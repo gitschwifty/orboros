@@ -1,0 +1,1 @@
+{"type":"init","id":"1","protocol_version":"1.1.0","config":{"model":"openrouter/auto","system_prompt":"You are a helpful assistant.","tools":["read_file"],"max_iterations":2}}

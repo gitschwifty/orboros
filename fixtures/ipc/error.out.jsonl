@@ -1,0 +1,4 @@
+{"type":"init_ok","id":"1","session_id":"sess-err","protocol_version":"0.1.0"}
+{"type":"event","event":{"event":"error","error":"Model error","code":"provider_error","provider":"openrouter","details":{"error":{"message":"Model error","type":"error","code":500}}}}
+{"type":"result","id":"2","status":"error","error":"Model error","tool_calls_made":[],"iterations":0}
+{"type":"shutdown_ok","id":"3"}
