@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use orboros::coordinator::decompose::decompose;
 use orboros::runner::execute_task;
 use orboros::state::store::TaskStore;
 use orboros::state::task::{Task, TaskStatus};
@@ -44,6 +45,19 @@ enum Commands {
         #[arg(long)]
         queue: bool,
     },
+    /// Decompose a task into subtasks without executing.
+    Decompose {
+        /// The high-level task to decompose.
+        task: String,
+    },
+    /// Decompose a task and execute all subtasks.
+    Orchestrate {
+        /// The high-level task to orchestrate.
+        task: String,
+        /// Priority for subtasks (1=highest, 5=lowest).
+        #[arg(short, long, default_value = "3")]
+        priority: u8,
+    },
     /// List tasks, optionally filtered by status.
     Tasks {
         /// Filter by status (pending, active, review, done, failed).
@@ -68,9 +82,37 @@ fn resolve_state_dir(raw: &str) -> PathBuf {
     PathBuf::from(raw)
 }
 
+fn require_binary(worker_binary: Option<&str>) -> anyhow::Result<&str> {
+    worker_binary.ok_or_else(|| {
+        anyhow::anyhow!("No worker binary configured. Set --worker-binary or HEDDLE_BINARY.")
+    })
+}
+
+fn make_worker_config(binary: &str, model: &str, system_prompt: &str) -> WorkerConfig {
+    WorkerConfig {
+        command: binary.into(),
+        args: vec![],
+        cwd: None,
+        env: vec![],
+        model: model.into(),
+        system_prompt: system_prompt.into(),
+        tools: vec![],
+        max_iterations: None,
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     // Load .env from current dir or ancestors (silently ignore if missing)
     let _ = dotenvy::dotenv();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("orboros=info")),
+        )
+        .with_target(false)
+        .init();
+
     let cli = Cli::parse();
     let state_dir = resolve_state_dir(&cli.state_dir);
     std::fs::create_dir_all(&state_dir)?;
@@ -88,6 +130,16 @@ fn main() -> anyhow::Result<()> {
             &task,
             priority,
             queue,
+        ),
+        Commands::Decompose { task } => {
+            cmd_decompose(cli.worker_binary.as_deref(), &cli.model, &task)
+        }
+        Commands::Orchestrate { task, priority } => cmd_orchestrate(
+            &store,
+            cli.worker_binary.as_deref(),
+            &cli.model,
+            &task,
+            priority,
         ),
         Commands::Tasks { status } => cmd_tasks(&store, status.as_deref()),
         Commands::Status { id } => cmd_status(&store, &id),
@@ -113,24 +165,12 @@ fn cmd_run(
         return Ok(());
     }
 
-    let Some(binary) = worker_binary else {
-        println!("  status:   pending (no worker binary configured)");
-        println!();
-        println!("Set --worker-binary or HEDDLE_BINARY to execute tasks.");
-        return Ok(());
-    };
-
-    let config = WorkerConfig {
-        command: binary.into(),
-        args: vec![],
-        cwd: None,
-        env: vec![],
-        model: model.into(),
-        system_prompt:
-            "You are a helpful assistant. Complete the task described in the user message.".into(),
-        tools: vec![],
-        max_iterations: None,
-    };
+    let binary = require_binary(worker_binary)?;
+    let config = make_worker_config(
+        binary,
+        model,
+        "You are a helpful assistant. Complete the task described in the user message.",
+    );
 
     println!("  status:   executing...");
     println!();
@@ -153,6 +193,147 @@ fn cmd_run(
             }
         }
     });
+    Ok(())
+}
+
+fn cmd_decompose(
+    worker_binary: Option<&str>,
+    model: &str,
+    description: &str,
+) -> anyhow::Result<()> {
+    let binary = require_binary(worker_binary)?;
+    let config = make_worker_config(binary, model, ""); // system prompt set by decompose()
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let result = rt.block_on(decompose(description, &config))?;
+
+    println!("Decomposed into {} subtask(s):\n", result.subtasks.len());
+    for (i, sub) in result.subtasks.iter().enumerate() {
+        println!(
+            "  {}. [{}] {} (order: {})",
+            i + 1,
+            sub.worker_type,
+            sub.title,
+            sub.order
+        );
+        println!("     {}", sub.description);
+        if !sub.tools_needed.is_empty() {
+            println!("     tools: {}", sub.tools_needed.join(", "));
+        }
+        println!();
+    }
+
+    Ok(())
+}
+
+fn cmd_orchestrate(
+    store: &TaskStore,
+    worker_binary: Option<&str>,
+    model: &str,
+    description: &str,
+    priority: u8,
+) -> anyhow::Result<()> {
+    let binary = require_binary(worker_binary)?;
+    let config = make_worker_config(binary, model, ""); // system prompt set per step
+
+    // Create parent task
+    let parent = Task::new(description, description).with_priority(priority);
+    let parent_id = parent.id;
+    store.append(&parent)?;
+    println!("Created parent task {parent_id}");
+    println!();
+
+    let rt = tokio::runtime::Runtime::new()?;
+
+    // Decompose
+    println!("Decomposing task...");
+    let decomposition = rt.block_on(decompose(description, &config))?;
+    println!("  → {} subtask(s)\n", decomposition.subtasks.len());
+
+    // Create subtasks in store
+    let mut subtasks: Vec<Task> = decomposition
+        .subtasks
+        .iter()
+        .map(|sub| {
+            Task::new(&sub.title, &sub.description)
+                .with_parent(parent_id)
+                .with_priority(priority)
+        })
+        .collect();
+
+    for task in &subtasks {
+        store.append(task)?;
+    }
+
+    // Execute subtasks in order
+    let total = subtasks.len();
+    for (i, sub_spec) in decomposition.subtasks.iter().enumerate() {
+        let task = &mut subtasks[i];
+        println!(
+            "[{}/{}] {} ({})",
+            i + 1,
+            total,
+            task.title,
+            sub_spec.worker_type
+        );
+
+        let worker_config = make_worker_config(
+            binary,
+            model,
+            &format!(
+                "You are a {} worker. Complete the task described in the user message.",
+                sub_spec.worker_type
+            ),
+        );
+
+        match rt.block_on(execute_task(store, task, &worker_config)) {
+            Ok(()) => {
+                println!("  ✓ {:?}", task.status);
+                if let Some(ref result) = task.result {
+                    // Print first 200 chars of result as preview
+                    let preview = if result.len() > 200 {
+                        format!("{}...", &result[..200])
+                    } else {
+                        result.clone()
+                    };
+                    println!("  {preview}");
+                }
+            }
+            Err(e) => {
+                eprintln!("  ✗ Failed: {e}");
+            }
+        }
+        println!();
+    }
+
+    // Update parent status based on subtask outcomes
+    let mut parent_task = store.load_by_id(parent_id)?.unwrap_or(parent);
+    let all_done = subtasks.iter().all(|t| t.status == TaskStatus::Done);
+    let any_failed = subtasks.iter().any(|t| t.status == TaskStatus::Failed);
+
+    if all_done {
+        parent_task.transition(TaskStatus::Done);
+        parent_task.result = Some(format!(
+            "All {} subtasks completed successfully.",
+            subtasks.len()
+        ));
+    } else if any_failed {
+        parent_task.transition(TaskStatus::Failed);
+        let failed_count = subtasks
+            .iter()
+            .filter(|t| t.status == TaskStatus::Failed)
+            .count();
+        parent_task.result = Some(format!(
+            "{failed_count}/{} subtasks failed.",
+            subtasks.len()
+        ));
+    } else {
+        parent_task.transition(TaskStatus::Active);
+    }
+    store.update(&parent_task)?;
+
+    println!("Orchestration complete: {:?}", parent_task.status);
+
     Ok(())
 }
 
