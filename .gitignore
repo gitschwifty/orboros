@@ -1,5 +1,7 @@
 .claude
 private
+.env
+.env.*
 
 
 # Added by cargo

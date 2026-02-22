@@ -3,5 +3,6 @@
 #![allow(clippy::must_use_candidate)]
 
 pub mod ipc;
+pub mod runner;
 pub mod state;
 pub mod worker;
