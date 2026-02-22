@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use orboros::coordinator::decompose::decompose;
+use orboros::routing::rules::RoutingConfig;
 use orboros::runner::execute_task;
 use orboros::state::store::TaskStore;
 use orboros::state::task::{Task, TaskStatus};
@@ -86,6 +87,27 @@ fn require_binary(worker_binary: Option<&str>) -> anyhow::Result<&str> {
     worker_binary.ok_or_else(|| {
         anyhow::anyhow!("No worker binary configured. Set --worker-binary or HEDDLE_BINARY.")
     })
+}
+
+fn load_routing_config(state_dir: Option<&std::path::Path>) -> RoutingConfig {
+    if let Some(dir) = state_dir {
+        let config_path = dir.join("routing.toml");
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            match orboros::routing::rules::parse_routing_config(&content) {
+                Ok(config) => {
+                    tracing::info!("Loaded routing config from {}", config_path.display());
+                    return config;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to parse routing config at {}: {e}",
+                        config_path.display()
+                    );
+                }
+            }
+        }
+    }
+    RoutingConfig::default()
 }
 
 fn make_worker_config(binary: &str, model: &str, system_prompt: &str) -> WorkerConfig {
@@ -265,21 +287,26 @@ fn cmd_orchestrate(
         store.append(task)?;
     }
 
+    // Load routing config if available
+    let routing = load_routing_config(store.path().parent());
+
     // Execute subtasks in order
     let total = subtasks.len();
     for (i, sub_spec) in decomposition.subtasks.iter().enumerate() {
         let task = &mut subtasks[i];
+        let routed_model = routing.model_for(&sub_spec.worker_type);
         println!(
-            "[{}/{}] {} ({})",
+            "[{}/{}] {} ({}) → {}",
             i + 1,
             total,
             task.title,
-            sub_spec.worker_type
+            sub_spec.worker_type,
+            routed_model
         );
 
         let worker_config = make_worker_config(
             binary,
-            model,
+            routed_model,
             &format!(
                 "You are a {} worker. Complete the task described in the user message.",
                 sub_spec.worker_type
