@@ -6,6 +6,7 @@ use tokio::task::JoinSet;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::coordinator::aggregate::{aggregate, fallback_concatenate};
 use crate::coordinator::decompose::Subtask;
 use crate::routing::rules::RoutingConfig;
 use crate::state::store::TaskStore;
@@ -129,34 +130,50 @@ pub async fn orchestrate(
 
     parent.transition(parent_status);
 
-    // Build a simple concatenated result for now (aggregation comes in step 4)
-    if all_done {
-        let summary: Vec<String> = all_results
-            .iter()
-            .filter_map(|r| {
-                r.response
-                    .as_ref()
-                    .map(|resp| format!("## {}\n{}", r.title, resp))
-            })
-            .collect();
-        parent.result = Some(summary.join("\n\n"));
+    // Aggregate results
+    let aggregated_result = if all_done {
+        // Build an aggregation worker config using the default model
+        let agg_config = WorkerConfig {
+            command: config.worker_binary.clone(),
+            args: config.worker_args.clone(),
+            cwd: config.worker_cwd.clone(),
+            env: config.worker_env.clone(),
+            model: config.routing.default_model.clone(),
+            system_prompt: String::new(), // overridden by aggregate()
+            tools: vec![],
+            max_iterations: Some(1),
+        };
+
+        match aggregate(&parent.description, &all_results, &agg_config).await {
+            Ok(agg) => {
+                parent.result = Some(agg.summary.clone());
+                Some(agg.summary)
+            }
+            Err(e) => {
+                warn!("Aggregation failed, falling back to concatenation: {e}");
+                let fallback = fallback_concatenate(&all_results);
+                parent.result = Some(fallback.clone());
+                Some(fallback)
+            }
+        }
     } else if any_failed {
         let failed_count = all_results
             .iter()
             .filter(|r| r.status == TaskStatus::Failed)
             .count();
-        parent.result = Some(format!(
-            "{failed_count}/{} subtasks failed.",
-            all_results.len()
-        ));
-    }
+        let msg = format!("{failed_count}/{} subtasks failed.", all_results.len());
+        parent.result = Some(msg.clone());
+        Some(msg)
+    } else {
+        None
+    };
 
     store.update(parent).map_err(anyhow::Error::from)?;
 
     Ok(OrchestrateOutcome {
         parent_status,
         subtask_results: all_results,
-        aggregated_result: None,
+        aggregated_result,
     })
 }
 
@@ -741,5 +758,67 @@ mod tests {
             .subtask_results
             .iter()
             .all(|r| r.status == TaskStatus::Done));
+    }
+
+    // --- aggregation integration tests ---
+
+    #[tokio::test]
+    async fn orchestrate_aggregates_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let config = test_orchestrate_config();
+
+        let mut parent = Task::new("Parent", "Build a feature");
+        store.append(&parent).unwrap();
+
+        let subtasks = vec![
+            make_subtask("Research", "Research the thing", 0),
+            make_subtask("Implement", "Build the thing", 1),
+        ];
+
+        let outcome = orchestrate(&store, &mut parent, &subtasks, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.parent_status, TaskStatus::Done);
+        // Aggregation should have produced a result (mock returns "Hello from mock worker")
+        assert!(outcome.aggregated_result.is_some());
+        assert!(parent.result.is_some());
+        // The mock worker always returns this, so aggregation result is this
+        assert_eq!(
+            outcome.aggregated_result.as_deref(),
+            Some("Hello from mock worker")
+        );
+    }
+
+    #[tokio::test]
+    async fn orchestrate_failure_skips_aggregation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let config = OrchestrateConfig {
+            worker_binary: "/nonexistent/binary".into(),
+            worker_args: vec![],
+            worker_cwd: None,
+            worker_env: vec![],
+            routing: RoutingConfig::default(),
+            max_concurrency: 1,
+        };
+
+        let mut parent = Task::new("Parent", "Will fail");
+        store.append(&parent).unwrap();
+
+        let subtasks = vec![make_subtask("Doomed", "Fail", 0)];
+
+        let outcome = orchestrate(&store, &mut parent, &subtasks, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.parent_status, TaskStatus::Failed);
+        // Should have failure message, not aggregated result
+        assert!(parent
+            .result
+            .as_deref()
+            .unwrap()
+            .contains("subtasks failed"));
     }
 }
