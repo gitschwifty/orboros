@@ -6,6 +6,7 @@ use crate::state::task::{Task, TaskStatus};
 ///
 /// Each task mutation is appended as a full JSON line. Reading replays
 /// the log and keeps the latest version of each task (by ID).
+#[derive(Clone)]
 pub struct TaskStore {
     path: PathBuf,
 }

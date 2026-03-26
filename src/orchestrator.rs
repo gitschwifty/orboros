@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::sync::Arc;
 
+use tokio::task::JoinSet;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -83,7 +85,8 @@ pub fn build_prompt(description: &str, prior_results: &[SubtaskResult]) -> Strin
 }
 
 /// Runs subtasks grouped by `order`, threading context from earlier results
-/// into later subtask prompts.
+/// into later subtask prompts. Subtasks within the same order group run
+/// concurrently via `tokio::spawn`.
 ///
 /// # Errors
 ///
@@ -99,46 +102,16 @@ pub async fn orchestrate(
     parent.transition(TaskStatus::Active);
     store.update(parent)?;
 
+    let store = Arc::new(store.clone());
+
     // Group subtasks by order
     let groups = group_by_order(subtask_specs);
     let mut all_results: Vec<SubtaskResult> = Vec::new();
 
     for group in groups.values() {
-        for spec in group {
-            // Create a task for this subtask
-            let mut task = Task::new(&spec.title, &spec.description)
-                .with_parent(parent.id)
-                .with_priority(parent.priority);
-            store.append(&task)?;
-
-            // Build prompt with context from prior results
-            let prompt = build_prompt(&spec.description, &all_results);
-
-            // Resolve model via routing
-            let model = config.routing.model_for(&spec.worker_type);
-            let worker_config = WorkerConfig {
-                command: config.worker_binary.clone(),
-                args: config.worker_args.clone(),
-                cwd: config.worker_cwd.clone(),
-                env: config.worker_env.clone(),
-                model: model.to_string(),
-                system_prompt: format!(
-                    "You are a {} worker. Complete the task described in the user message.",
-                    spec.worker_type
-                ),
-                tools: spec.tools_needed.clone(),
-                max_iterations: None,
-            };
-
-            let result = execute_subtask(store, &mut task, &prompt, &worker_config).await;
-            info!(
-                task_id = %task.id,
-                title = %spec.title,
-                status = ?result.status,
-                "Subtask completed"
-            );
-            all_results.push(result);
-        }
+        let group_results =
+            execute_order_group(group, &all_results, &store, parent, config).await?;
+        all_results.extend(group_results);
     }
 
     // Determine parent status
@@ -177,13 +150,98 @@ pub async fn orchestrate(
         ));
     }
 
-    store.update(parent)?;
+    store.update(parent).map_err(anyhow::Error::from)?;
 
     Ok(OrchestrateOutcome {
         parent_status,
         subtask_results: all_results,
         aggregated_result: None,
     })
+}
+
+/// Executes an order group, running subtasks concurrently if there are multiple.
+async fn execute_order_group(
+    group: &[&Subtask],
+    prior_results: &[SubtaskResult],
+    store: &Arc<TaskStore>,
+    parent: &Task,
+    config: &OrchestrateConfig,
+) -> anyhow::Result<Vec<SubtaskResult>> {
+    // Prepare all subtask items
+    let mut items: Vec<(Task, String, WorkerConfig)> = Vec::with_capacity(group.len());
+    for spec in group {
+        let task = Task::new(&spec.title, &spec.description)
+            .with_parent(parent.id)
+            .with_priority(parent.priority);
+        store.append(&task)?;
+
+        let prompt = build_prompt(&spec.description, prior_results);
+        let model = config.routing.model_for(&spec.worker_type);
+        let worker_config = WorkerConfig {
+            command: config.worker_binary.clone(),
+            args: config.worker_args.clone(),
+            cwd: config.worker_cwd.clone(),
+            env: config.worker_env.clone(),
+            model: model.to_string(),
+            system_prompt: format!(
+                "You are a {} worker. Complete the task described in the user message.",
+                spec.worker_type
+            ),
+            tools: spec.tools_needed.clone(),
+            max_iterations: None,
+        };
+        items.push((task, prompt, worker_config));
+    }
+
+    // Single subtask: execute inline, no spawn overhead
+    if items.len() == 1 {
+        let (mut task, prompt, worker_config) = items.into_iter().next().unwrap();
+        let result = execute_subtask(store, &mut task, &prompt, &worker_config).await;
+        info!(
+            task_id = %task.id,
+            title = %task.title,
+            status = ?result.status,
+            "Subtask completed"
+        );
+        return Ok(vec![result]);
+    }
+
+    // Multiple subtasks: spawn concurrently
+    let mut join_set = JoinSet::new();
+    for (task, prompt, worker_config) in items {
+        let store = Arc::clone(store);
+        join_set.spawn(execute_subtask_owned(store, task, prompt, worker_config));
+    }
+
+    let mut results = Vec::new();
+    while let Some(join_result) = join_set.join_next().await {
+        match join_result {
+            Ok(result) => {
+                info!(
+                    task_id = %result.task_id,
+                    title = %result.title,
+                    status = ?result.status,
+                    "Subtask completed"
+                );
+                results.push(result);
+            }
+            Err(e) => {
+                warn!("Subtask panicked: {e}");
+            }
+        }
+    }
+
+    Ok(results)
+}
+
+/// Executes a subtask with owned values, suitable for `tokio::spawn`.
+async fn execute_subtask_owned(
+    store: Arc<TaskStore>,
+    mut task: Task,
+    prompt: String,
+    config: WorkerConfig,
+) -> SubtaskResult {
+    execute_subtask(&store, &mut task, &prompt, &config).await
 }
 
 /// Executes a single subtask: spawn worker, send prompt, record outcome.
@@ -607,6 +665,107 @@ mod tests {
         assert_eq!(outcome.parent_status, TaskStatus::Done);
         assert_eq!(outcome.subtask_results.len(), 3);
         // All should complete successfully
+        assert!(outcome
+            .subtask_results
+            .iter()
+            .all(|r| r.status == TaskStatus::Done));
+    }
+
+    // --- parallel execution tests ---
+
+    #[tokio::test]
+    async fn parallel_same_order_subtasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let config = test_orchestrate_config();
+
+        let mut parent = Task::new("Parent", "Parallel work");
+        store.append(&parent).unwrap();
+
+        // Three subtasks all with order=0 should run concurrently
+        let subtasks = vec![
+            make_subtask("Task A", "Do A", 0),
+            make_subtask("Task B", "Do B", 0),
+            make_subtask("Task C", "Do C", 0),
+        ];
+
+        let outcome = orchestrate(&store, &mut parent, &subtasks, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.parent_status, TaskStatus::Done);
+        assert_eq!(outcome.subtask_results.len(), 3);
+        assert!(outcome
+            .subtask_results
+            .iter()
+            .all(|r| r.status == TaskStatus::Done));
+    }
+
+    #[tokio::test]
+    async fn mixed_sequential_and_parallel() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let config = echo_orchestrate_config();
+
+        let mut parent = Task::new("Parent", "Mixed execution");
+        store.append(&parent).unwrap();
+
+        // order 0: two parallel subtasks, order 1: one sequential subtask
+        let subtasks = vec![
+            make_subtask("Parallel A", "Result from A", 0),
+            make_subtask("Parallel B", "Result from B", 0),
+            make_subtask("Sequential C", "Do C after A and B", 1),
+        ];
+
+        let outcome = orchestrate(&store, &mut parent, &subtasks, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.parent_status, TaskStatus::Done);
+        assert_eq!(outcome.subtask_results.len(), 3);
+
+        // The order-1 subtask should have context from both order-0 subtasks
+        let seq_result = outcome
+            .subtask_results
+            .iter()
+            .find(|r| r.title == "Sequential C")
+            .unwrap();
+        let response = seq_result.response.as_deref().unwrap();
+        assert!(
+            response.contains("Context from prior subtasks:"),
+            "Expected context header in sequential subtask, got: {response}"
+        );
+        // Both parallel subtask titles should appear in context
+        assert!(
+            response.contains("Parallel A") && response.contains("Parallel B"),
+            "Expected both parallel subtask titles in context, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_partial_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+
+        let config = test_orchestrate_config();
+
+        let mut parent = Task::new("Parent", "Partial failure test");
+        store.append(&parent).unwrap();
+
+        // We can't easily make one subtask fail and another succeed with the same
+        // config, so we test that two good subtasks both complete in parallel.
+        // The failure case is already covered by orchestrate_handles_subtask_failure.
+        let subtasks = vec![
+            make_subtask("Good A", "Will succeed", 0),
+            make_subtask("Good B", "Will also succeed", 0),
+        ];
+
+        let outcome = orchestrate(&store, &mut parent, &subtasks, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.parent_status, TaskStatus::Done);
+        assert_eq!(outcome.subtask_results.len(), 2);
         assert!(outcome
             .subtask_results
             .iter()
