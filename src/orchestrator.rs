@@ -7,11 +7,11 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::coordinator::decompose::Subtask;
-use crate::ipc::types::ResultStatus;
 use crate::routing::rules::RoutingConfig;
 use crate::state::store::TaskStore;
 use crate::state::task::{Task, TaskStatus};
-use crate::worker::process::{Worker, WorkerConfig};
+use crate::worker::pool::WorkerPool;
+use crate::worker::process::WorkerConfig;
 
 /// Maximum characters of a subtask result to include in context for later subtasks.
 const CONTEXT_RESULT_MAX_CHARS: usize = 500;
@@ -103,6 +103,7 @@ pub async fn orchestrate(
     store.update(parent)?;
 
     let store = Arc::new(store.clone());
+    let pool = Arc::new(WorkerPool::new(config.max_concurrency));
 
     // Group subtasks by order
     let groups = group_by_order(subtask_specs);
@@ -110,7 +111,7 @@ pub async fn orchestrate(
 
     for group in groups.values() {
         let group_results =
-            execute_order_group(group, &all_results, &store, parent, config).await?;
+            execute_order_group(group, &all_results, &store, &pool, parent, config).await?;
         all_results.extend(group_results);
     }
 
@@ -160,10 +161,12 @@ pub async fn orchestrate(
 }
 
 /// Executes an order group, running subtasks concurrently if there are multiple.
+/// Uses the worker pool to bound concurrency.
 async fn execute_order_group(
     group: &[&Subtask],
     prior_results: &[SubtaskResult],
     store: &Arc<TaskStore>,
+    pool: &Arc<WorkerPool>,
     parent: &Task,
     config: &OrchestrateConfig,
 ) -> anyhow::Result<Vec<SubtaskResult>> {
@@ -193,10 +196,19 @@ async fn execute_order_group(
         items.push((task, prompt, worker_config));
     }
 
-    // Single subtask: execute inline, no spawn overhead
+    // Single subtask: execute inline via pool, no spawn overhead
     if items.len() == 1 {
         let (mut task, prompt, worker_config) = items.into_iter().next().unwrap();
-        let result = execute_subtask(store, &mut task, &prompt, &worker_config).await;
+        let outcome = pool
+            .execute(store, &mut task, &prompt, &worker_config)
+            .await;
+        let result = SubtaskResult {
+            task_id: task.id,
+            title: task.title.clone(),
+            order: 0,
+            status: outcome.status,
+            response: outcome.response,
+        };
         info!(
             task_id = %task.id,
             title = %task.title,
@@ -206,11 +218,18 @@ async fn execute_order_group(
         return Ok(vec![result]);
     }
 
-    // Multiple subtasks: spawn concurrently
+    // Multiple subtasks: spawn concurrently, pool semaphore limits workers
     let mut join_set = JoinSet::new();
     for (task, prompt, worker_config) in items {
         let store = Arc::clone(store);
-        join_set.spawn(execute_subtask_owned(store, task, prompt, worker_config));
+        let pool = Arc::clone(pool);
+        join_set.spawn(execute_subtask_owned(
+            store,
+            pool,
+            task,
+            prompt,
+            worker_config,
+        ));
     }
 
     let mut results = Vec::new();
@@ -237,77 +256,18 @@ async fn execute_order_group(
 /// Executes a subtask with owned values, suitable for `tokio::spawn`.
 async fn execute_subtask_owned(
     store: Arc<TaskStore>,
+    pool: Arc<WorkerPool>,
     mut task: Task,
     prompt: String,
     config: WorkerConfig,
 ) -> SubtaskResult {
-    execute_subtask(&store, &mut task, &prompt, &config).await
-}
-
-/// Executes a single subtask: spawn worker, send prompt, record outcome.
-async fn execute_subtask(
-    store: &TaskStore,
-    task: &mut Task,
-    prompt: &str,
-    config: &WorkerConfig,
-) -> SubtaskResult {
-    task.transition(TaskStatus::Active);
-    if let Err(e) = store.update(task) {
-        warn!("Failed to persist active status: {e}");
-    }
-
-    let result = execute_subtask_inner(task, prompt, config).await;
-
-    task.transition(result.status);
-    task.result.clone_from(&result.response);
-    task.worker_model = Some(config.model.clone());
-    if let Err(e) = store.update(task) {
-        warn!("Failed to persist subtask result: {e}");
-    }
-
-    result
-}
-
-/// Inner execution logic, separated for cleaner error handling.
-async fn execute_subtask_inner(task: &Task, prompt: &str, config: &WorkerConfig) -> SubtaskResult {
-    let fail = |msg: String| SubtaskResult {
-        task_id: task.id,
-        title: task.title.clone(),
-        order: 0,
-        status: TaskStatus::Failed,
-        response: Some(msg),
-    };
-
-    let mut worker = match Worker::spawn(config).await {
-        Ok(w) => w,
-        Err(e) => return fail(format!("Worker spawn failed: {e}")),
-    };
-
-    let outcome = match worker.send(&task.id.to_string(), prompt).await {
-        Ok(o) => o,
-        Err(e) => {
-            let _ = worker.shutdown().await;
-            return fail(format!("Worker send failed: {e}"));
-        }
-    };
-
-    if let Err(e) = worker.shutdown().await {
-        warn!("Worker shutdown failed: {e}");
-    }
-
-    let (status, response) = match outcome.status {
-        ResultStatus::Ok => (TaskStatus::Done, outcome.response),
-        ResultStatus::Error | ResultStatus::Cancelled => {
-            (TaskStatus::Failed, outcome.error.or(outcome.response))
-        }
-    };
-
+    let outcome = pool.execute(&store, &mut task, &prompt, &config).await;
     SubtaskResult {
         task_id: task.id,
         title: task.title.clone(),
         order: 0,
-        status,
-        response,
+        status: outcome.status,
+        response: outcome.response,
     }
 }
 
@@ -484,40 +444,45 @@ mod tests {
         assert_eq!(groups[&2].len(), 1);
     }
 
-    // --- execute_subtask tests ---
+    // --- pool execution tests (via orchestrator) ---
 
     #[tokio::test]
-    async fn execute_subtask_with_mock_worker() {
+    async fn pool_execute_via_orchestrate_config() {
         let dir = tempfile::tempdir().unwrap();
         let store = TaskStore::new(dir.path().join("tasks.jsonl"));
-        let config = mock_worker_config();
+        let pool = WorkerPool::new(4);
 
-        let mut task = Task::new("Test subtask", "Say hello");
+        let mut task = Task::new("Pool test", "Say hello");
         store.append(&task).unwrap();
 
-        let result = execute_subtask(&store, &mut task, "Say hello", &config).await;
-        assert_eq!(result.status, TaskStatus::Done);
-        assert_eq!(result.response.as_deref(), Some("Hello from mock worker"));
+        let outcome = pool
+            .execute(&store, &mut task, "Say hello", &mock_worker_config())
+            .await;
+        assert_eq!(outcome.status, TaskStatus::Done);
+        assert_eq!(outcome.response.as_deref(), Some("Hello from mock worker"));
     }
 
     #[tokio::test]
-    async fn execute_subtask_with_echo_worker() {
+    async fn pool_execute_echo() {
         let dir = tempfile::tempdir().unwrap();
         let store = TaskStore::new(dir.path().join("tasks.jsonl"));
-        let config = echo_worker_config();
+        let pool = WorkerPool::new(4);
 
         let mut task = Task::new("Echo test", "Echo this back");
         store.append(&task).unwrap();
 
-        let result = execute_subtask(&store, &mut task, "Echo this back", &config).await;
-        assert_eq!(result.status, TaskStatus::Done);
-        assert_eq!(result.response.as_deref(), Some("Echo this back"));
+        let outcome = pool
+            .execute(&store, &mut task, "Echo this back", &echo_worker_config())
+            .await;
+        assert_eq!(outcome.status, TaskStatus::Done);
+        assert_eq!(outcome.response.as_deref(), Some("Echo this back"));
     }
 
     #[tokio::test]
-    async fn execute_subtask_records_failure() {
+    async fn pool_execute_failure() {
         let dir = tempfile::tempdir().unwrap();
         let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let pool = WorkerPool::new(4);
         let config = WorkerConfig {
             command: "/nonexistent/binary".into(),
             args: vec![],
@@ -532,9 +497,15 @@ mod tests {
         let mut task = Task::new("Doomed", "This will fail");
         store.append(&task).unwrap();
 
-        let result = execute_subtask(&store, &mut task, "This will fail", &config).await;
-        assert_eq!(result.status, TaskStatus::Failed);
-        assert!(result.response.as_deref().unwrap().contains("spawn failed"));
+        let outcome = pool
+            .execute(&store, &mut task, "This will fail", &config)
+            .await;
+        assert_eq!(outcome.status, TaskStatus::Failed);
+        assert!(outcome
+            .response
+            .as_deref()
+            .unwrap()
+            .contains("spawn failed"));
     }
 
     // --- orchestrate tests ---
