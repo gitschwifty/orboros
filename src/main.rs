@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use orboros::coordinator::decompose::decompose;
+use orboros::orchestrator::{orchestrate, OrchestrateConfig};
 use orboros::routing::rules::RoutingConfig;
 use orboros::runner::execute_task;
 use orboros::state::store::TaskStore;
@@ -259,10 +260,9 @@ fn cmd_orchestrate(
     let config = make_worker_config(binary, model, ""); // system prompt set per step
 
     // Create parent task
-    let parent = Task::new(description, description).with_priority(priority);
-    let parent_id = parent.id;
+    let mut parent = Task::new(description, description).with_priority(priority);
     store.append(&parent)?;
-    println!("Created parent task {parent_id}");
+    println!("Created parent task {}", parent.id);
     println!();
 
     let rt = tokio::runtime::Runtime::new()?;
@@ -272,94 +272,68 @@ fn cmd_orchestrate(
     let decomposition = rt.block_on(decompose(description, &config))?;
     println!("  → {} subtask(s)\n", decomposition.subtasks.len());
 
-    // Create subtasks in store
-    let mut subtasks: Vec<Task> = decomposition
-        .subtasks
-        .iter()
-        .map(|sub| {
-            Task::new(&sub.title, &sub.description)
-                .with_parent(parent_id)
-                .with_priority(priority)
-        })
-        .collect();
-
-    for task in &subtasks {
-        store.append(task)?;
-    }
-
-    // Load routing config if available
-    let routing = load_routing_config(store.path().parent());
-
-    // Execute subtasks in order
-    let total = subtasks.len();
-    for (i, sub_spec) in decomposition.subtasks.iter().enumerate() {
-        let task = &mut subtasks[i];
-        let routed_model = routing.model_for(&sub_spec.worker_type);
+    // Print subtask plan
+    for (i, sub) in decomposition.subtasks.iter().enumerate() {
         println!(
-            "[{}/{}] {} ({}) → {}",
+            "  {}. [{}] {} (order: {})",
             i + 1,
-            total,
-            task.title,
-            sub_spec.worker_type,
-            routed_model
+            sub.worker_type,
+            sub.title,
+            sub.order
         );
+    }
+    println!();
 
-        let worker_config = make_worker_config(
-            binary,
-            routed_model,
-            &format!(
-                "You are a {} worker. Complete the task described in the user message.",
-                sub_spec.worker_type
-            ),
-        );
+    // Load routing config and build orchestrate config
+    let routing = load_routing_config(store.path().parent());
+    let orch_config = OrchestrateConfig {
+        worker_binary: binary.to_string(),
+        worker_args: vec![],
+        worker_cwd: None,
+        worker_env: vec![],
+        routing,
+        max_concurrency: 4,
+    };
 
-        match rt.block_on(execute_task(store, task, &worker_config)) {
-            Ok(()) => {
-                println!("  ✓ {:?}", task.status);
-                if let Some(ref result) = task.result {
-                    // Print first 200 chars of result as preview
-                    let preview = if result.len() > 200 {
-                        format!("{}...", &result[..200])
-                    } else {
-                        result.clone()
-                    };
-                    println!("  {preview}");
-                }
-            }
-            Err(e) => {
-                eprintln!("  ✗ Failed: {e}");
-            }
+    // Run orchestration
+    println!("Executing subtasks...");
+    let outcome = rt.block_on(orchestrate(
+        store,
+        &mut parent,
+        &decomposition.subtasks,
+        &orch_config,
+    ))?;
+
+    // Print results
+    println!();
+    for result in &outcome.subtask_results {
+        let status_icon = if result.status == TaskStatus::Done {
+            "✓"
+        } else {
+            "✗"
+        };
+        println!("  {status_icon} {} — {:?}", result.title, result.status);
+        if let Some(ref response) = result.response {
+            let preview = if response.len() > 200 {
+                format!("{}...", &response[..200])
+            } else {
+                response.clone()
+            };
+            println!("    {preview}");
         }
+    }
+    println!();
+
+    println!("Orchestration complete: {:?}", outcome.parent_status);
+    if let Some(ref result) = parent.result {
+        let preview = if result.len() > 500 {
+            format!("{}...", &result[..500])
+        } else {
+            result.clone()
+        };
         println!();
+        println!("{preview}");
     }
-
-    // Update parent status based on subtask outcomes
-    let mut parent_task = store.load_by_id(parent_id)?.unwrap_or(parent);
-    let all_done = subtasks.iter().all(|t| t.status == TaskStatus::Done);
-    let any_failed = subtasks.iter().any(|t| t.status == TaskStatus::Failed);
-
-    if all_done {
-        parent_task.transition(TaskStatus::Done);
-        parent_task.result = Some(format!(
-            "All {} subtasks completed successfully.",
-            subtasks.len()
-        ));
-    } else if any_failed {
-        parent_task.transition(TaskStatus::Failed);
-        let failed_count = subtasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::Failed)
-            .count();
-        parent_task.result = Some(format!(
-            "{failed_count}/{} subtasks failed.",
-            subtasks.len()
-        ));
-    } else {
-        parent_task.transition(TaskStatus::Active);
-    }
-    store.update(&parent_task)?;
-
-    println!("Orchestration complete: {:?}", parent_task.status);
 
     Ok(())
 }
