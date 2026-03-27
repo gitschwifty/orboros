@@ -47,6 +47,34 @@ impl RoutingConfig {
             .get(worker_type)
             .or_else(|| self.profiles.get("default"))
     }
+
+    /// Validates the config and returns a list of warnings.
+    ///
+    /// Checks for:
+    /// - Rules whose `worker_type` has no matching profile and no "default" fallback
+    /// - Profiles with empty `allowed_tools`
+    pub fn validate(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        for rule in &self.rules {
+            if self.profile_for(&rule.worker_type).is_none() {
+                warnings.push(format!(
+                    "Rule for worker type '{}' has no matching profile and no 'default' profile",
+                    rule.worker_type
+                ));
+            }
+        }
+
+        for (name, profile) in &self.profiles {
+            if profile.allowed_tools.is_empty() {
+                warnings.push(format!(
+                    "Profile '{name}' has empty allowed_tools — workers will have no tools"
+                ));
+            }
+        }
+
+        warnings
+    }
 }
 
 impl Default for RoutingConfig {
@@ -252,5 +280,124 @@ model = "anthropic/claude-sonnet-4-20250514"
     fn profile_for_no_match_no_default() {
         let config = RoutingConfig::default();
         assert!(config.profile_for("edit").is_none());
+    }
+
+    // --- validate tests ---
+
+    #[test]
+    fn validate_empty_config_clean() {
+        let config = RoutingConfig::default();
+        assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn validate_rule_without_profile_warns() {
+        let config = RoutingConfig {
+            rules: vec![RoutingRule {
+                worker_type: "edit".into(),
+                model: "test/model".into(),
+                reason: None,
+            }],
+            ..Default::default()
+        };
+        let warnings = config.validate();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("edit"));
+        assert!(warnings[0].contains("no matching profile"));
+    }
+
+    #[test]
+    fn validate_matching_profile_clean() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "edit".into(),
+            ToolProfile {
+                allowed_tools: vec!["read".into()],
+            },
+        );
+        let config = RoutingConfig {
+            rules: vec![RoutingRule {
+                worker_type: "edit".into(),
+                model: "test/model".into(),
+                reason: None,
+            }],
+            profiles,
+            ..Default::default()
+        };
+        assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn validate_default_fallback_clean() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "default".into(),
+            ToolProfile {
+                allowed_tools: vec!["read".into()],
+            },
+        );
+        let config = RoutingConfig {
+            rules: vec![RoutingRule {
+                worker_type: "edit".into(),
+                model: "test/model".into(),
+                reason: None,
+            }],
+            profiles,
+            ..Default::default()
+        };
+        assert!(config.validate().is_empty());
+    }
+
+    #[test]
+    fn validate_empty_allowed_tools_warns() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "edit".into(),
+            ToolProfile {
+                allowed_tools: vec![],
+            },
+        );
+        let config = RoutingConfig {
+            profiles,
+            ..Default::default()
+        };
+        let warnings = config.validate();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("edit"));
+        assert!(warnings[0].contains("empty allowed_tools"));
+    }
+
+    #[test]
+    fn validate_valid_config_clean() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "edit".into(),
+            ToolProfile {
+                allowed_tools: vec!["read".into(), "write".into()],
+            },
+        );
+        profiles.insert(
+            "research".into(),
+            ToolProfile {
+                allowed_tools: vec!["read".into(), "web_search".into()],
+            },
+        );
+        let config = RoutingConfig {
+            rules: vec![
+                RoutingRule {
+                    worker_type: "edit".into(),
+                    model: "test/model".into(),
+                    reason: None,
+                },
+                RoutingRule {
+                    worker_type: "research".into(),
+                    model: "test/model".into(),
+                    reason: None,
+                },
+            ],
+            profiles,
+            ..Default::default()
+        };
+        assert!(config.validate().is_empty());
     }
 }
