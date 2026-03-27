@@ -1,4 +1,8 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
+
+use crate::routing::profile::ToolProfile;
 
 /// Model routing configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8,6 +12,9 @@ pub struct RoutingConfig {
     /// Routing rules, checked in order.
     #[serde(default)]
     pub rules: Vec<RoutingRule>,
+    /// Tool profiles keyed by worker type.
+    #[serde(default)]
+    pub profiles: HashMap<String, ToolProfile>,
 }
 
 /// A single routing rule mapping a worker type to a model.
@@ -38,6 +45,7 @@ impl Default for RoutingConfig {
         Self {
             default_model: "openrouter/free".into(),
             rules: vec![],
+            profiles: HashMap::new(),
         }
     }
 }
@@ -77,6 +85,7 @@ mod tests {
                     reason: None,
                 },
             ],
+            ..Default::default()
         };
 
         assert_eq!(config.model_for("research"), "google/gemini-2.0-flash-001");
@@ -128,6 +137,7 @@ reason = "cheap"
                 model: "better/model".into(),
                 reason: Some("because".into()),
             }],
+            ..Default::default()
         };
         let serialized = toml::to_string(&config).unwrap();
         let parsed: RoutingConfig = toml::from_str(&serialized).unwrap();
@@ -141,5 +151,51 @@ reason = "cheap"
         let toml = r#"default_model = "openrouter/free""#;
         let config = parse_routing_config(toml).unwrap();
         assert_eq!(config.model_for("anything"), "openrouter/free");
+    }
+
+    #[test]
+    fn parse_config_with_profiles() {
+        let toml = r#"
+default_model = "openrouter/auto"
+
+[[rules]]
+worker_type = "edit"
+model = "anthropic/claude-sonnet-4-20250514"
+
+[profiles.edit]
+allowed_tools = ["read", "write", "execute"]
+
+[profiles.research]
+allowed_tools = ["read", "web_search"]
+"#;
+        let config = parse_routing_config(toml).unwrap();
+        assert_eq!(config.profiles.len(), 2);
+        assert_eq!(
+            config.profiles["edit"].allowed_tools,
+            vec!["read", "write", "execute"]
+        );
+        assert_eq!(
+            config.profiles["research"].allowed_tools,
+            vec!["read", "web_search"]
+        );
+    }
+
+    #[test]
+    fn parse_config_without_profiles_backwards_compat() {
+        let toml = r#"
+default_model = "openrouter/auto"
+
+[[rules]]
+worker_type = "edit"
+model = "anthropic/claude-sonnet-4-20250514"
+"#;
+        let config = parse_routing_config(toml).unwrap();
+        assert!(config.profiles.is_empty());
+    }
+
+    #[test]
+    fn default_config_has_empty_profiles() {
+        let config = RoutingConfig::default();
+        assert!(config.profiles.is_empty());
     }
 }
