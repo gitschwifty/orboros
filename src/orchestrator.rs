@@ -284,6 +284,53 @@ pub async fn orchestrate(
     })
 }
 
+/// Builds a `Task`, prompt, and `WorkerConfig` for a single subtask spec.
+fn prepare_subtask(
+    spec: &Subtask,
+    prior_results: &[SubtaskResult],
+    parent: &Task,
+    config: &OrchestrateConfig,
+    store: &TaskStore,
+) -> anyhow::Result<(Task, String, WorkerConfig)> {
+    let task = Task::new(&spec.title, &spec.description)
+        .with_parent(parent.id)
+        .with_priority(parent.priority);
+    store.append(&task)?;
+
+    let prompt = build_prompt(
+        &spec.description,
+        prior_results,
+        config.context_result_max_chars,
+    );
+    let model = config.routing.model_for(&spec.worker_type);
+    let profile = config.routing.profile_for(&spec.worker_type);
+    let filtered = filter_tools(&spec.tools_needed, profile);
+    if !filtered.denied.is_empty() {
+        warn!(
+            worker_type = %spec.worker_type,
+            denied = ?filtered.denied,
+            "Profile denied tools for worker"
+        );
+    }
+    let worker_config = WorkerConfig {
+        command: config.worker_binary.clone(),
+        args: config.worker_args.clone(),
+        cwd: config.worker_cwd.clone(),
+        env: config.worker_env.clone(),
+        model: model.to_string(),
+        system_prompt: format!(
+            "You are a {} worker. Complete the task described in the user message.",
+            spec.worker_type
+        ),
+        tools: filtered.allowed,
+        max_iterations: None,
+        init_timeout: None,
+        send_timeout: None,
+        shutdown_timeout: None,
+    };
+    Ok((task, prompt, worker_config))
+}
+
 /// Executes an order group, running subtasks concurrently if there are multiple.
 /// Uses the worker pool to bound concurrency.
 #[allow(clippy::too_many_arguments)]
@@ -297,46 +344,9 @@ async fn execute_order_group(
     root_token: &CancellationToken,
     budget: Option<&BudgetTracker>,
 ) -> anyhow::Result<Vec<SubtaskResult>> {
-    // Prepare all subtask items
     let mut items: Vec<(Task, String, WorkerConfig)> = Vec::with_capacity(group.len());
     for spec in group {
-        let task = Task::new(&spec.title, &spec.description)
-            .with_parent(parent.id)
-            .with_priority(parent.priority);
-        store.append(&task)?;
-
-        let prompt = build_prompt(
-            &spec.description,
-            prior_results,
-            config.context_result_max_chars,
-        );
-        let model = config.routing.model_for(&spec.worker_type);
-        let profile = config.routing.profile_for(&spec.worker_type);
-        let filtered = filter_tools(&spec.tools_needed, profile);
-        if !filtered.denied.is_empty() {
-            warn!(
-                worker_type = %spec.worker_type,
-                denied = ?filtered.denied,
-                "Profile denied tools for worker"
-            );
-        }
-        let worker_config = WorkerConfig {
-            command: config.worker_binary.clone(),
-            args: config.worker_args.clone(),
-            cwd: config.worker_cwd.clone(),
-            env: config.worker_env.clone(),
-            model: model.to_string(),
-            system_prompt: format!(
-                "You are a {} worker. Complete the task described in the user message.",
-                spec.worker_type
-            ),
-            tools: filtered.allowed,
-            max_iterations: None,
-            init_timeout: None,
-            send_timeout: None,
-            shutdown_timeout: None,
-        };
-        items.push((task, prompt, worker_config));
+        items.push(prepare_subtask(spec, prior_results, parent, config, store)?);
     }
 
     // Single subtask: execute inline via pool, no spawn overhead
