@@ -156,6 +156,18 @@ pub enum WorkerEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         details: Option<serde_json::Value>,
     },
+    PermissionRequest {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    PermissionDenied {
+        name: String,
+        reason: String,
+    },
+    PlanComplete {
+        plan: String,
+    },
     Heartbeat {
         duration_ms: u32,
     },
