@@ -1,9 +1,12 @@
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::BufReader;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex as TokioMutex;
+use tokio_util::sync::CancellationToken;
 
 use crate::ipc::error::IpcError;
 use crate::ipc::transport::{read_response, write_request};
@@ -41,11 +44,53 @@ pub struct WorkerConfig {
 /// A running worker process communicating over JSON-line IPC.
 pub struct Worker {
     child: Child,
-    stdin: ChildStdin,
+    stdin: Arc<TokioMutex<ChildStdin>>,
     reader: BufReader<ChildStdout>,
     session_id: String,
     send_timeout: Option<Duration>,
     shutdown_timeout: Option<Duration>,
+}
+
+/// The outcome of a `send` call, including streamed events and the final result.
+#[derive(Debug)]
+pub struct SendOutcome {
+    pub id: String,
+    pub status: ResultStatus,
+    pub response: Option<String>,
+    pub tool_calls_made: Vec<crate::ipc::types::ToolCallRecord>,
+    pub usage: Option<crate::ipc::types::Usage>,
+    pub iterations: u32,
+    pub error: Option<ErrorEnvelope>,
+    pub events: Vec<WorkerEvent>,
+}
+
+/// Handle for sending a cancel request to a running worker.
+/// Clone-able so it can be held by timeout/budget watchers.
+#[derive(Clone)]
+pub struct CancelSender {
+    stdin: Arc<TokioMutex<ChildStdin>>,
+    session_id: String,
+}
+
+impl CancelSender {
+    /// Sends an IPC cancel request for the given target send ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns `IpcError` if writing the cancel request fails.
+    pub async fn cancel(&self, target_id: &str) -> Result<(), IpcError> {
+        let request = IpcRequest::Cancel {
+            id: format!("cancel-{target_id}"),
+            target_id: target_id.into(),
+        };
+        let mut stdin = self.stdin.lock().await;
+        write_request(&mut stdin, &request).await
+    }
+
+    /// Returns the session ID of the worker.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
 }
 
 impl Worker {
@@ -73,7 +118,9 @@ impl Worker {
 
         let mut child = cmd.spawn().map_err(IpcError::Write)?;
 
-        let stdin = child.stdin.take().ok_or(IpcError::StdoutClosed)?;
+        let stdin = Arc::new(TokioMutex::new(
+            child.stdin.take().ok_or(IpcError::StdoutClosed)?,
+        ));
         let stdout = child.stdout.take().ok_or(IpcError::StdoutClosed)?;
         let reader = BufReader::new(stdout);
 
@@ -111,7 +158,10 @@ impl Worker {
             },
         };
 
-        write_request(&mut self.stdin, &request).await?;
+        {
+            let mut stdin = self.stdin.lock().await;
+            write_request(&mut stdin, &request).await?;
+        }
 
         let response = read_response(&mut self.reader)
             .await?
@@ -180,7 +230,10 @@ impl Worker {
             message: message.into(),
         };
 
-        write_request(&mut self.stdin, &request).await?;
+        {
+            let mut stdin = self.stdin.lock().await;
+            write_request(&mut stdin, &request).await?;
+        }
 
         let mut events = Vec::new();
 
@@ -244,7 +297,10 @@ impl Worker {
             id: "shutdown-1".into(),
         };
 
-        write_request(&mut self.stdin, &request).await?;
+        {
+            let mut stdin = self.stdin.lock().await;
+            write_request(&mut stdin, &request).await?;
+        }
 
         let response = read_response(&mut self.reader)
             .await?
@@ -262,23 +318,98 @@ impl Worker {
         }
     }
 
+    /// Attempts graceful shutdown within the grace period, then kills the process.
+    /// Always succeeds — errors from shutdown are swallowed.
+    pub async fn force_stop(mut self, grace: Duration) {
+        let ok = matches!(
+            tokio::time::timeout(grace, self.shutdown_inner()).await,
+            Ok(Ok(()))
+        );
+        if !ok {
+            let _ = self.child.kill().await;
+        }
+    }
+
     /// Returns the session ID assigned by the worker during init.
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
-}
 
-/// The outcome of a `send` call, including streamed events and the final result.
-#[derive(Debug)]
-pub struct SendOutcome {
-    pub id: String,
-    pub status: ResultStatus,
-    pub response: Option<String>,
-    pub tool_calls_made: Vec<crate::ipc::types::ToolCallRecord>,
-    pub usage: Option<crate::ipc::types::Usage>,
-    pub iterations: u32,
-    pub error: Option<ErrorEnvelope>,
-    pub events: Vec<WorkerEvent>,
+    /// Returns a `CancelSender` that can send cancel requests to this worker.
+    pub fn cancel_sender(&self) -> CancelSender {
+        CancelSender {
+            stdin: Arc::clone(&self.stdin),
+            session_id: self.session_id.clone(),
+        }
+    }
+
+    /// Like `send()`, but races against a `CancellationToken`.
+    /// If the token fires, sends a cancel request and returns the cancelled result.
+    ///
+    /// # Errors
+    ///
+    /// Returns `IpcError` if the send fails or the worker does not respond to cancel.
+    pub async fn send_cancellable(
+        &mut self,
+        id: &str,
+        message: &str,
+        token: CancellationToken,
+    ) -> Result<SendOutcome, IpcError> {
+        let cancel_sender = self.cancel_sender();
+        let id_owned = id.to_string();
+
+        tokio::select! {
+            result = self.send(&id_owned, message) => result,
+            () = token.cancelled() => {
+                // Token fired — try to cancel the in-flight send
+                let _ = cancel_sender.cancel(&id_owned).await;
+                // Read the response (should be a cancelled result)
+                // Give a short timeout for the cancel response
+                match tokio::time::timeout(
+                    Duration::from_secs(2),
+                    self.read_remaining_response()
+                ).await {
+                    Ok(Ok(outcome)) => Ok(outcome),
+                    _ => Err(IpcError::StdoutClosed),
+                }
+            }
+        }
+    }
+
+    /// Reads remaining response after a cancel -- collects events until result.
+    async fn read_remaining_response(&mut self) -> Result<SendOutcome, IpcError> {
+        let mut events = Vec::new();
+        loop {
+            let response = read_response(&mut self.reader)
+                .await?
+                .ok_or(IpcError::StdoutClosed)?;
+            match response {
+                IpcResponse::Event { event, .. } => events.push(event),
+                IpcResponse::Result {
+                    id,
+                    status,
+                    response,
+                    tool_calls_made,
+                    usage,
+                    iterations,
+                    error,
+                    ..
+                } => {
+                    return Ok(SendOutcome {
+                        id,
+                        status,
+                        response,
+                        tool_calls_made,
+                        usage,
+                        iterations,
+                        error,
+                        events,
+                    });
+                }
+                _ => {} // ignore other responses during cancel drain
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -291,6 +422,26 @@ mod tests {
             command: "bash".into(),
             args: vec![manifest_dir
                 .join("test-fixtures/mock-worker.sh")
+                .to_string_lossy()
+                .into()],
+            cwd: None,
+            env: vec![],
+            model: "mock/test".into(),
+            system_prompt: "You are a test assistant.".into(),
+            tools: vec![],
+            max_iterations: None,
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
+        }
+    }
+
+    fn cancel_mock_worker_config() -> WorkerConfig {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        WorkerConfig {
+            command: "bash".into(),
+            args: vec![manifest_dir
+                .join("test-fixtures/mock-worker-cancel.sh")
                 .to_string_lossy()
                 .into()],
             cwd: None,
@@ -487,5 +638,109 @@ mod tests {
         let outcome = worker.send("msg-1", "hello").await.unwrap();
         assert_eq!(outcome.status, ResultStatus::Ok);
         worker.shutdown().await.unwrap();
+    }
+
+    // ---- Step 1: CancelSender tests ----
+
+    #[tokio::test]
+    async fn cancel_sender_is_clone() {
+        let worker = Worker::spawn(&mock_worker_config()).await.unwrap();
+        let cancel_sender = worker.cancel_sender();
+        let _cloned = cancel_sender.clone();
+        assert_eq!(cancel_sender.session_id(), "mock-sess-001");
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_during_send() {
+        let mut worker = Worker::spawn(&cancel_mock_worker_config()).await.unwrap();
+        assert_eq!(worker.session_id(), "cancel-sess-001");
+
+        let cancel_sender = worker.cancel_sender();
+
+        // Start send in a spawned task — the cancel mock won't respond until cancel arrives
+        let send_handle = tokio::spawn(async move { worker.send("msg-1", "hello").await });
+
+        // Give the send a moment to write the request
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Send cancel
+        cancel_sender.cancel("msg-1").await.unwrap();
+
+        // The send should now complete with a cancelled result
+        let outcome = send_handle.await.unwrap().unwrap();
+        assert_eq!(outcome.status, ResultStatus::Cancelled);
+        assert!(
+            outcome
+                .error
+                .as_ref()
+                .is_some_and(|e| e.code == "cancelled"),
+            "Expected cancelled error, got: {:?}",
+            outcome.error
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_send_works_with_arc_stdin() {
+        // Validates the refactor: existing mock worker still works with Arc<Mutex> stdin
+        let mut worker = Worker::spawn(&mock_worker_config()).await.unwrap();
+        let outcome = worker.send("msg-1", "hello").await.unwrap();
+        assert_eq!(outcome.status, ResultStatus::Ok);
+        assert_eq!(outcome.response.as_deref(), Some("Hello from mock worker"));
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_after_completion_is_harmless() {
+        let mut worker = Worker::spawn(&mock_worker_config()).await.unwrap();
+        let cancel_sender = worker.cancel_sender();
+
+        // Complete a normal send
+        let outcome = worker.send("msg-1", "hello").await.unwrap();
+        assert_eq!(outcome.status, ResultStatus::Ok);
+
+        // Cancel after completion — should not panic, may fail with write error (ok)
+        let cancel_result = cancel_sender.cancel("msg-1").await;
+        // Either Ok (wrote but worker ignored) or Err (broken pipe) — both fine
+        drop(cancel_result);
+
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_force_stop_graceful() {
+        let worker = Worker::spawn(&mock_worker_config()).await.unwrap();
+        // force_stop with generous grace should shutdown gracefully
+        worker.force_stop(Duration::from_secs(5)).await;
+        // No panic = success
+    }
+
+    #[tokio::test]
+    async fn worker_force_stop_kills_on_timeout() {
+        // Use a worker that won't respond to shutdown (mock-worker-slow with long delay)
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let config = WorkerConfig {
+            command: "bash".into(),
+            args: vec![manifest_dir
+                .join("test-fixtures/mock-worker-slow.sh")
+                .to_string_lossy()
+                .into()],
+            cwd: None,
+            env: vec![
+                ("MOCK_DELAY".into(), "0".into()),
+                ("MOCK_SEND_DELAY".into(), "0".into()),
+            ],
+            model: "mock/slow".into(),
+            system_prompt: "test".into(),
+            tools: vec![],
+            max_iterations: None,
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
+        };
+        let worker = Worker::spawn(&config).await.unwrap();
+        // Very short grace period — should trigger kill
+        worker.force_stop(Duration::from_millis(50)).await;
+        // No panic/hang = success
     }
 }

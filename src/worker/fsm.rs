@@ -1,5 +1,7 @@
+use tokio_util::sync::CancellationToken;
+
 use crate::ipc::error::IpcError;
-use crate::worker::process::{SendOutcome, Worker, WorkerConfig};
+use crate::worker::process::{CancelSender, SendOutcome, Worker, WorkerConfig};
 
 // ---------------------------------------------------------------------------
 // Failure taxonomy
@@ -158,6 +160,11 @@ impl WorkerFsm {
         self.last_outcome.as_ref()
     }
 
+    /// Returns a `CancelSender` if the worker is alive (has a Worker instance).
+    pub fn cancel_handle(&self) -> Option<CancelSender> {
+        self.worker.as_ref().map(Worker::cancel_sender)
+    }
+
     /// Spawns the worker process and performs the init handshake.
     ///
     /// Transitions: `Idle` → `Initializing` → `Ready` (or `Stopped` on failure).
@@ -215,6 +222,47 @@ impl WorkerFsm {
 
         let worker = self.worker.as_mut().expect("worker must exist in Ready");
         match worker.send(id, message).await {
+            Ok(outcome) => {
+                self.last_outcome = Some(outcome);
+                self.state = WorkerState::Ready;
+                Ok(self.last_outcome.as_ref().unwrap())
+            }
+            Err(e) => {
+                let class = FailureClass::from(&e);
+                self.failure = Some(class.clone());
+                self.state = WorkerState::Stopped(StopReason::Failed(class.clone()));
+                Err(FsmError::WorkerFailed(class))
+            }
+        }
+    }
+
+    /// Sends a message with cancellation support.
+    ///
+    /// Transitions: `Ready` → `Running` → `Ready` (or `Stopped` on failure).
+    ///
+    /// # Errors
+    ///
+    /// Returns `FsmError::InvalidTransition` if not in `Ready` state.
+    /// Returns `FsmError::WorkerFailed` if the send fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if internal state is inconsistent (worker missing while in `Ready`).
+    pub async fn send_cancellable(
+        &mut self,
+        id: &str,
+        message: &str,
+        token: CancellationToken,
+    ) -> Result<&SendOutcome, FsmError> {
+        if self.state != WorkerState::Ready {
+            return Err(FsmError::InvalidTransition {
+                current: self.state.clone(),
+                action: "send_cancellable".into(),
+            });
+        }
+        self.state = WorkerState::Running;
+        let worker = self.worker.as_mut().expect("worker must exist in Ready");
+        match worker.send_cancellable(id, message, token).await {
             Ok(outcome) => {
                 self.last_outcome = Some(outcome);
                 self.state = WorkerState::Ready;
@@ -577,5 +625,37 @@ mod tests {
         fsm.stop().await.unwrap();
         assert_eq!(*fsm.state(), WorkerState::Stopped(StopReason::Clean));
         assert!(fsm.failure().is_none());
+    }
+
+    // ---- cancel_handle tests ----
+
+    #[test]
+    fn cancel_handle_none_before_start() {
+        let fsm = WorkerFsm::new(mock_worker_config());
+        assert!(fsm.cancel_handle().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_handle_some_after_start() {
+        let mut fsm = WorkerFsm::new(mock_worker_config());
+        fsm.start().await.unwrap();
+        assert!(fsm.cancel_handle().is_some());
+        fsm.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_handle_none_after_stop() {
+        let mut fsm = WorkerFsm::new(mock_worker_config());
+        fsm.start().await.unwrap();
+        fsm.stop().await.unwrap();
+        // Worker is taken during stop
+        assert!(fsm.cancel_handle().is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_handle_none_after_failure() {
+        let mut fsm = WorkerFsm::new(bad_binary_config());
+        let _ = fsm.start().await;
+        assert!(fsm.cancel_handle().is_none());
     }
 }

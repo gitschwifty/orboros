@@ -16,6 +16,8 @@ pub enum TaskStatus {
     Done,
     /// Failed during execution.
     Failed,
+    /// Cancelled before completion.
+    Cancelled,
 }
 
 /// A task managed by the orchestrator.
@@ -130,6 +132,8 @@ mod tests {
         assert_eq!(json, "\"active\"");
         let json = serde_json::to_string(&TaskStatus::Review).unwrap();
         assert_eq!(json, "\"review\"");
+        let json = serde_json::to_string(&TaskStatus::Cancelled).unwrap();
+        assert_eq!(json, "\"cancelled\"");
     }
 
     #[test]

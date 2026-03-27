@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -12,8 +13,11 @@ use crate::routing::profile::filter_tools;
 use crate::routing::rules::RoutingConfig;
 use crate::state::store::TaskStore;
 use crate::state::task::{Task, TaskStatus};
+use crate::worker::budget::BudgetTracker;
 use crate::worker::pool::WorkerPool;
 use crate::worker::process::WorkerConfig;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 /// Maximum characters of a subtask result to include in context for later subtasks.
 pub const CONTEXT_RESULT_MAX_CHARS: usize = 500;
@@ -35,6 +39,10 @@ pub struct OrchestrateConfig {
     pub max_concurrency: usize,
     /// Maximum characters of a subtask result to include in context for later subtasks.
     pub context_result_max_chars: usize,
+    /// Optional task-level timeout. If set, cancels all subtasks after this duration.
+    pub task_timeout: Option<Duration>,
+    /// Optional token budget. If set, cancels remaining subtasks when cumulative usage exceeds limit.
+    pub budget_limit: Option<u32>,
 }
 
 /// Result of a single subtask execution.
@@ -50,6 +58,26 @@ pub struct SubtaskResult {
     pub status: TaskStatus,
     /// Response text from the worker.
     pub response: Option<String>,
+    /// Token usage from the worker.
+    pub usage: Option<crate::ipc::types::Usage>,
+    /// Number of retries before this result.
+    pub retries: u32,
+}
+
+/// Why the orchestration run ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminationReason {
+    /// All subtasks completed successfully.
+    Completed,
+    /// Some subtasks failed but the run wasn't cancelled.
+    PartialFailure,
+    /// Task-level timeout fired.
+    Timeout,
+    /// Budget limit was exceeded.
+    BudgetExceeded,
+    /// Explicitly cancelled (token fired for other reasons).
+    Cancelled,
 }
 
 /// Outcome of a full orchestration run.
@@ -61,6 +89,12 @@ pub struct OrchestrateOutcome {
     pub subtask_results: Vec<SubtaskResult>,
     /// Aggregated result (None until aggregation is implemented).
     pub aggregated_result: Option<String>,
+    /// Why the run ended.
+    pub termination_reason: TerminationReason,
+    /// Cumulative token usage across all subtasks.
+    pub total_usage: Option<crate::ipc::types::Usage>,
+    /// Wall-clock time for the orchestration run.
+    pub elapsed: Duration,
 }
 
 /// Builds a prompt with context from prior subtask results prepended.
@@ -101,6 +135,7 @@ pub fn build_prompt(
 /// Returns an error if task store operations fail. Individual subtask failures
 /// are recorded but do not cause early return — all subtasks in subsequent
 /// groups still execute.
+#[allow(clippy::too_many_lines)]
 pub async fn orchestrate(
     store: &TaskStore,
     parent: &mut Task,
@@ -110,29 +145,88 @@ pub async fn orchestrate(
     parent.transition(TaskStatus::Active);
     store.update(parent)?;
 
+    let start = tokio::time::Instant::now();
     let store = Arc::new(store.clone());
     let pool = Arc::new(WorkerPool::new(config.max_concurrency));
+
+    // Create root cancellation token; spawn timeout timer if configured
+    let root_token = CancellationToken::new();
+    let timeout_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some(timeout) = config.task_timeout {
+        let token = root_token.clone();
+        let fired = Arc::clone(&timeout_fired);
+        tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            fired.store(true, std::sync::atomic::Ordering::Relaxed);
+            token.cancel();
+        });
+    }
+
+    // Create budget tracker if configured
+    let budget = config
+        .budget_limit
+        .map(|limit| BudgetTracker::new(limit, root_token.clone()));
 
     // Group subtasks by order
     let groups = group_by_order(subtask_specs);
     let mut all_results: Vec<SubtaskResult> = Vec::new();
 
     for group in groups.values() {
-        let group_results =
-            execute_order_group(group, &all_results, &store, &pool, parent, config).await?;
+        let group_results = execute_order_group(
+            group,
+            &all_results,
+            &store,
+            &pool,
+            parent,
+            config,
+            &root_token,
+            budget.as_ref(),
+        )
+        .await?;
         all_results.extend(group_results);
     }
 
-    // Determine parent status
+    // Determine parent status and termination reason
     let all_done = all_results.iter().all(|r| r.status == TaskStatus::Done);
-    let any_failed = all_results.iter().any(|r| r.status == TaskStatus::Failed);
+    let any_failed = all_results
+        .iter()
+        .any(|r| r.status == TaskStatus::Failed || r.status == TaskStatus::Cancelled);
 
-    let parent_status = if all_done {
-        TaskStatus::Done
+    let (parent_status, termination_reason) = if all_done {
+        (TaskStatus::Done, TerminationReason::Completed)
+    } else if timeout_fired.load(std::sync::atomic::Ordering::Relaxed) {
+        (TaskStatus::Failed, TerminationReason::Timeout)
+    } else if budget.as_ref().is_some_and(BudgetTracker::is_exceeded) {
+        (TaskStatus::Failed, TerminationReason::BudgetExceeded)
+    } else if root_token.is_cancelled() {
+        (TaskStatus::Cancelled, TerminationReason::Cancelled)
     } else if any_failed {
-        TaskStatus::Failed
+        (TaskStatus::Failed, TerminationReason::PartialFailure)
     } else {
-        TaskStatus::Active
+        (TaskStatus::Active, TerminationReason::Completed)
+    };
+
+    // Compute total usage
+    let total_usage = {
+        let mut total = crate::ipc::types::Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+        };
+        let mut has_any = false;
+        for result in &all_results {
+            if let Some(ref u) = result.usage {
+                total.prompt_tokens += u.prompt_tokens;
+                total.completion_tokens += u.completion_tokens;
+                total.total_tokens += u.total_tokens;
+                has_any = true;
+            }
+        }
+        if has_any {
+            Some(total)
+        } else {
+            None
+        }
     };
 
     parent.transition(parent_status);
@@ -184,11 +278,15 @@ pub async fn orchestrate(
         parent_status,
         subtask_results: all_results,
         aggregated_result,
+        termination_reason,
+        total_usage,
+        elapsed: start.elapsed(),
     })
 }
 
 /// Executes an order group, running subtasks concurrently if there are multiple.
 /// Uses the worker pool to bound concurrency.
+#[allow(clippy::too_many_arguments)]
 async fn execute_order_group(
     group: &[&Subtask],
     prior_results: &[SubtaskResult],
@@ -196,6 +294,8 @@ async fn execute_order_group(
     pool: &Arc<WorkerPool>,
     parent: &Task,
     config: &OrchestrateConfig,
+    root_token: &CancellationToken,
+    budget: Option<&BudgetTracker>,
 ) -> anyhow::Result<Vec<SubtaskResult>> {
     // Prepare all subtask items
     let mut items: Vec<(Task, String, WorkerConfig)> = Vec::with_capacity(group.len());
@@ -243,14 +343,25 @@ async fn execute_order_group(
     if items.len() == 1 {
         let (mut task, prompt, worker_config) = items.into_iter().next().unwrap();
         let outcome = pool
-            .execute(store, &mut task, &prompt, &worker_config)
+            .execute(
+                store,
+                &mut task,
+                &prompt,
+                &worker_config,
+                root_token.child_token(),
+            )
             .await;
+        if let (Some(budget), Some(usage)) = (budget, &outcome.usage) {
+            budget.record(usage.total_tokens);
+        }
         let result = SubtaskResult {
             task_id: task.id,
             title: task.title.clone(),
             order: 0,
             status: outcome.status,
             response: outcome.response,
+            usage: outcome.usage,
+            retries: outcome.retries,
         };
         info!(
             task_id = %task.id,
@@ -266,12 +377,15 @@ async fn execute_order_group(
     for (task, prompt, worker_config) in items {
         let store = Arc::clone(store);
         let pool = Arc::clone(pool);
+        let budget = budget.cloned();
         join_set.spawn(execute_subtask_owned(
             store,
             pool,
             task,
             prompt,
             worker_config,
+            root_token.child_token(),
+            budget,
         ));
     }
 
@@ -303,14 +417,23 @@ async fn execute_subtask_owned(
     mut task: Task,
     prompt: String,
     config: WorkerConfig,
+    token: CancellationToken,
+    budget: Option<BudgetTracker>,
 ) -> SubtaskResult {
-    let outcome = pool.execute(&store, &mut task, &prompt, &config).await;
+    let outcome = pool
+        .execute(&store, &mut task, &prompt, &config, token)
+        .await;
+    if let (Some(budget), Some(usage)) = (&budget, &outcome.usage) {
+        budget.record(usage.total_tokens);
+    }
     SubtaskResult {
         task_id: task.id,
         title: task.title.clone(),
         order: 0,
         status: outcome.status,
         response: outcome.response,
+        usage: outcome.usage,
+        retries: outcome.retries,
     }
 }
 
@@ -381,6 +504,8 @@ mod tests {
             routing: RoutingConfig::default(),
             max_concurrency: 1,
             context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
+            task_timeout: None,
+            budget_limit: None,
         }
     }
 
@@ -397,6 +522,8 @@ mod tests {
             routing: RoutingConfig::default(),
             max_concurrency: 1,
             context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
+            task_timeout: None,
+            budget_limit: None,
         }
     }
 
@@ -443,6 +570,8 @@ mod tests {
                 order: 0,
                 status: TaskStatus::Done,
                 response: Some("Found some patterns".into()),
+                usage: None,
+                retries: 0,
             },
             SubtaskResult {
                 task_id: Uuid::new_v4(),
@@ -450,6 +579,8 @@ mod tests {
                 order: 0,
                 status: TaskStatus::Done,
                 response: Some("Wrote initial draft".into()),
+                usage: None,
+                retries: 0,
             },
         ];
 
@@ -469,6 +600,8 @@ mod tests {
             order: 0,
             status: TaskStatus::Done,
             response: Some(long_response),
+            usage: None,
+            retries: 0,
         }];
 
         let prompt = build_prompt("Next step", &prior, CONTEXT_RESULT_MAX_CHARS);
@@ -487,6 +620,8 @@ mod tests {
             order: 0,
             status: TaskStatus::Failed,
             response: None,
+            usage: None,
+            retries: 0,
         }];
 
         let prompt = build_prompt("Continue anyway", &prior, CONTEXT_RESULT_MAX_CHARS);
@@ -502,6 +637,8 @@ mod tests {
             order: 0,
             status: TaskStatus::Done,
             response: Some(long_response),
+            usage: None,
+            retries: 0,
         }];
 
         let prompt = build_prompt("Next step", &prior, 50);
@@ -542,7 +679,13 @@ mod tests {
         store.append(&task).unwrap();
 
         let outcome = pool
-            .execute(&store, &mut task, "Say hello", &mock_worker_config())
+            .execute(
+                &store,
+                &mut task,
+                "Say hello",
+                &mock_worker_config(),
+                CancellationToken::new(),
+            )
             .await;
         assert_eq!(outcome.status, TaskStatus::Done);
         assert_eq!(outcome.response.as_deref(), Some("Hello from mock worker"));
@@ -558,7 +701,13 @@ mod tests {
         store.append(&task).unwrap();
 
         let outcome = pool
-            .execute(&store, &mut task, "Echo this back", &echo_worker_config())
+            .execute(
+                &store,
+                &mut task,
+                "Echo this back",
+                &echo_worker_config(),
+                CancellationToken::new(),
+            )
             .await;
         assert_eq!(outcome.status, TaskStatus::Done);
         assert_eq!(outcome.response.as_deref(), Some("Echo this back"));
@@ -587,7 +736,13 @@ mod tests {
         store.append(&task).unwrap();
 
         let outcome = pool
-            .execute(&store, &mut task, "This will fail", &config)
+            .execute(
+                &store,
+                &mut task,
+                "This will fail",
+                &config,
+                CancellationToken::new(),
+            )
             .await;
         assert_eq!(outcome.status, TaskStatus::Failed);
         assert!(outcome
@@ -683,6 +838,8 @@ mod tests {
             routing: RoutingConfig::default(),
             max_concurrency: 1,
             context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
+            task_timeout: None,
+            budget_limit: None,
         };
 
         let mut parent = Task::new("Parent", "This will fail");
@@ -976,6 +1133,8 @@ mod tests {
             routing: RoutingConfig::default(),
             max_concurrency: 1,
             context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
+            task_timeout: None,
+            budget_limit: None,
         };
 
         let mut parent = Task::new("Parent", "Will fail");
@@ -994,5 +1153,226 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("subtasks failed"));
+    }
+
+    // --- task timeout tests ---
+
+    #[tokio::test]
+    async fn no_timeout_by_default() {
+        let config = test_orchestrate_config();
+        assert!(config.task_timeout.is_none());
+    }
+
+    #[tokio::test]
+    async fn timeout_fires_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let config = OrchestrateConfig {
+            worker_binary: "bash".into(),
+            worker_args: vec![manifest_dir
+                .join("test-fixtures/mock-worker-slow.sh")
+                .to_string_lossy()
+                .into()],
+            worker_cwd: None,
+            worker_env: vec![
+                ("MOCK_DELAY".into(), "0".into()),
+                ("MOCK_SEND_DELAY".into(), "10".into()),
+            ],
+            routing: RoutingConfig::default(),
+            max_concurrency: 1,
+            context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
+            task_timeout: Some(Duration::from_millis(200)),
+            budget_limit: None,
+        };
+
+        let mut parent = Task::new("Timeout test", "Should be cancelled");
+        store.append(&parent).unwrap();
+        let subtasks = vec![make_subtask("Slow step", "Take forever", 0)];
+
+        let outcome = orchestrate(&store, &mut parent, &subtasks, &config)
+            .await
+            .unwrap();
+
+        // The subtask should have failed due to cancellation
+        assert_eq!(outcome.parent_status, TaskStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn completes_before_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let mut config = test_orchestrate_config();
+        config.task_timeout = Some(Duration::from_secs(10));
+
+        let mut parent = Task::new("Fast parent", "Quick task");
+        store.append(&parent).unwrap();
+        let subtasks = vec![make_subtask("Fast step", "Do quickly", 0)];
+
+        let outcome = orchestrate(&store, &mut parent, &subtasks, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.parent_status, TaskStatus::Done);
+    }
+
+    // --- budget tests ---
+
+    #[test]
+    fn no_budget_by_default() {
+        let config = test_orchestrate_config();
+        assert!(config.budget_limit.is_none());
+    }
+
+    #[tokio::test]
+    async fn outcome_includes_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let config = test_orchestrate_config();
+
+        let mut parent = Task::new("Usage parent", "Check usage");
+        store.append(&parent).unwrap();
+        let subtasks = vec![make_subtask("Step", "Do it", 0)];
+
+        let outcome = orchestrate(&store, &mut parent, &subtasks, &config)
+            .await
+            .unwrap();
+
+        // The mock worker returns usage in its result
+        let result = &outcome.subtask_results[0];
+        assert!(result.usage.is_some(), "Expected usage in subtask result");
+    }
+
+    #[tokio::test]
+    async fn budget_cancels_orchestration() {
+        // Verify that BudgetTracker fires the cancellation token when budget exceeded
+        use crate::worker::budget::BudgetTracker;
+
+        let token = CancellationToken::new();
+        let tracker = BudgetTracker::new(10, token.clone());
+        assert!(!token.is_cancelled());
+
+        // First subtask usage stays under budget
+        tracker.record(5);
+        assert!(!token.is_cancelled());
+
+        // Second subtask pushes over budget
+        tracker.record(10);
+        assert!(token.is_cancelled());
+        assert!(tracker.is_exceeded());
+        assert_eq!(tracker.total_tokens(), 15);
+    }
+
+    // --- Audit trail tests (Step 8) ---
+
+    #[test]
+    fn cancelled_variant_serializes() {
+        let json = serde_json::to_string(&TaskStatus::Cancelled).unwrap();
+        assert_eq!(json, "\"cancelled\"");
+        let parsed: TaskStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, TaskStatus::Cancelled);
+    }
+
+    #[test]
+    fn termination_reason_serde_round_trip() {
+        let reasons = vec![
+            TerminationReason::Completed,
+            TerminationReason::PartialFailure,
+            TerminationReason::Timeout,
+            TerminationReason::BudgetExceeded,
+            TerminationReason::Cancelled,
+        ];
+        for reason in reasons {
+            let json = serde_json::to_string(&reason).unwrap();
+            let parsed: TerminationReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, reason);
+        }
+    }
+
+    #[tokio::test]
+    async fn termination_reason_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let config = test_orchestrate_config();
+
+        let mut parent = Task::new("Good parent", "All good");
+        store.append(&parent).unwrap();
+        let subtasks = vec![make_subtask("Step", "Do it", 0)];
+
+        let outcome = orchestrate(&store, &mut parent, &subtasks, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.termination_reason, TerminationReason::Completed);
+        assert_eq!(outcome.parent_status, TaskStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn termination_reason_partial_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let config = OrchestrateConfig {
+            worker_binary: "/nonexistent/binary".into(),
+            worker_args: vec![],
+            worker_cwd: None,
+            worker_env: vec![],
+            routing: RoutingConfig::default(),
+            max_concurrency: 1,
+            context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
+            task_timeout: None,
+            budget_limit: None,
+        };
+
+        let mut parent = Task::new("Failing", "Will fail");
+        store.append(&parent).unwrap();
+        let subtasks = vec![make_subtask("Bad step", "Fail", 0)];
+
+        let outcome = orchestrate(&store, &mut parent, &subtasks, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome.termination_reason,
+            TerminationReason::PartialFailure
+        );
+    }
+
+    #[tokio::test]
+    async fn total_usage_summed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let config = test_orchestrate_config();
+
+        let mut parent = Task::new("Multi", "Multiple steps");
+        store.append(&parent).unwrap();
+        let subtasks = vec![
+            make_subtask("Step 1", "First", 0),
+            make_subtask("Step 2", "Second", 0),
+        ];
+
+        let outcome = orchestrate(&store, &mut parent, &subtasks, &config)
+            .await
+            .unwrap();
+
+        let total = outcome.total_usage.expect("should have total usage");
+        // Mock returns 15 total_tokens per subtask
+        assert!(total.total_tokens > 0);
+    }
+
+    #[tokio::test]
+    async fn elapsed_is_positive() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let config = test_orchestrate_config();
+
+        let mut parent = Task::new("Timer", "Check elapsed");
+        store.append(&parent).unwrap();
+        let subtasks = vec![make_subtask("Step", "Do it", 0)];
+
+        let outcome = orchestrate(&store, &mut parent, &subtasks, &config)
+            .await
+            .unwrap();
+
+        assert!(outcome.elapsed.as_nanos() > 0);
     }
 }

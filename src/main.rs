@@ -297,6 +297,8 @@ fn cmd_orchestrate(
         routing,
         max_concurrency: 4,
         context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
+        task_timeout: None,
+        budget_limit: None,
     };
 
     // Run orchestration
