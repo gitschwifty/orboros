@@ -90,7 +90,10 @@ pub async fn decompose(
     if outcome.status != ResultStatus::Ok {
         anyhow::bail!(
             "Coordinator returned error: {}",
-            outcome.error.unwrap_or_else(|| "unknown error".into())
+            outcome
+                .error
+                .as_ref()
+                .map_or("unknown error", |e| &*e.message)
         );
     }
 

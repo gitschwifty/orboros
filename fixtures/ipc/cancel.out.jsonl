@@ -1,3 +1,0 @@
-{"type":"init_ok","id":"1","session_id":"sess-cancel","protocol_version":"0.1.0"}
-{"type":"result","id":"2","status":"error","error":"cancelled","tool_calls_made":[],"iterations":0}
-{"type":"shutdown_ok","id":"4"}

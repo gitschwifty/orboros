@@ -1,0 +1,8 @@
+{"type":"init_ok","id":"1","session_id":"sess-hb","protocol_version":"0.2.0"}
+{"type":"event","event":{"event":"heartbeat","duration_ms":5000},"event_seq":0,"send_id":"2"}
+{"type":"event","event":{"event":"tool_start","name":"read_file","args":{"path":"src/main.rs"}},"event_seq":1,"send_id":"2"}
+{"type":"event","event":{"event":"tool_end","name":"read_file","result_preview":"fn main() { ... }"},"event_seq":2,"send_id":"2"}
+{"type":"event","event":{"event":"content_delta","text":"The codebase has..."},"event_seq":3,"send_id":"2"}
+{"type":"event","event":{"event":"usage","prompt_tokens":120,"completion_tokens":30,"total_tokens":150},"event_seq":4,"send_id":"2"}
+{"type":"result","id":"2","status":"ok","response":"The codebase has...","tool_calls_made":[{"name":"read_file","args":{"path":"src/main.rs"}}],"usage":{"prompt_tokens":120,"completion_tokens":30,"total_tokens":150},"iterations":2,"model_latency_ms":4900,"tool_latency_ms":200,"total_latency_ms":5100}
+{"type":"shutdown_ok","id":"3"}

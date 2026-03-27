@@ -1,0 +1,3 @@
+{"type":"init","id":"1","protocol_version":"0.2.0","config":{"model":"openrouter/auto","system_prompt":"You are a helpful assistant.","tools":["read_file","glob","grep"],"max_iterations":10}}
+{"type":"send","id":"2","message":"List files in the current directory."}
+{"type":"shutdown","id":"3"}

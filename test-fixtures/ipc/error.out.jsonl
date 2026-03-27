@@ -1,0 +1,4 @@
+{"type":"init_ok","id":"1","session_id":"sess-err","protocol_version":"0.2.0"}
+{"type":"event","event":{"event":"error","code":"provider_error","message":"Model error","retryable":true,"provider":"openrouter","details":{"error":{"message":"Model error","type":"error","code":500}}},"event_seq":0,"send_id":"2"}
+{"type":"result","id":"2","status":"error","error":{"code":"provider_error","message":"Model error","retryable":true,"details":{"error":{"message":"Model error","type":"error","code":500}}},"tool_calls_made":[],"iterations":0}
+{"type":"shutdown_ok","id":"3"}

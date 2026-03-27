@@ -83,7 +83,10 @@ pub async fn aggregate(
     if outcome.status != crate::ipc::types::ResultStatus::Ok {
         anyhow::bail!(
             "Aggregation returned error: {}",
-            outcome.error.unwrap_or_else(|| "unknown error".into())
+            outcome
+                .error
+                .as_ref()
+                .map_or("unknown error", |e| &*e.message)
         );
     }
 

@@ -50,7 +50,11 @@ pub async fn execute_task(
         }
         crate::ipc::types::ResultStatus::Error | crate::ipc::types::ResultStatus::Cancelled => {
             task.transition(TaskStatus::Failed);
-            task.result = outcome.error.or(outcome.response);
+            task.result = outcome
+                .error
+                .as_ref()
+                .map(|e| e.message.clone())
+                .or(outcome.response);
         }
     }
 

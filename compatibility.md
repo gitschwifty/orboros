@@ -29,10 +29,38 @@
 
 ### Responses/Events
 - `InitOk`
-- `Event` (`content_delta`, `tool_start`, `tool_end`, `usage`, `error`)
+- `Event` (`content_delta`, `tool_start`, `tool_end`, `usage`, `error`, `heartbeat`, `context_prune`, `context_compact`, `context_handoff`, `permission_request`, `permission_denied`, `plan_complete`)
 - `Result`
 - `StatusOk`
 - `ShutdownOk`
+
+## Changelog
+
+### 0.2.0
+
+**Summary:** All Batch 4 integration hardening changes (tasks 11–14). Adds protocol hardening, cancel/heartbeat, correlation IDs, latency tracking, and context transition events.
+
+**From 0.1.0:**
+- `event_seq` (monotonic, 0-based per send) and `send_id` on all Event responses
+- Structured `ErrorEnvelope` (`{ code, message, retryable, details? }`) replaces flat error strings on Result and InitOk
+- `heartbeat` WorkerEvent — emitted at fixed interval during active sends
+- `cancel` request aborts in-progress tools via AbortSignal threading
+- `InitConfig` gains optional `task_id`, `worker_id`
+- Event responses gain optional `session_id`, `task_id`, `worker_id` (correlation IDs)
+- Result gains optional `session_id`, `task_id`, `worker_id`, `model_latency_ms`, `tool_latency_ms`, `total_latency_ms`
+- `context_prune` WorkerEvent (`messages_pruned`, `tokens_before`, `tokens_after`)
+- `context_compact`, `context_handoff` WorkerEvent placeholders (schema only, not emitted yet)
+- `HeddleTool.execute` gains optional `signal` param (AbortSignal)
+
+**Error codes:** `provider_error` (retryable), `protocol_error`, `protocol_version_mismatch`, `tool_error`, `loop_detected`, `cancelled` (all non-retryable).
+
+### 0.1.0 (protocol-hardening)
+- **Event responses** now include `event_seq` (monotonic counter, 0-based per send) and `send_id` (mirrors the originating send request `id`).
+- **Result error** changed from `error?: string` to `error?: { code, message, retryable, details? }` (ErrorEnvelope).
+- **InitOk error** changed from `error?: string` to `error?: ErrorEnvelope`.
+- **WorkerEvent error variant** changed: `error` field renamed to `message`, `code` now required, `retryable` (boolean) added.
+- **Error codes**: `provider_error` (retryable), `protocol_error`, `protocol_version_mismatch`, `tool_error`, `loop_detected`, `cancelled` (all non-retryable).
+- *Note: 0.1.0 was never released independently; all changes are included in 0.2.0.*
 
 ## Forward/Backward Handling
 - Clients must ignore unknown fields.

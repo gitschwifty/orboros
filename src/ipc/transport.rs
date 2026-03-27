@@ -53,6 +53,8 @@ mod tests {
                 system_prompt: "test".into(),
                 tools: vec![],
                 max_iterations: None,
+                task_id: None,
+                worker_id: None,
             },
         };
         let json = serde_json::to_string(&req).unwrap();

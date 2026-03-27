@@ -125,9 +125,14 @@ async fn run_worker(task: &Task, prompt: &str, config: &WorkerConfig) -> Subtask
 
     let (status, response) = match outcome.status {
         ResultStatus::Ok => (TaskStatus::Done, outcome.response),
-        ResultStatus::Error | ResultStatus::Cancelled => {
-            (TaskStatus::Failed, outcome.error.or(outcome.response))
-        }
+        ResultStatus::Error | ResultStatus::Cancelled => (
+            TaskStatus::Failed,
+            outcome
+                .error
+                .as_ref()
+                .map(|e| e.message.clone())
+                .or(outcome.response),
+        ),
     };
 
     SubtaskOutcome { status, response }

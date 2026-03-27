@@ -9,12 +9,12 @@ while IFS= read -r line; do
 
   case "$type" in
     init)
-      echo "{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"mock-sess-001\",\"protocol_version\":\"0.1.0\"}"
+      echo "{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"mock-sess-001\",\"protocol_version\":\"0.2.0\"}"
       ;;
     send)
       # Stream events then result
-      echo "{\"type\":\"event\",\"event\":{\"event\":\"content_delta\",\"text\":\"Hello from mock\"}}"
-      echo "{\"type\":\"event\",\"event\":{\"event\":\"usage\",\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}"
+      echo "{\"type\":\"event\",\"event\":{\"event\":\"content_delta\",\"text\":\"Hello from mock\"},\"event_seq\":0,\"send_id\":\"$id\"}"
+      echo "{\"type\":\"event\",\"event\":{\"event\":\"usage\",\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15},\"event_seq\":1,\"send_id\":\"$id\"}"
       echo "{\"type\":\"result\",\"id\":\"$id\",\"status\":\"ok\",\"response\":\"Hello from mock worker\",\"tool_calls_made\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15},\"iterations\":1}"
       ;;
     status)
@@ -25,7 +25,7 @@ while IFS= read -r line; do
       exit 0
       ;;
     *)
-      echo "{\"type\":\"event\",\"event\":{\"event\":\"error\",\"error\":\"unknown request type: $type\"}}" >&2
+      echo "{\"type\":\"event\",\"event\":{\"event\":\"error\",\"message\":\"unknown request type: $type\",\"code\":\"unknown_request\",\"retryable\":false},\"event_seq\":0,\"send_id\":\"\"}" >&2
       ;;
   esac
 done

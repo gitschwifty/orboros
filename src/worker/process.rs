@@ -8,7 +8,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use crate::ipc::error::IpcError;
 use crate::ipc::transport::{read_response, write_request};
 use crate::ipc::types::{
-    InitConfig, IpcRequest, IpcResponse, ResultStatus, WorkerEvent, PROTOCOL_VERSION,
+    ErrorEnvelope, InitConfig, IpcRequest, IpcResponse, ResultStatus, WorkerEvent, PROTOCOL_VERSION,
 };
 
 /// Configuration for spawning a worker process.
@@ -106,6 +106,8 @@ impl Worker {
                 system_prompt: config.system_prompt.clone(),
                 tools: config.tools.clone(),
                 max_iterations: config.max_iterations,
+                task_id: None,
+                worker_id: None,
             },
         };
 
@@ -122,10 +124,10 @@ impl Worker {
                 error,
                 ..
             } => {
-                if let Some(err) = error {
+                if let Some(ref envelope) = error {
                     return Err(IpcError::UnexpectedResponse {
                         expected: "init_ok without error".into(),
-                        actual: err,
+                        actual: envelope.message.clone(),
                     });
                 }
                 if let Some(version) = &protocol_version {
@@ -145,7 +147,7 @@ impl Worker {
                 ..
             } => Err(IpcError::UnexpectedResponse {
                 expected: "init_ok".into(),
-                actual: error.unwrap_or_else(|| "unknown error during init".into()),
+                actual: error.map_or_else(|| "unknown error during init".into(), |e| e.message),
             }),
             other => Err(IpcError::UnexpectedResponse {
                 expected: "init_ok".into(),
@@ -188,7 +190,7 @@ impl Worker {
                 .ok_or(IpcError::StdoutClosed)?;
 
             match response {
-                IpcResponse::Event { event } => {
+                IpcResponse::Event { event, .. } => {
                     events.push(event);
                 }
                 IpcResponse::Result {
@@ -199,6 +201,7 @@ impl Worker {
                     usage,
                     iterations,
                     error,
+                    ..
                 } => {
                     return Ok(SendOutcome {
                         id: result_id,
@@ -274,7 +277,7 @@ pub struct SendOutcome {
     pub tool_calls_made: Vec<crate::ipc::types::ToolCallRecord>,
     pub usage: Option<crate::ipc::types::Usage>,
     pub iterations: u32,
-    pub error: Option<String>,
+    pub error: Option<ErrorEnvelope>,
     pub events: Vec<WorkerEvent>,
 }
 

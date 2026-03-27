@@ -1,0 +1,3 @@
+{"type":"init","id":"1","protocol_version":"0.2.0","config":{"model":"openrouter/auto","system_prompt":"You are a helpful assistant.","tools":["read_file"],"max_iterations":5}}
+{"type":"send","id":"2","message":"Analyze this codebase."}
+{"type":"shutdown","id":"3"}

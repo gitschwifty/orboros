@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 // ── Protocol version ──
 
-pub const PROTOCOL_VERSION: &str = "0.1.0";
+pub const PROTOCOL_VERSION: &str = "0.2.0";
 
 // ── Requests (Orboros → Heddle) ──
 
@@ -38,6 +38,20 @@ pub struct InitConfig {
     pub tools: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_iterations: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+}
+
+/// Structured error envelope returned by heddle in protocol 0.2.0+.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ErrorEnvelope {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
 }
 
 // ── Responses (Heddle → Orboros) ──
@@ -50,11 +64,21 @@ pub enum IpcResponse {
         session_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         protocol_version: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ErrorEnvelope>,
     },
     Event {
         event: WorkerEvent,
+        #[serde(default)]
+        event_seq: u32,
+        #[serde(default)]
+        send_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker_id: Option<String>,
     },
     Result {
         id: String,
@@ -67,8 +91,20 @@ pub enum IpcResponse {
         usage: Option<Usage>,
         #[serde(default)]
         iterations: u32,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<ErrorEnvelope>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_latency_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_latency_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total_latency_ms: Option<u64>,
     },
     StatusOk {
         id: String,
@@ -112,14 +148,24 @@ pub enum WorkerEvent {
         total_tokens: u32,
     },
     Error {
-        error: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        code: Option<String>,
+        message: String,
+        code: String,
+        retryable: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         details: Option<serde_json::Value>,
     },
+    Heartbeat {
+        duration_ms: u32,
+    },
+    ContextPrune {
+        messages_pruned: u32,
+        tokens_before: u32,
+        tokens_after: u32,
+    },
+    ContextCompact {},
+    ContextHandoff {},
 }
 
 // ── Shared types ──
@@ -144,7 +190,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn fixtures_dir() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/ipc")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-fixtures/ipc")
     }
 
     fn parse_jsonl_requests(content: &str) -> Vec<IpcRequest> {
@@ -175,6 +221,8 @@ mod tests {
                 system_prompt: "You are a helpful assistant.".into(),
                 tools: vec!["read_file".into(), "glob".into()],
                 max_iterations: Some(10),
+                task_id: None,
+                worker_id: None,
             },
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -209,7 +257,7 @@ mod tests {
         let resp = IpcResponse::InitOk {
             id: "1".into(),
             session_id: "sess-123".into(),
-            protocol_version: Some("0.1.0".into()),
+            protocol_version: Some("0.2.0".into()),
             error: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -234,6 +282,12 @@ mod tests {
             }),
             iterations: 2,
             error: None,
+            session_id: None,
+            task_id: None,
+            worker_id: None,
+            model_latency_ms: None,
+            tool_latency_ms: None,
+            total_latency_ms: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
@@ -249,7 +303,18 @@ mod tests {
             tool_calls_made: vec![],
             usage: None,
             iterations: 0,
-            error: Some("Model error".into()),
+            error: Some(ErrorEnvelope {
+                code: "provider_error".into(),
+                message: "Model error".into(),
+                retryable: true,
+                details: None,
+            }),
+            session_id: None,
+            task_id: None,
+            worker_id: None,
+            model_latency_ms: None,
+            tool_latency_ms: None,
+            total_latency_ms: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
@@ -263,6 +328,11 @@ mod tests {
                 name: "glob".into(),
                 args: serde_json::json!({"pattern": "*"}),
             },
+            event_seq: 0,
+            send_id: "2".into(),
+            session_id: None,
+            task_id: None,
+            worker_id: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
@@ -273,11 +343,51 @@ mod tests {
     fn round_trip_event_error() {
         let resp = IpcResponse::Event {
             event: WorkerEvent::Error {
-                error: "Model error".into(),
-                code: Some("provider_error".into()),
+                message: "Model error".into(),
+                code: "provider_error".into(),
+                retryable: true,
                 provider: Some("openrouter".into()),
                 details: Some(serde_json::json!({"error": {"message": "fail"}})),
             },
+            event_seq: 0,
+            send_id: "2".into(),
+            session_id: None,
+            task_id: None,
+            worker_id: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, parsed);
+    }
+
+    #[test]
+    fn round_trip_event_heartbeat() {
+        let resp = IpcResponse::Event {
+            event: WorkerEvent::Heartbeat { duration_ms: 5000 },
+            event_seq: 1,
+            send_id: "2".into(),
+            session_id: None,
+            task_id: None,
+            worker_id: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, parsed);
+    }
+
+    #[test]
+    fn round_trip_event_context_prune() {
+        let resp = IpcResponse::Event {
+            event: WorkerEvent::ContextPrune {
+                messages_pruned: 10,
+                tokens_before: 50000,
+                tokens_after: 30000,
+            },
+            event_seq: 2,
+            send_id: "2".into(),
+            session_id: None,
+            task_id: None,
+            worker_id: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
@@ -329,7 +439,8 @@ mod tests {
         assert!(matches!(
             &responses[1],
             IpcResponse::Event {
-                event: WorkerEvent::Error { .. }
+                event: WorkerEvent::Error { .. },
+                ..
             }
         ));
         assert!(matches!(
@@ -386,6 +497,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_heartbeat_fixture() {
+        let in_content = fs::read_to_string(fixtures_dir().join("heartbeat.in.jsonl")).unwrap();
+        let requests = parse_jsonl_requests(&in_content);
+        assert_eq!(requests.len(), 3);
+
+        let out_content = fs::read_to_string(fixtures_dir().join("heartbeat.out.jsonl")).unwrap();
+        let responses = parse_jsonl_responses(&out_content);
+        assert_eq!(responses.len(), 8);
+        assert!(matches!(&responses[0], IpcResponse::InitOk { .. }));
+        assert!(matches!(
+            &responses[1],
+            IpcResponse::Event {
+                event: WorkerEvent::Heartbeat { duration_ms: 5000 },
+                ..
+            }
+        ));
+        // result should have latency fields
+        match &responses[6] {
+            IpcResponse::Result {
+                model_latency_ms,
+                tool_latency_ms,
+                total_latency_ms,
+                ..
+            } => {
+                assert_eq!(*model_latency_ms, Some(4900));
+                assert_eq!(*tool_latency_ms, Some(200));
+                assert_eq!(*total_latency_ms, Some(5100));
+            }
+            other => panic!("Expected Result, got: {other:?}"),
+        }
+        assert!(matches!(&responses[7], IpcResponse::ShutdownOk { .. }));
+    }
+
+    #[test]
     fn normal_fixture_round_trips() {
         // Parse and re-serialize each fixture line, then parse again — should be equal
         let in_content = fs::read_to_string(fixtures_dir().join("normal.in.jsonl")).unwrap();
@@ -408,7 +553,7 @@ mod tests {
     #[test]
     fn ignores_unknown_fields_in_responses() {
         // Per compatibility.md: clients must ignore unknown fields
-        let json = r#"{"type":"init_ok","id":"1","session_id":"s","protocol_version":"0.1.0","some_future_field":"value"}"#;
+        let json = r#"{"type":"init_ok","id":"1","session_id":"s","protocol_version":"0.2.0","some_future_field":"value"}"#;
         let resp: IpcResponse = serde_json::from_str(json).unwrap();
         assert!(matches!(resp, IpcResponse::InitOk { .. }));
     }
