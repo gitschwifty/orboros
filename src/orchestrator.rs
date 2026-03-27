@@ -13,6 +13,7 @@ use crate::state::store::TaskStore;
 use crate::state::task::{Task, TaskStatus};
 use crate::worker::pool::WorkerPool;
 use crate::worker::process::WorkerConfig;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 /// Maximum characters of a subtask result to include in context for later subtasks.
@@ -33,6 +34,8 @@ pub struct OrchestrateConfig {
     pub routing: RoutingConfig,
     /// Maximum concurrent workers (used in later steps).
     pub max_concurrency: usize,
+    /// Optional task-level timeout. If set, cancels all subtasks after this duration.
+    pub task_timeout: Option<Duration>,
 }
 
 /// Result of a single subtask execution.
@@ -107,13 +110,31 @@ pub async fn orchestrate(
     let store = Arc::new(store.clone());
     let pool = Arc::new(WorkerPool::new(config.max_concurrency));
 
+    // Create root cancellation token; spawn timeout timer if configured
+    let root_token = CancellationToken::new();
+    if let Some(timeout) = config.task_timeout {
+        let token = root_token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            token.cancel();
+        });
+    }
+
     // Group subtasks by order
     let groups = group_by_order(subtask_specs);
     let mut all_results: Vec<SubtaskResult> = Vec::new();
 
     for group in groups.values() {
-        let group_results =
-            execute_order_group(group, &all_results, &store, &pool, parent, config).await?;
+        let group_results = execute_order_group(
+            group,
+            &all_results,
+            &store,
+            &pool,
+            parent,
+            config,
+            &root_token,
+        )
+        .await?;
         all_results.extend(group_results);
     }
 
@@ -190,6 +211,7 @@ async fn execute_order_group(
     pool: &Arc<WorkerPool>,
     parent: &Task,
     config: &OrchestrateConfig,
+    root_token: &CancellationToken,
 ) -> anyhow::Result<Vec<SubtaskResult>> {
     // Prepare all subtask items
     let mut items: Vec<(Task, String, WorkerConfig)> = Vec::with_capacity(group.len());
@@ -229,7 +251,7 @@ async fn execute_order_group(
                 &mut task,
                 &prompt,
                 &worker_config,
-                CancellationToken::new(),
+                root_token.child_token(),
             )
             .await;
         let result = SubtaskResult {
@@ -259,6 +281,7 @@ async fn execute_order_group(
             task,
             prompt,
             worker_config,
+            root_token.child_token(),
         ));
     }
 
@@ -290,15 +313,10 @@ async fn execute_subtask_owned(
     mut task: Task,
     prompt: String,
     config: WorkerConfig,
+    token: CancellationToken,
 ) -> SubtaskResult {
     let outcome = pool
-        .execute(
-            &store,
-            &mut task,
-            &prompt,
-            &config,
-            CancellationToken::new(),
-        )
+        .execute(&store, &mut task, &prompt, &config, token)
         .await;
     SubtaskResult {
         task_id: task.id,
@@ -375,6 +393,7 @@ mod tests {
             worker_env: vec![],
             routing: RoutingConfig::default(),
             max_concurrency: 1,
+            task_timeout: None,
         }
     }
 
@@ -390,6 +409,7 @@ mod tests {
             worker_env: vec![],
             routing: RoutingConfig::default(),
             max_concurrency: 1,
+            task_timeout: None,
         }
     }
 
@@ -658,6 +678,7 @@ mod tests {
             worker_env: vec![],
             routing: RoutingConfig::default(),
             max_concurrency: 1,
+            task_timeout: None,
         };
 
         let mut parent = Task::new("Parent", "This will fail");
@@ -850,6 +871,7 @@ mod tests {
             worker_env: vec![],
             routing: RoutingConfig::default(),
             max_concurrency: 1,
+            task_timeout: None,
         };
 
         let mut parent = Task::new("Parent", "Will fail");
@@ -868,5 +890,64 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("subtasks failed"));
+    }
+
+    // --- task timeout tests ---
+
+    #[tokio::test]
+    async fn no_timeout_by_default() {
+        let config = test_orchestrate_config();
+        assert!(config.task_timeout.is_none());
+    }
+
+    #[tokio::test]
+    async fn timeout_fires_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let config = OrchestrateConfig {
+            worker_binary: "bash".into(),
+            worker_args: vec![manifest_dir
+                .join("test-fixtures/mock-worker-slow.sh")
+                .to_string_lossy()
+                .into()],
+            worker_cwd: None,
+            worker_env: vec![
+                ("MOCK_DELAY".into(), "0".into()),
+                ("MOCK_SEND_DELAY".into(), "10".into()),
+            ],
+            routing: RoutingConfig::default(),
+            max_concurrency: 1,
+            task_timeout: Some(Duration::from_millis(200)),
+        };
+
+        let mut parent = Task::new("Timeout test", "Should be cancelled");
+        store.append(&parent).unwrap();
+        let subtasks = vec![make_subtask("Slow step", "Take forever", 0)];
+
+        let outcome = orchestrate(&store, &mut parent, &subtasks, &config)
+            .await
+            .unwrap();
+
+        // The subtask should have failed due to cancellation
+        assert_eq!(outcome.parent_status, TaskStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn completes_before_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let mut config = test_orchestrate_config();
+        config.task_timeout = Some(Duration::from_secs(10));
+
+        let mut parent = Task::new("Fast parent", "Quick task");
+        store.append(&parent).unwrap();
+        let subtasks = vec![make_subtask("Fast step", "Do quickly", 0)];
+
+        let outcome = orchestrate(&store, &mut parent, &subtasks, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.parent_status, TaskStatus::Done);
     }
 }

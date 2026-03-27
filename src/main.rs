@@ -296,6 +296,7 @@ fn cmd_orchestrate(
         worker_env: vec![],
         routing,
         max_concurrency: 4,
+        task_timeout: None,
     };
 
     // Run orchestration
