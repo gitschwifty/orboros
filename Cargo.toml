@@ -17,6 +17,7 @@ toml = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
 dotenvy = "0.15"
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [dev-dependencies]
 tempfile = "3"

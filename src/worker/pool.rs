@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::ipc::types::ResultStatus;
@@ -60,6 +61,7 @@ impl WorkerPool {
         task: &mut Task,
         prompt: &str,
         config: &WorkerConfig,
+        token: CancellationToken,
     ) -> SubtaskOutcome {
         // Acquire semaphore permit — blocks if at capacity
         let _permit = self
@@ -75,7 +77,7 @@ impl WorkerPool {
             warn!("Failed to persist active status: {e}");
         }
 
-        let outcome = run_worker(task, prompt, config).await;
+        let outcome = run_worker(task, prompt, config, token).await;
 
         task.transition(outcome.status);
         task.result.clone_from(&outcome.response);
@@ -103,7 +105,12 @@ pub struct SubtaskOutcome {
 }
 
 /// Spawns a worker via the FSM, sends the prompt, and shuts down.
-async fn run_worker(task: &Task, prompt: &str, config: &WorkerConfig) -> SubtaskOutcome {
+async fn run_worker(
+    task: &Task,
+    prompt: &str,
+    config: &WorkerConfig,
+    token: CancellationToken,
+) -> SubtaskOutcome {
     let fail = |msg: String, class: FailureClass| SubtaskOutcome {
         status: TaskStatus::Failed,
         response: Some(msg),
@@ -116,7 +123,9 @@ async fn run_worker(task: &Task, prompt: &str, config: &WorkerConfig) -> Subtask
         return fail(format!("Worker spawn failed: {class:?}"), class);
     }
 
-    let send_result = fsm.send(&task.id.to_string(), prompt).await;
+    let send_result = fsm
+        .send_cancellable(&task.id.to_string(), prompt, token)
+        .await;
     if let Err(FsmError::WorkerFailed(class)) = send_result {
         return fail(format!("Worker send failed: {class:?}"), class);
     }
@@ -185,7 +194,13 @@ mod tests {
         store.append(&task).unwrap();
 
         let outcome = pool
-            .execute(&store, &mut task, "Say hello", &mock_worker_config())
+            .execute(
+                &store,
+                &mut task,
+                "Say hello",
+                &mock_worker_config(),
+                CancellationToken::new(),
+            )
             .await;
 
         assert_eq!(outcome.status, TaskStatus::Done);
@@ -225,7 +240,13 @@ mod tests {
                 });
 
                 let outcome = pool
-                    .execute(&store, &mut task, &format!("Do thing {i}"), &config)
+                    .execute(
+                        &store,
+                        &mut task,
+                        &format!("Do thing {i}"),
+                        &config,
+                        CancellationToken::new(),
+                    )
                     .await;
                 let _ = monitor.await;
                 outcome
@@ -269,7 +290,13 @@ mod tests {
         let mut task = Task::new("Doomed", "Will fail");
         store.append(&task).unwrap();
         let outcome = pool
-            .execute(&store, &mut task, "Will fail", &bad_config)
+            .execute(
+                &store,
+                &mut task,
+                "Will fail",
+                &bad_config,
+                CancellationToken::new(),
+            )
             .await;
 
         assert_eq!(outcome.status, TaskStatus::Failed);
@@ -289,7 +316,13 @@ mod tests {
         let mut task = Task::new("Good", "Will succeed");
         store.append(&task).unwrap();
         let outcome = pool
-            .execute(&store, &mut task, "Say hello", &mock_worker_config())
+            .execute(
+                &store,
+                &mut task,
+                "Say hello",
+                &mock_worker_config(),
+                CancellationToken::new(),
+            )
             .await;
 
         assert_eq!(outcome.status, TaskStatus::Done);
@@ -321,7 +354,13 @@ mod tests {
             let mut task = Task::new("Doomed", "Will fail");
             store.append(&task).unwrap();
             let outcome = pool
-                .execute(&store, &mut task, "Will fail", &bad_config)
+                .execute(
+                    &store,
+                    &mut task,
+                    "Will fail",
+                    &bad_config,
+                    CancellationToken::new(),
+                )
                 .await;
             assert_eq!(outcome.status, TaskStatus::Failed);
         }
@@ -330,9 +369,69 @@ mod tests {
         let mut task = Task::new("Recovery", "Should work");
         store.append(&task).unwrap();
         let outcome = pool
-            .execute(&store, &mut task, "Should work", &mock_worker_config())
+            .execute(
+                &store,
+                &mut task,
+                "Should work",
+                &mock_worker_config(),
+                CancellationToken::new(),
+            )
             .await;
         assert_eq!(outcome.status, TaskStatus::Done);
         assert_eq!(pool.active_workers(), 0);
+    }
+
+    // ---- CancellationToken tests ----
+
+    #[tokio::test]
+    async fn normal_completion_with_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let pool = WorkerPool::new(4);
+
+        let mut task = Task::new("Token test", "Hello");
+        store.append(&task).unwrap();
+
+        let token = CancellationToken::new();
+        let outcome = pool
+            .execute(&store, &mut task, "Say hello", &mock_worker_config(), token)
+            .await;
+
+        assert_eq!(outcome.status, TaskStatus::Done);
+    }
+
+    #[test]
+    fn child_token_hierarchy() {
+        let parent = CancellationToken::new();
+        let child = parent.child_token();
+        assert!(!child.is_cancelled());
+        parent.cancel();
+        assert!(child.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn pool_execute_with_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let pool = WorkerPool::new(4);
+
+        let mut task = Task::new("Token exec", "Do it");
+        store.append(&task).unwrap();
+
+        let parent_token = CancellationToken::new();
+        let child_token = parent_token.child_token();
+
+        let outcome = pool
+            .execute(
+                &store,
+                &mut task,
+                "Say hello",
+                &mock_worker_config(),
+                child_token,
+            )
+            .await;
+
+        assert_eq!(outcome.status, TaskStatus::Done);
+        assert!(!parent_token.is_cancelled());
     }
 }

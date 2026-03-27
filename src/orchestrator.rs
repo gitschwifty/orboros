@@ -13,6 +13,7 @@ use crate::state::store::TaskStore;
 use crate::state::task::{Task, TaskStatus};
 use crate::worker::pool::WorkerPool;
 use crate::worker::process::WorkerConfig;
+use tokio_util::sync::CancellationToken;
 
 /// Maximum characters of a subtask result to include in context for later subtasks.
 const CONTEXT_RESULT_MAX_CHARS: usize = 500;
@@ -223,7 +224,13 @@ async fn execute_order_group(
     if items.len() == 1 {
         let (mut task, prompt, worker_config) = items.into_iter().next().unwrap();
         let outcome = pool
-            .execute(store, &mut task, &prompt, &worker_config)
+            .execute(
+                store,
+                &mut task,
+                &prompt,
+                &worker_config,
+                CancellationToken::new(),
+            )
             .await;
         let result = SubtaskResult {
             task_id: task.id,
@@ -284,7 +291,15 @@ async fn execute_subtask_owned(
     prompt: String,
     config: WorkerConfig,
 ) -> SubtaskResult {
-    let outcome = pool.execute(&store, &mut task, &prompt, &config).await;
+    let outcome = pool
+        .execute(
+            &store,
+            &mut task,
+            &prompt,
+            &config,
+            CancellationToken::new(),
+        )
+        .await;
     SubtaskResult {
         task_id: task.id,
         title: task.title.clone(),
@@ -485,7 +500,13 @@ mod tests {
         store.append(&task).unwrap();
 
         let outcome = pool
-            .execute(&store, &mut task, "Say hello", &mock_worker_config())
+            .execute(
+                &store,
+                &mut task,
+                "Say hello",
+                &mock_worker_config(),
+                CancellationToken::new(),
+            )
             .await;
         assert_eq!(outcome.status, TaskStatus::Done);
         assert_eq!(outcome.response.as_deref(), Some("Hello from mock worker"));
@@ -501,7 +522,13 @@ mod tests {
         store.append(&task).unwrap();
 
         let outcome = pool
-            .execute(&store, &mut task, "Echo this back", &echo_worker_config())
+            .execute(
+                &store,
+                &mut task,
+                "Echo this back",
+                &echo_worker_config(),
+                CancellationToken::new(),
+            )
             .await;
         assert_eq!(outcome.status, TaskStatus::Done);
         assert_eq!(outcome.response.as_deref(), Some("Echo this back"));
@@ -530,7 +557,13 @@ mod tests {
         store.append(&task).unwrap();
 
         let outcome = pool
-            .execute(&store, &mut task, "This will fail", &config)
+            .execute(
+                &store,
+                &mut task,
+                "This will fail",
+                &config,
+                CancellationToken::new(),
+            )
             .await;
         assert_eq!(outcome.status, TaskStatus::Failed);
         assert!(outcome
