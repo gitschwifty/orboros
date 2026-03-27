@@ -531,22 +531,39 @@ mod tests {
     }
 
     #[test]
-    fn normal_fixture_round_trips() {
-        // Parse and re-serialize each fixture line, then parse again — should be equal
-        let in_content = fs::read_to_string(fixtures_dir().join("normal.in.jsonl")).unwrap();
-        for line in in_content.lines().filter(|l| !l.trim().is_empty()) {
-            let req: IpcRequest = serde_json::from_str(line).unwrap();
-            let reserialized = serde_json::to_string(&req).unwrap();
-            let reparsed: IpcRequest = serde_json::from_str(&reserialized).unwrap();
-            assert_eq!(req, reparsed, "Round-trip failed for request: {line}");
-        }
+    fn all_fixtures_round_trip() {
+        // Every fixture file should parse → serialize → parse back identically
+        let fixtures = &["normal", "error", "cancel", "version-mismatch", "heartbeat"];
+        for name in fixtures {
+            let in_path = fixtures_dir().join(format!("{name}.in.jsonl"));
+            for line in fs::read_to_string(&in_path)
+                .unwrap()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+            {
+                let req: IpcRequest = serde_json::from_str(line).unwrap();
+                let reserialized = serde_json::to_string(&req).unwrap();
+                let reparsed: IpcRequest = serde_json::from_str(&reserialized).unwrap();
+                assert_eq!(
+                    req, reparsed,
+                    "Round-trip failed for {name} request: {line}"
+                );
+            }
 
-        let out_content = fs::read_to_string(fixtures_dir().join("normal.out.jsonl")).unwrap();
-        for line in out_content.lines().filter(|l| !l.trim().is_empty()) {
-            let resp: IpcResponse = serde_json::from_str(line).unwrap();
-            let reserialized = serde_json::to_string(&resp).unwrap();
-            let reparsed: IpcResponse = serde_json::from_str(&reserialized).unwrap();
-            assert_eq!(resp, reparsed, "Round-trip failed for response: {line}");
+            let out_path = fixtures_dir().join(format!("{name}.out.jsonl"));
+            for line in fs::read_to_string(&out_path)
+                .unwrap()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+            {
+                let resp: IpcResponse = serde_json::from_str(line).unwrap();
+                let reserialized = serde_json::to_string(&resp).unwrap();
+                let reparsed: IpcResponse = serde_json::from_str(&reserialized).unwrap();
+                assert_eq!(
+                    resp, reparsed,
+                    "Round-trip failed for {name} response: {line}"
+                );
+            }
         }
     }
 
