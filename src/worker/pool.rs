@@ -7,7 +7,8 @@ use tracing::warn;
 use crate::ipc::types::ResultStatus;
 use crate::state::store::TaskStore;
 use crate::state::task::{Task, TaskStatus};
-use crate::worker::process::{Worker, WorkerConfig};
+use crate::worker::fsm::{FailureClass, FsmError, WorkerFsm};
+use crate::worker::process::WorkerConfig;
 
 /// Semaphore-based concurrency limiter for worker execution.
 ///
@@ -97,45 +98,55 @@ pub struct SubtaskOutcome {
     pub status: TaskStatus,
     /// Response text from the worker.
     pub response: Option<String>,
+    /// Failure classification (for retry policy). `None` on success.
+    pub failure_class: Option<FailureClass>,
 }
 
-/// Spawns a worker, sends the prompt, and shuts down.
+/// Spawns a worker via the FSM, sends the prompt, and shuts down.
 async fn run_worker(task: &Task, prompt: &str, config: &WorkerConfig) -> SubtaskOutcome {
-    let fail = |msg: String| SubtaskOutcome {
+    let fail = |msg: String, class: FailureClass| SubtaskOutcome {
         status: TaskStatus::Failed,
         response: Some(msg),
+        failure_class: Some(class),
     };
 
-    let mut worker = match Worker::spawn(config).await {
-        Ok(w) => w,
-        Err(e) => return fail(format!("Worker spawn failed: {e}")),
-    };
+    let mut fsm = WorkerFsm::new(config.clone());
 
-    let outcome = match worker.send(&task.id.to_string(), prompt).await {
-        Ok(o) => o,
-        Err(e) => {
-            let _ = worker.shutdown().await;
-            return fail(format!("Worker send failed: {e}"));
-        }
-    };
-
-    if let Err(e) = worker.shutdown().await {
-        warn!("Worker shutdown failed: {e}");
+    if let Err(FsmError::WorkerFailed(class)) = fsm.start().await {
+        return fail(format!("Worker spawn failed: {class:?}"), class);
     }
 
+    let send_result = fsm.send(&task.id.to_string(), prompt).await;
+    if let Err(FsmError::WorkerFailed(class)) = send_result {
+        return fail(format!("Worker send failed: {class:?}"), class);
+    }
+
+    // Attempt graceful shutdown — log but don't fail the outcome for it.
+    if let Err(FsmError::WorkerFailed(class)) = fsm.stop().await {
+        warn!("Worker shutdown failed: {class:?}");
+    }
+
+    let outcome = fsm
+        .last_outcome()
+        .expect("send succeeded, outcome must exist");
+
     let (status, response) = match outcome.status {
-        ResultStatus::Ok => (TaskStatus::Done, outcome.response),
+        ResultStatus::Ok => (TaskStatus::Done, outcome.response.clone()),
         ResultStatus::Error | ResultStatus::Cancelled => (
             TaskStatus::Failed,
             outcome
                 .error
                 .as_ref()
                 .map(|e| e.message.clone())
-                .or(outcome.response),
+                .or_else(|| outcome.response.clone()),
         ),
     };
 
-    SubtaskOutcome { status, response }
+    SubtaskOutcome {
+        status,
+        response,
+        failure_class: None,
+    }
 }
 
 #[cfg(test)]
@@ -233,6 +244,56 @@ mod tests {
             "Peak active workers was {peak_val}, expected <= 2"
         );
         assert_eq!(pool.active_workers(), 0);
+    }
+
+    #[tokio::test]
+    async fn pool_failure_carries_failure_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let pool = WorkerPool::new(4);
+
+        let bad_config = WorkerConfig {
+            command: "/nonexistent/binary".into(),
+            args: vec![],
+            cwd: None,
+            env: vec![],
+            model: "bad/model".into(),
+            system_prompt: "test".into(),
+            tools: vec![],
+            max_iterations: None,
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
+        };
+
+        let mut task = Task::new("Doomed", "Will fail");
+        store.append(&task).unwrap();
+        let outcome = pool
+            .execute(&store, &mut task, "Will fail", &bad_config)
+            .await;
+
+        assert_eq!(outcome.status, TaskStatus::Failed);
+        assert!(
+            matches!(outcome.failure_class, Some(FailureClass::Crash { .. })),
+            "Expected Some(Crash), got: {:?}",
+            outcome.failure_class
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_success_has_no_failure_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let pool = WorkerPool::new(4);
+
+        let mut task = Task::new("Good", "Will succeed");
+        store.append(&task).unwrap();
+        let outcome = pool
+            .execute(&store, &mut task, "Say hello", &mock_worker_config())
+            .await;
+
+        assert_eq!(outcome.status, TaskStatus::Done);
+        assert!(outcome.failure_class.is_none());
     }
 
     #[tokio::test]
