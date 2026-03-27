@@ -150,6 +150,7 @@ mod tests {
             status: TaskStatus::Done,
             response: Some(response.into()),
             usage: None,
+            retries: 0,
         }
     }
 
@@ -178,6 +179,7 @@ mod tests {
                 status: TaskStatus::Failed,
                 response: Some("Worker spawn failed".into()),
                 usage: None,
+                retries: 0,
             },
         ];
 
@@ -195,6 +197,7 @@ mod tests {
             status: TaskStatus::Failed,
             response: None,
             usage: None,
+            retries: 0,
         }];
 
         let prompt = build_aggregate_prompt("Task", &results);
@@ -240,6 +243,7 @@ mod tests {
                 status: TaskStatus::Failed,
                 response: None,
                 usage: None,
+                retries: 0,
             },
         ];
 

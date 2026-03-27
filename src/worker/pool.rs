@@ -192,7 +192,15 @@ async fn run_worker_once(
 
     let (status, response) = match outcome.status {
         ResultStatus::Ok => (TaskStatus::Done, outcome.response.clone()),
-        ResultStatus::Error | ResultStatus::Cancelled => (
+        ResultStatus::Cancelled => (
+            TaskStatus::Cancelled,
+            outcome
+                .error
+                .as_ref()
+                .map(|e| e.message.clone())
+                .or_else(|| outcome.response.clone()),
+        ),
+        ResultStatus::Error => (
             TaskStatus::Failed,
             outcome
                 .error
