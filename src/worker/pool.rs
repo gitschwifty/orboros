@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -90,6 +91,24 @@ impl WorkerPool {
         // _permit drops here, releasing the semaphore slot
 
         outcome
+    }
+
+    /// Cancels the token and waits up to `timeout` for all active workers to finish.
+    /// Returns `true` if all workers drained, `false` on timeout.
+    pub async fn shutdown_all(&self, token: CancellationToken, timeout: Duration) -> bool {
+        token.cancel();
+
+        let active = Arc::clone(&self.active_count);
+        tokio::time::timeout(timeout, async move {
+            loop {
+                if active.load(Ordering::Relaxed) == 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok()
     }
 }
 
@@ -578,6 +597,18 @@ mod tests {
 
         assert_eq!(outcome.status, TaskStatus::Failed);
         assert_eq!(outcome.retries, 0);
+    }
+
+    #[tokio::test]
+    async fn pool_shutdown_all_drains() {
+        let pool = WorkerPool::new(4);
+        let token = CancellationToken::new();
+        // No active workers — should drain immediately
+        let drained = pool
+            .shutdown_all(token.clone(), Duration::from_millis(100))
+            .await;
+        assert!(drained);
+        assert!(token.is_cancelled());
     }
 
     #[tokio::test]

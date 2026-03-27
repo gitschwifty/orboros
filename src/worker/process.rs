@@ -318,6 +318,18 @@ impl Worker {
         }
     }
 
+    /// Attempts graceful shutdown within the grace period, then kills the process.
+    /// Always succeeds — errors from shutdown are swallowed.
+    pub async fn force_stop(mut self, grace: Duration) {
+        let ok = matches!(
+            tokio::time::timeout(grace, self.shutdown_inner()).await,
+            Ok(Ok(()))
+        );
+        if !ok {
+            let _ = self.child.kill().await;
+        }
+    }
+
     /// Returns the session ID assigned by the worker during init.
     pub fn session_id(&self) -> &str {
         &self.session_id
@@ -693,5 +705,42 @@ mod tests {
         drop(cancel_result);
 
         worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_force_stop_graceful() {
+        let worker = Worker::spawn(&mock_worker_config()).await.unwrap();
+        // force_stop with generous grace should shutdown gracefully
+        worker.force_stop(Duration::from_secs(5)).await;
+        // No panic = success
+    }
+
+    #[tokio::test]
+    async fn worker_force_stop_kills_on_timeout() {
+        // Use a worker that won't respond to shutdown (mock-worker-slow with long delay)
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let config = WorkerConfig {
+            command: "bash".into(),
+            args: vec![manifest_dir
+                .join("test-fixtures/mock-worker-slow.sh")
+                .to_string_lossy()
+                .into()],
+            cwd: None,
+            env: vec![
+                ("MOCK_DELAY".into(), "0".into()),
+                ("MOCK_SEND_DELAY".into(), "0".into()),
+            ],
+            model: "mock/slow".into(),
+            system_prompt: "test".into(),
+            tools: vec![],
+            max_iterations: None,
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
+        };
+        let worker = Worker::spawn(&config).await.unwrap();
+        // Very short grace period — should trigger kill
+        worker.force_stop(Duration::from_millis(50)).await;
+        // No panic/hang = success
     }
 }
