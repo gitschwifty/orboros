@@ -15,7 +15,7 @@ use crate::worker::pool::WorkerPool;
 use crate::worker::process::WorkerConfig;
 
 /// Maximum characters of a subtask result to include in context for later subtasks.
-const CONTEXT_RESULT_MAX_CHARS: usize = 500;
+pub const CONTEXT_RESULT_MAX_CHARS: usize = 500;
 
 /// Configuration for an orchestration run.
 #[derive(Debug, Clone)]
@@ -32,6 +32,8 @@ pub struct OrchestrateConfig {
     pub routing: RoutingConfig,
     /// Maximum concurrent workers (used in later steps).
     pub max_concurrency: usize,
+    /// Maximum characters of a subtask result to include in context for later subtasks.
+    pub context_result_max_chars: usize,
 }
 
 /// Result of a single subtask execution.
@@ -64,8 +66,12 @@ pub struct OrchestrateOutcome {
 ///
 /// If `prior_results` is empty, returns the description unchanged.
 /// Otherwise prepends a summary of prior results, each truncated to
-/// [`CONTEXT_RESULT_MAX_CHARS`].
-pub fn build_prompt(description: &str, prior_results: &[SubtaskResult]) -> String {
+/// `max_chars`.
+pub fn build_prompt(
+    description: &str,
+    prior_results: &[SubtaskResult],
+    max_chars: usize,
+) -> String {
     if prior_results.is_empty() {
         return description.to_string();
     }
@@ -73,8 +79,8 @@ pub fn build_prompt(description: &str, prior_results: &[SubtaskResult]) -> Strin
     let mut context = String::from("Context from prior subtasks:\n");
     for r in prior_results {
         let text = match &r.response {
-            Some(s) if s.len() > CONTEXT_RESULT_MAX_CHARS => {
-                format!("{}...", &s[..CONTEXT_RESULT_MAX_CHARS])
+            Some(s) if s.len() > max_chars => {
+                format!("{}...", &s[..max_chars])
             }
             Some(s) => s.clone(),
             None => "(no response)".to_string(),
@@ -198,7 +204,11 @@ async fn execute_order_group(
             .with_priority(parent.priority);
         store.append(&task)?;
 
-        let prompt = build_prompt(&spec.description, prior_results);
+        let prompt = build_prompt(
+            &spec.description,
+            prior_results,
+            config.context_result_max_chars,
+        );
         let model = config.routing.model_for(&spec.worker_type);
         let worker_config = WorkerConfig {
             command: config.worker_binary.clone(),
@@ -360,6 +370,7 @@ mod tests {
             worker_env: vec![],
             routing: RoutingConfig::default(),
             max_concurrency: 1,
+            context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
         }
     }
 
@@ -375,6 +386,7 @@ mod tests {
             worker_env: vec![],
             routing: RoutingConfig::default(),
             max_concurrency: 1,
+            context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
         }
     }
 
@@ -392,7 +404,7 @@ mod tests {
 
     #[test]
     fn build_prompt_no_context() {
-        let prompt = build_prompt("Do the thing", &[]);
+        let prompt = build_prompt("Do the thing", &[], CONTEXT_RESULT_MAX_CHARS);
         assert_eq!(prompt, "Do the thing");
     }
 
@@ -415,7 +427,7 @@ mod tests {
             },
         ];
 
-        let prompt = build_prompt("Review the work", &prior);
+        let prompt = build_prompt("Review the work", &prior, CONTEXT_RESULT_MAX_CHARS);
         assert!(prompt.contains("Context from prior subtasks:"));
         assert!(prompt.contains("- Research: Found some patterns"));
         assert!(prompt.contains("- Draft: Wrote initial draft"));
@@ -433,7 +445,7 @@ mod tests {
             response: Some(long_response),
         }];
 
-        let prompt = build_prompt("Next step", &prior);
+        let prompt = build_prompt("Next step", &prior, CONTEXT_RESULT_MAX_CHARS);
         // Should contain truncated version with "..."
         assert!(prompt.contains(&"x".repeat(CONTEXT_RESULT_MAX_CHARS)));
         assert!(prompt.contains("..."));
@@ -451,8 +463,27 @@ mod tests {
             response: None,
         }];
 
-        let prompt = build_prompt("Continue anyway", &prior);
+        let prompt = build_prompt("Continue anyway", &prior, CONTEXT_RESULT_MAX_CHARS);
         assert!(prompt.contains("- Failed step: (no response)"));
+    }
+
+    #[test]
+    fn build_prompt_respects_custom_max_chars() {
+        let long_response = "x".repeat(200);
+        let prior = vec![SubtaskResult {
+            task_id: Uuid::new_v4(),
+            title: "Verbose".into(),
+            order: 0,
+            status: TaskStatus::Done,
+            response: Some(long_response),
+        }];
+
+        let prompt = build_prompt("Next step", &prior, 50);
+        // Should contain truncated version at 50 chars with "..."
+        assert!(prompt.contains(&"x".repeat(50)));
+        assert!(prompt.contains("..."));
+        // Should NOT contain the full 200-char response
+        assert!(!prompt.contains(&"x".repeat(200)));
     }
 
     // --- group_by_order tests ---
@@ -625,6 +656,7 @@ mod tests {
             worker_env: vec![],
             routing: RoutingConfig::default(),
             max_concurrency: 1,
+            context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
         };
 
         let mut parent = Task::new("Parent", "This will fail");
@@ -817,6 +849,7 @@ mod tests {
             worker_env: vec![],
             routing: RoutingConfig::default(),
             max_concurrency: 1,
+            context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
         };
 
         let mut parent = Task::new("Parent", "Will fail");

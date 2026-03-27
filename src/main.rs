@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 use orboros::coordinator::decompose::decompose;
-use orboros::orchestrator::{orchestrate, OrchestrateConfig};
+use orboros::orchestrator::{orchestrate, OrchestrateConfig, CONTEXT_RESULT_MAX_CHARS};
 use orboros::routing::rules::RoutingConfig;
 use orboros::runner::execute_task;
 use orboros::state::store::TaskStore;
@@ -296,6 +296,7 @@ fn cmd_orchestrate(
         worker_env: vec![],
         routing,
         max_concurrency: 4,
+        context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
     };
 
     // Run orchestration
