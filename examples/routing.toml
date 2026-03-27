@@ -25,3 +25,16 @@ reason = "cheap for read-only review"
 worker_type = "test"
 model = "google/gemini-2.0-flash-001"
 reason = "cheap for test generation"
+
+# Tool profiles — restrict which tools each worker type can use.
+[profiles.edit]
+allowed_tools = ["read", "write", "execute", "glob", "grep"]
+
+[profiles.research]
+allowed_tools = ["read", "web_search", "glob", "grep"]
+
+[profiles.review]
+allowed_tools = ["read", "glob", "grep"]
+
+[profiles.default]
+allowed_tools = ["read", "write", "execute", "glob", "grep", "web_search"]

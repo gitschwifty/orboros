@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tracing::warn;
 
-use crate::ipc::types::ResultStatus;
+use crate::ipc::types::{ResultStatus, WorkerEvent};
 use crate::state::store::TaskStore;
 use crate::state::task::{Task, TaskStatus};
 use crate::worker::fsm::{FailureClass, FsmError, WorkerFsm};
@@ -100,6 +100,19 @@ pub struct SubtaskOutcome {
     pub response: Option<String>,
     /// Failure classification (for retry policy). `None` on success.
     pub failure_class: Option<FailureClass>,
+    /// Tool names that were denied by the worker's permission system.
+    pub permission_denials: Vec<String>,
+}
+
+/// Extracts tool names from `PermissionDenied` events.
+fn extract_permission_denials(events: &[WorkerEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            WorkerEvent::PermissionDenied { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Spawns a worker via the FSM, sends the prompt, and shuts down.
@@ -108,6 +121,7 @@ async fn run_worker(task: &Task, prompt: &str, config: &WorkerConfig) -> Subtask
         status: TaskStatus::Failed,
         response: Some(msg),
         failure_class: Some(class),
+        permission_denials: vec![],
     };
 
     let mut fsm = WorkerFsm::new(config.clone());
@@ -130,6 +144,8 @@ async fn run_worker(task: &Task, prompt: &str, config: &WorkerConfig) -> Subtask
         .last_outcome()
         .expect("send succeeded, outcome must exist");
 
+    let permission_denials = extract_permission_denials(&outcome.events);
+
     let (status, response) = match outcome.status {
         ResultStatus::Ok => (TaskStatus::Done, outcome.response.clone()),
         ResultStatus::Error | ResultStatus::Cancelled => (
@@ -146,6 +162,7 @@ async fn run_worker(task: &Task, prompt: &str, config: &WorkerConfig) -> Subtask
         status,
         response,
         failure_class: None,
+        permission_denials,
     }
 }
 
@@ -294,6 +311,56 @@ mod tests {
 
         assert_eq!(outcome.status, TaskStatus::Done);
         assert!(outcome.failure_class.is_none());
+    }
+
+    #[test]
+    fn default_outcome_has_empty_denials() {
+        let outcome = SubtaskOutcome {
+            status: TaskStatus::Done,
+            response: Some("ok".into()),
+            failure_class: None,
+            permission_denials: vec![],
+        };
+        assert!(outcome.permission_denials.is_empty());
+    }
+
+    #[tokio::test]
+    async fn success_has_no_denials() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let pool = WorkerPool::new(4);
+
+        let mut task = Task::new("Good", "Will succeed");
+        store.append(&task).unwrap();
+        let outcome = pool
+            .execute(&store, &mut task, "Say hello", &mock_worker_config())
+            .await;
+
+        assert_eq!(outcome.status, TaskStatus::Done);
+        assert!(outcome.permission_denials.is_empty());
+    }
+
+    #[test]
+    fn extract_permission_denials_from_events() {
+        use crate::ipc::types::WorkerEvent;
+
+        let events = vec![
+            WorkerEvent::ToolStart {
+                name: "read".into(),
+                args: serde_json::json!({}),
+            },
+            WorkerEvent::PermissionDenied {
+                name: "write".into(),
+                reason: "not allowed".into(),
+            },
+            WorkerEvent::PermissionDenied {
+                name: "execute".into(),
+                reason: "restricted".into(),
+            },
+        ];
+
+        let denials = extract_permission_denials(&events);
+        assert_eq!(denials, vec!["write", "execute"]);
     }
 
     #[tokio::test]
