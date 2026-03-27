@@ -11,6 +11,7 @@ use crate::coordinator::decompose::Subtask;
 use crate::routing::rules::RoutingConfig;
 use crate::state::store::TaskStore;
 use crate::state::task::{Task, TaskStatus};
+use crate::worker::budget::BudgetTracker;
 use crate::worker::pool::WorkerPool;
 use crate::worker::process::WorkerConfig;
 use std::time::Duration;
@@ -36,6 +37,8 @@ pub struct OrchestrateConfig {
     pub max_concurrency: usize,
     /// Optional task-level timeout. If set, cancels all subtasks after this duration.
     pub task_timeout: Option<Duration>,
+    /// Optional token budget. If set, cancels remaining subtasks when cumulative usage exceeds limit.
+    pub budget_limit: Option<u32>,
 }
 
 /// Result of a single subtask execution.
@@ -51,6 +54,8 @@ pub struct SubtaskResult {
     pub status: TaskStatus,
     /// Response text from the worker.
     pub response: Option<String>,
+    /// Token usage from the worker.
+    pub usage: Option<crate::ipc::types::Usage>,
 }
 
 /// Outcome of a full orchestration run.
@@ -120,6 +125,11 @@ pub async fn orchestrate(
         });
     }
 
+    // Create budget tracker if configured
+    let budget = config
+        .budget_limit
+        .map(|limit| BudgetTracker::new(limit, root_token.clone()));
+
     // Group subtasks by order
     let groups = group_by_order(subtask_specs);
     let mut all_results: Vec<SubtaskResult> = Vec::new();
@@ -133,6 +143,7 @@ pub async fn orchestrate(
             parent,
             config,
             &root_token,
+            budget.as_ref(),
         )
         .await?;
         all_results.extend(group_results);
@@ -204,6 +215,7 @@ pub async fn orchestrate(
 
 /// Executes an order group, running subtasks concurrently if there are multiple.
 /// Uses the worker pool to bound concurrency.
+#[allow(clippy::too_many_arguments)]
 async fn execute_order_group(
     group: &[&Subtask],
     prior_results: &[SubtaskResult],
@@ -212,6 +224,7 @@ async fn execute_order_group(
     parent: &Task,
     config: &OrchestrateConfig,
     root_token: &CancellationToken,
+    budget: Option<&BudgetTracker>,
 ) -> anyhow::Result<Vec<SubtaskResult>> {
     // Prepare all subtask items
     let mut items: Vec<(Task, String, WorkerConfig)> = Vec::with_capacity(group.len());
@@ -254,12 +267,16 @@ async fn execute_order_group(
                 root_token.child_token(),
             )
             .await;
+        if let (Some(budget), Some(usage)) = (budget, &outcome.usage) {
+            budget.record(usage.total_tokens);
+        }
         let result = SubtaskResult {
             task_id: task.id,
             title: task.title.clone(),
             order: 0,
             status: outcome.status,
             response: outcome.response,
+            usage: outcome.usage,
         };
         info!(
             task_id = %task.id,
@@ -275,6 +292,7 @@ async fn execute_order_group(
     for (task, prompt, worker_config) in items {
         let store = Arc::clone(store);
         let pool = Arc::clone(pool);
+        let budget = budget.cloned();
         join_set.spawn(execute_subtask_owned(
             store,
             pool,
@@ -282,6 +300,7 @@ async fn execute_order_group(
             prompt,
             worker_config,
             root_token.child_token(),
+            budget,
         ));
     }
 
@@ -314,16 +333,21 @@ async fn execute_subtask_owned(
     prompt: String,
     config: WorkerConfig,
     token: CancellationToken,
+    budget: Option<BudgetTracker>,
 ) -> SubtaskResult {
     let outcome = pool
         .execute(&store, &mut task, &prompt, &config, token)
         .await;
+    if let (Some(budget), Some(usage)) = (&budget, &outcome.usage) {
+        budget.record(usage.total_tokens);
+    }
     SubtaskResult {
         task_id: task.id,
         title: task.title.clone(),
         order: 0,
         status: outcome.status,
         response: outcome.response,
+        usage: outcome.usage,
     }
 }
 
@@ -394,6 +418,7 @@ mod tests {
             routing: RoutingConfig::default(),
             max_concurrency: 1,
             task_timeout: None,
+            budget_limit: None,
         }
     }
 
@@ -410,6 +435,7 @@ mod tests {
             routing: RoutingConfig::default(),
             max_concurrency: 1,
             task_timeout: None,
+            budget_limit: None,
         }
     }
 
@@ -440,6 +466,7 @@ mod tests {
                 order: 0,
                 status: TaskStatus::Done,
                 response: Some("Found some patterns".into()),
+                usage: None,
             },
             SubtaskResult {
                 task_id: Uuid::new_v4(),
@@ -447,6 +474,7 @@ mod tests {
                 order: 0,
                 status: TaskStatus::Done,
                 response: Some("Wrote initial draft".into()),
+                usage: None,
             },
         ];
 
@@ -466,6 +494,7 @@ mod tests {
             order: 0,
             status: TaskStatus::Done,
             response: Some(long_response),
+            usage: None,
         }];
 
         let prompt = build_prompt("Next step", &prior);
@@ -484,6 +513,7 @@ mod tests {
             order: 0,
             status: TaskStatus::Failed,
             response: None,
+            usage: None,
         }];
 
         let prompt = build_prompt("Continue anyway", &prior);
@@ -679,6 +709,7 @@ mod tests {
             routing: RoutingConfig::default(),
             max_concurrency: 1,
             task_timeout: None,
+            budget_limit: None,
         };
 
         let mut parent = Task::new("Parent", "This will fail");
@@ -872,6 +903,7 @@ mod tests {
             routing: RoutingConfig::default(),
             max_concurrency: 1,
             task_timeout: None,
+            budget_limit: None,
         };
 
         let mut parent = Task::new("Parent", "Will fail");
@@ -919,6 +951,7 @@ mod tests {
             routing: RoutingConfig::default(),
             max_concurrency: 1,
             task_timeout: Some(Duration::from_millis(200)),
+            budget_limit: None,
         };
 
         let mut parent = Task::new("Timeout test", "Should be cancelled");
@@ -949,5 +982,57 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome.parent_status, TaskStatus::Done);
+    }
+
+    // --- budget tests ---
+
+    #[test]
+    fn no_budget_by_default() {
+        let config = test_orchestrate_config();
+        assert!(config.budget_limit.is_none());
+    }
+
+    #[tokio::test]
+    async fn outcome_includes_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let config = test_orchestrate_config();
+
+        let mut parent = Task::new("Usage parent", "Check usage");
+        store.append(&parent).unwrap();
+        let subtasks = vec![make_subtask("Step", "Do it", 0)];
+
+        let outcome = orchestrate(&store, &mut parent, &subtasks, &config)
+            .await
+            .unwrap();
+
+        // The mock worker returns usage in its result
+        let result = &outcome.subtask_results[0];
+        assert!(result.usage.is_some(), "Expected usage in subtask result");
+    }
+
+    #[tokio::test]
+    async fn budget_cancels_orchestration() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let mut config = test_orchestrate_config();
+        // Set budget very low — the first subtask will exceed it (mock returns 15 total_tokens)
+        config.budget_limit = Some(1);
+
+        let mut parent = Task::new("Budget parent", "Will exceed budget");
+        store.append(&parent).unwrap();
+        // Two sequential subtasks — second should be cancelled after first exceeds budget
+        let subtasks = vec![
+            make_subtask("Step 1", "Do first", 0),
+            make_subtask("Step 2", "Do second", 1),
+        ];
+
+        let outcome = orchestrate(&store, &mut parent, &subtasks, &config)
+            .await
+            .unwrap();
+
+        // First subtask should succeed, second should fail (cancelled by budget)
+        assert_eq!(outcome.subtask_results[0].status, TaskStatus::Done);
+        assert_eq!(outcome.subtask_results[1].status, TaskStatus::Failed);
     }
 }

@@ -5,7 +5,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::ipc::types::ResultStatus;
+use crate::ipc::types::{ResultStatus, Usage};
 use crate::state::store::TaskStore;
 use crate::state::task::{Task, TaskStatus};
 use crate::worker::fsm::{FailureClass, FsmError, WorkerFsm};
@@ -102,6 +102,8 @@ pub struct SubtaskOutcome {
     pub response: Option<String>,
     /// Failure classification (for retry policy). `None` on success.
     pub failure_class: Option<FailureClass>,
+    /// Token usage from the worker (if available).
+    pub usage: Option<Usage>,
 }
 
 /// Spawns a worker via the FSM, sends the prompt, and shuts down.
@@ -115,6 +117,7 @@ async fn run_worker(
         status: TaskStatus::Failed,
         response: Some(msg),
         failure_class: Some(class),
+        usage: None,
     };
 
     let mut fsm = WorkerFsm::new(config.clone());
@@ -155,6 +158,7 @@ async fn run_worker(
         status,
         response,
         failure_class: None,
+        usage: outcome.usage.clone(),
     }
 }
 
