@@ -38,6 +38,15 @@ impl RoutingConfig {
             .find(|r| r.worker_type == worker_type)
             .map_or(&self.default_model, |r| &r.model)
     }
+
+    /// Returns the tool profile for a worker type.
+    /// Falls back to the "default" profile if no exact match exists.
+    /// Returns `None` if neither the worker type nor "default" has a profile.
+    pub fn profile_for(&self, worker_type: &str) -> Option<&ToolProfile> {
+        self.profiles
+            .get(worker_type)
+            .or_else(|| self.profiles.get("default"))
+    }
 }
 
 impl Default for RoutingConfig {
@@ -197,5 +206,51 @@ model = "anthropic/claude-sonnet-4-20250514"
     fn default_config_has_empty_profiles() {
         let config = RoutingConfig::default();
         assert!(config.profiles.is_empty());
+    }
+
+    #[test]
+    fn profile_for_exact_match() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "edit".into(),
+            ToolProfile {
+                allowed_tools: vec!["read".into(), "write".into()],
+            },
+        );
+        profiles.insert(
+            "default".into(),
+            ToolProfile {
+                allowed_tools: vec!["read".into()],
+            },
+        );
+        let config = RoutingConfig {
+            profiles,
+            ..Default::default()
+        };
+        let profile = config.profile_for("edit").unwrap();
+        assert_eq!(profile.allowed_tools, vec!["read", "write"]);
+    }
+
+    #[test]
+    fn profile_for_fallback_to_default() {
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "default".into(),
+            ToolProfile {
+                allowed_tools: vec!["read".into()],
+            },
+        );
+        let config = RoutingConfig {
+            profiles,
+            ..Default::default()
+        };
+        let profile = config.profile_for("unknown_type").unwrap();
+        assert_eq!(profile.allowed_tools, vec!["read"]);
+    }
+
+    #[test]
+    fn profile_for_no_match_no_default() {
+        let config = RoutingConfig::default();
+        assert!(config.profile_for("edit").is_none());
     }
 }
