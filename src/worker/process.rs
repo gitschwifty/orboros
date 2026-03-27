@@ -373,39 +373,63 @@ mod tests {
     async fn heddle_headless_init_handshake() {
         let binary = match std::env::var("HEDDLE_BINARY") {
             Ok(path) => path,
-            Err(_) => return, // skip if not set
+            Err(_) => return,
         };
 
         let config = WorkerConfig {
             command: binary,
             args: vec![],
             cwd: None,
-            env: vec![("OPENROUTER_API_KEY".into(), "fake-key-for-testing".into())],
+            env: vec![],
             model: "openrouter/auto".into(),
             system_prompt: "Say hello".into(),
             tools: vec![],
             max_iterations: Some(1),
-            init_timeout: None,
+            init_timeout: Some(Duration::from_secs(10)),
             send_timeout: None,
             shutdown_timeout: None,
         };
 
-        // With a fake API key, init may succeed or we may get an error result.
-        // Either way, we're validating the protocol works.
-        match Worker::spawn(&config).await {
-            Ok(worker) => {
-                // Init succeeded — protocol handshake works
-                assert!(!worker.session_id().is_empty());
-            }
-            Err(e) => {
-                // Expected: structured error about bad API key
-                let msg = format!("{e}");
-                assert!(
-                    msg.contains("error") || msg.contains("unexpected"),
-                    "Expected a structured error, got: {msg}"
-                );
-            }
-        }
+        let worker = Worker::spawn(&config).await.unwrap();
+        assert!(!worker.session_id().is_empty());
+    }
+
+    /// Full send/receive cycle against real heddle-headless.
+    /// Only runs when HEDDLE_BINARY is set (skipped in normal test runs).
+    #[tokio::test]
+    async fn heddle_headless_send_receive() {
+        let binary = match std::env::var("HEDDLE_BINARY") {
+            Ok(path) => path,
+            Err(_) => return,
+        };
+
+        let config = WorkerConfig {
+            command: binary,
+            args: vec![],
+            cwd: None,
+            env: vec![],
+            model: "openrouter/auto".into(),
+            system_prompt: "You are a test assistant. Reply as briefly as possible.".into(),
+            tools: vec![],
+            max_iterations: Some(1),
+            init_timeout: Some(Duration::from_secs(10)),
+            send_timeout: Some(Duration::from_secs(30)),
+            shutdown_timeout: Some(Duration::from_secs(5)),
+        };
+
+        let mut worker = Worker::spawn(&config).await.unwrap();
+        assert!(!worker.session_id().is_empty());
+
+        let outcome = worker
+            .send("msg-1", "Reply with the word hello")
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ResultStatus::Ok);
+        assert!(outcome.response.is_some(), "Expected a response");
+        assert!(!outcome.events.is_empty(), "Expected at least one event");
+        assert!(outcome.iterations >= 1);
+
+        worker.shutdown().await.unwrap();
     }
 
     #[tokio::test]
