@@ -206,6 +206,71 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_appends_all_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    let task = Task::new(&format!("Task {i}"), &format!("desc {i}"));
+                    let id = task.id;
+                    store.append(&task).unwrap();
+                    id
+                })
+            })
+            .collect();
+
+        let ids: Vec<uuid::Uuid> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let loaded = store.load_all().unwrap();
+        assert_eq!(loaded.len(), 10);
+        for id in &ids {
+            assert!(
+                loaded.iter().any(|t| t.id == *id),
+                "Missing task {id} after concurrent appends"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_updates_preserve_latest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+
+        let mut task = Task::new("Contended", "will be updated concurrently");
+        store.append(&task).unwrap();
+        let task_id = task.id;
+
+        // Simulate concurrent updates by writing different statuses
+        // The last one written wins when load_all replays.
+        let handles: Vec<_> = (0..5)
+            .map(|_| {
+                let store = store.clone();
+                let mut t = task.clone();
+                std::thread::spawn(move || {
+                    t.transition(TaskStatus::Active);
+                    store.update(&t).unwrap();
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Final update: mark as Done
+        task.transition(TaskStatus::Done);
+        task.result = Some("final".into());
+        store.update(&task).unwrap();
+
+        let loaded = store.load_by_id(task_id).unwrap().unwrap();
+        assert_eq!(loaded.status, TaskStatus::Done);
+        assert_eq!(loaded.result.as_deref(), Some("final"));
+    }
+
+    #[test]
     fn priority_ordering_in_subtasks() {
         let dir = tempfile::tempdir().unwrap();
         let store = TaskStore::new(dir.path().join("tasks.jsonl"));
