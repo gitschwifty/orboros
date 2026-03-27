@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
 
 use tokio::io::BufReader;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -29,6 +30,12 @@ pub struct WorkerConfig {
     pub tools: Vec<String>,
     /// Maximum iterations for the agentic loop.
     pub max_iterations: Option<u32>,
+    /// Timeout for the init handshake. `None` means no timeout.
+    pub init_timeout: Option<Duration>,
+    /// Timeout for send (entire response collection). `None` means no timeout.
+    pub send_timeout: Option<Duration>,
+    /// Timeout for shutdown handshake. `None` means no timeout.
+    pub shutdown_timeout: Option<Duration>,
 }
 
 /// A running worker process communicating over JSON-line IPC.
@@ -37,6 +44,8 @@ pub struct Worker {
     stdin: ChildStdin,
     reader: BufReader<ChildStdout>,
     session_id: String,
+    send_timeout: Option<Duration>,
+    shutdown_timeout: Option<Duration>,
 }
 
 impl Worker {
@@ -73,9 +82,17 @@ impl Worker {
             stdin,
             reader,
             session_id: String::new(),
+            send_timeout: config.send_timeout,
+            shutdown_timeout: config.shutdown_timeout,
         };
 
-        worker.init(config).await?;
+        if let Some(dur) = config.init_timeout {
+            tokio::time::timeout(dur, worker.init(config))
+                .await
+                .map_err(|_| IpcError::InitTimeout(dur))??;
+        } else {
+            worker.init(config).await?;
+        }
         Ok(worker)
     }
 
@@ -146,6 +163,16 @@ impl Worker {
     /// Returns `IpcError` if writing the request fails, reading responses fails,
     /// or the worker closes stdout unexpectedly.
     pub async fn send(&mut self, id: &str, message: &str) -> Result<SendOutcome, IpcError> {
+        if let Some(dur) = self.send_timeout {
+            tokio::time::timeout(dur, self.send_inner(id, message))
+                .await
+                .map_err(|_| IpcError::SendTimeout(dur))?
+        } else {
+            self.send_inner(id, message).await
+        }
+    }
+
+    async fn send_inner(&mut self, id: &str, message: &str) -> Result<SendOutcome, IpcError> {
         let request = IpcRequest::Send {
             id: id.into(),
             message: message.into(),
@@ -200,6 +227,16 @@ impl Worker {
     ///
     /// Returns `IpcError` if the shutdown handshake fails.
     pub async fn shutdown(mut self) -> Result<(), IpcError> {
+        if let Some(dur) = self.shutdown_timeout {
+            tokio::time::timeout(dur, self.shutdown_inner())
+                .await
+                .map_err(|_| IpcError::ShutdownTimeout(dur))?
+        } else {
+            self.shutdown_inner().await
+        }
+    }
+
+    async fn shutdown_inner(&mut self) -> Result<(), IpcError> {
         let request = IpcRequest::Shutdown {
             id: "shutdown-1".into(),
         };
@@ -259,6 +296,29 @@ mod tests {
             system_prompt: "You are a test assistant.".into(),
             tools: vec![],
             max_iterations: None,
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
+        }
+    }
+
+    fn slow_mock_worker_config(delay_secs: u32) -> WorkerConfig {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        WorkerConfig {
+            command: "bash".into(),
+            args: vec![manifest_dir
+                .join("test-fixtures/mock-worker-slow.sh")
+                .to_string_lossy()
+                .into()],
+            cwd: None,
+            env: vec![("MOCK_DELAY".into(), delay_secs.to_string())],
+            model: "mock/test".into(),
+            system_prompt: "You are a test assistant.".into(),
+            tools: vec![],
+            max_iterations: None,
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
         }
     }
 
@@ -322,6 +382,9 @@ mod tests {
             system_prompt: "Say hello".into(),
             tools: vec![],
             max_iterations: Some(1),
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
         };
 
         // With a fake API key, init may succeed or we may get an error result.
@@ -340,5 +403,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_init_timeout() {
+        let mut config = slow_mock_worker_config(5);
+        config.init_timeout = Some(Duration::from_millis(100));
+
+        let result: Result<Worker, IpcError> = Worker::spawn(&config).await;
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            matches!(err, IpcError::InitTimeout(d) if d == Duration::from_millis(100)),
+            "Expected InitTimeout, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_send_timeout() {
+        // Use the slow mock with delay only on send (init responds immediately)
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let config = WorkerConfig {
+            command: "bash".into(),
+            args: vec![manifest_dir
+                .join("test-fixtures/mock-worker-slow.sh")
+                .to_string_lossy()
+                .into()],
+            cwd: None,
+            env: vec![
+                ("MOCK_DELAY".into(), "0".into()),
+                ("MOCK_SEND_DELAY".into(), "5".into()),
+            ],
+            model: "mock/test".into(),
+            system_prompt: "You are a test assistant.".into(),
+            tools: vec![],
+            max_iterations: None,
+            init_timeout: None,
+            send_timeout: Some(Duration::from_millis(100)),
+            shutdown_timeout: None,
+        };
+
+        let mut worker = Worker::spawn(&config).await.unwrap();
+        let result = worker.send("msg-1", "hello").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, IpcError::SendTimeout(d) if d == Duration::from_millis(100)),
+            "Expected SendTimeout, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_timeout_by_default() {
+        // Existing mock_worker_config has None timeouts — should work as before
+        let mut worker = Worker::spawn(&mock_worker_config()).await.unwrap();
+        let outcome = worker.send("msg-1", "hello").await.unwrap();
+        assert_eq!(outcome.status, ResultStatus::Ok);
+        worker.shutdown().await.unwrap();
     }
 }

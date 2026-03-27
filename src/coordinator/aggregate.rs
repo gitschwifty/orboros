@@ -65,6 +65,9 @@ pub async fn aggregate(
         system_prompt: AGGREGATE_SYSTEM_PROMPT.into(),
         tools: vec![],
         max_iterations: Some(1),
+        init_timeout: worker_config.init_timeout,
+        send_timeout: worker_config.send_timeout,
+        shutdown_timeout: worker_config.shutdown_timeout,
     };
 
     info!("Spawning aggregation worker");
@@ -130,6 +133,9 @@ mod tests {
             system_prompt: "test".into(),
             tools: vec![],
             max_iterations: None,
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
         }
     }
 

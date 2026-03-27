@@ -142,6 +142,9 @@ pub async fn orchestrate(
             system_prompt: String::new(), // overridden by aggregate()
             tools: vec![],
             max_iterations: Some(1),
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
         };
 
         match aggregate(&parent.description, &all_results, &agg_config).await {
@@ -209,6 +212,9 @@ async fn execute_order_group(
             ),
             tools: spec.tools_needed.clone(),
             max_iterations: None,
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
         };
         items.push((task, prompt, worker_config));
     }
@@ -316,6 +322,9 @@ mod tests {
             system_prompt: "test".into(),
             tools: vec![],
             max_iterations: None,
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
         }
     }
 
@@ -333,6 +342,9 @@ mod tests {
             system_prompt: "test".into(),
             tools: vec![],
             max_iterations: None,
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
         }
     }
 
@@ -509,6 +521,9 @@ mod tests {
             system_prompt: "test".into(),
             tools: vec![],
             max_iterations: None,
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
         };
 
         let mut task = Task::new("Doomed", "This will fail");

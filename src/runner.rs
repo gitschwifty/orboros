@@ -93,6 +93,9 @@ mod tests {
             system_prompt: "You are a test assistant.".into(),
             tools: vec![],
             max_iterations: None,
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
         }
     }
 
@@ -134,6 +137,9 @@ mod tests {
             system_prompt: "test".into(),
             tools: vec![],
             max_iterations: None,
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
         };
 
         let result = execute_task(&store, &mut task, &config).await;

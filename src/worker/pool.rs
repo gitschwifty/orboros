@@ -153,6 +153,9 @@ mod tests {
             system_prompt: "test".into(),
             tools: vec![],
             max_iterations: None,
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
         }
     }
 
@@ -242,6 +245,9 @@ mod tests {
             system_prompt: "test".into(),
             tools: vec![],
             max_iterations: None,
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
         };
 
         // Run two failing tasks

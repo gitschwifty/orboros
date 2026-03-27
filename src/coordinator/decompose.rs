@@ -72,6 +72,9 @@ pub async fn decompose(
         system_prompt: DECOMPOSE_SYSTEM_PROMPT.into(),
         tools: vec![],           // coordinator doesn't need tools
         max_iterations: Some(1), // single-turn, no tool loop
+        init_timeout: worker_config.init_timeout,
+        send_timeout: worker_config.send_timeout,
+        shutdown_timeout: worker_config.shutdown_timeout,
     };
 
     info!("Spawning coordinator worker for task decomposition");

@@ -121,6 +121,9 @@ fn make_worker_config(binary: &str, model: &str, system_prompt: &str) -> WorkerC
         system_prompt: system_prompt.into(),
         tools: vec![],
         max_iterations: None,
+        init_timeout: None,
+        send_timeout: None,
+        shutdown_timeout: None,
     }
 }
 
