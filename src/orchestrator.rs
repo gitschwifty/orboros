@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::coordinator::aggregate::{aggregate, fallback_concatenate};
 use crate::coordinator::decompose::Subtask;
+use crate::routing::profile::filter_tools;
 use crate::routing::rules::RoutingConfig;
 use crate::state::store::TaskStore;
 use crate::state::task::{Task, TaskStatus};
@@ -200,6 +201,15 @@ async fn execute_order_group(
 
         let prompt = build_prompt(&spec.description, prior_results);
         let model = config.routing.model_for(&spec.worker_type);
+        let profile = config.routing.profile_for(&spec.worker_type);
+        let filtered = filter_tools(&spec.tools_needed, profile);
+        if !filtered.denied.is_empty() {
+            warn!(
+                worker_type = %spec.worker_type,
+                denied = ?filtered.denied,
+                "Profile denied tools for worker"
+            );
+        }
         let worker_config = WorkerConfig {
             command: config.worker_binary.clone(),
             args: config.worker_args.clone(),
@@ -210,7 +220,7 @@ async fn execute_order_group(
                 "You are a {} worker. Complete the task described in the user message.",
                 spec.worker_type
             ),
-            tools: spec.tools_needed.clone(),
+            tools: filtered.allowed,
             max_iterations: None,
             init_timeout: None,
             send_timeout: None,
@@ -384,6 +394,22 @@ mod tests {
             description: description.into(),
             worker_type: "research".into(),
             tools_needed: vec![],
+            order,
+        }
+    }
+
+    fn make_subtask_with_tools(
+        title: &str,
+        description: &str,
+        worker_type: &str,
+        tools: Vec<String>,
+        order: u32,
+    ) -> Subtask {
+        Subtask {
+            title: title.into(),
+            description: description.into(),
+            worker_type: worker_type.into(),
+            tools_needed: tools,
             order,
         }
     }
@@ -804,6 +830,106 @@ mod tests {
             outcome.aggregated_result.as_deref(),
             Some("Hello from mock worker")
         );
+    }
+
+    // --- profile integration tests ---
+
+    #[tokio::test]
+    async fn orchestrate_no_profiles_passes_all_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let config = echo_orchestrate_config();
+
+        let mut parent = Task::new("Parent", "No profiles test");
+        store.append(&parent).unwrap();
+
+        let subtasks = vec![make_subtask_with_tools(
+            "Edit task",
+            "Edit something",
+            "edit",
+            vec!["read".into(), "write".into(), "execute".into()],
+            0,
+        )];
+
+        let outcome = orchestrate(&store, &mut parent, &subtasks, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.parent_status, TaskStatus::Done);
+        assert_eq!(outcome.subtask_results.len(), 1);
+        assert_eq!(outcome.subtask_results[0].status, TaskStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn orchestrate_profile_filters_tools() {
+        use crate::routing::profile::ToolProfile;
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "edit".into(),
+            ToolProfile {
+                allowed_tools: vec!["read".into(), "write".into()],
+            },
+        );
+
+        let mut config = echo_orchestrate_config();
+        config.routing.profiles = profiles;
+
+        let mut parent = Task::new("Parent", "Profile filter test");
+        store.append(&parent).unwrap();
+
+        // The subtask requests 3 tools but the profile only allows 2
+        let subtasks = vec![make_subtask_with_tools(
+            "Edit task",
+            "Edit something",
+            "edit",
+            vec!["read".into(), "write".into(), "execute".into()],
+            0,
+        )];
+
+        let outcome = orchestrate(&store, &mut parent, &subtasks, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.parent_status, TaskStatus::Done);
+        // The echo worker echoes the prompt, not the tools — so we just verify it succeeds.
+        // The actual tool filtering is verified by unit tests in profile.rs.
+        assert_eq!(outcome.subtask_results[0].status, TaskStatus::Done);
+    }
+
+    #[tokio::test]
+    async fn orchestrate_succeeds_with_profiles() {
+        use crate::routing::profile::ToolProfile;
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+
+        let mut profiles = HashMap::new();
+        profiles.insert(
+            "default".into(),
+            ToolProfile {
+                allowed_tools: vec!["read".into()],
+            },
+        );
+
+        let mut config = test_orchestrate_config();
+        config.routing.profiles = profiles;
+
+        let mut parent = Task::new("Parent", "With default profile");
+        store.append(&parent).unwrap();
+
+        let subtasks = vec![make_subtask("Research", "Research the thing", 0)];
+
+        let outcome = orchestrate(&store, &mut parent, &subtasks, &config)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.parent_status, TaskStatus::Done);
     }
 
     #[tokio::test]
