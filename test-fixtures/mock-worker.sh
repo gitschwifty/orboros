@@ -15,7 +15,7 @@ while IFS= read -r line; do
       # Stream events then result
       echo "{\"type\":\"event\",\"event\":{\"event\":\"content_delta\",\"text\":\"Hello from mock\"},\"event_seq\":0,\"send_id\":\"$id\"}"
       echo "{\"type\":\"event\",\"event\":{\"event\":\"usage\",\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15},\"event_seq\":1,\"send_id\":\"$id\"}"
-      echo "{\"type\":\"result\",\"id\":\"$id\",\"status\":\"ok\",\"response\":\"Hello from mock worker\",\"tool_calls_made\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15},\"iterations\":1}"
+      echo "{\"type\":\"result\",\"id\":\"$id\",\"status\":\"ok\",\"response\":\"Hello from mock worker\",\"tool_calls_made\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15},\"iterations\":1,\"model_latency_ms\":120,\"tool_latency_ms\":30,\"total_latency_ms\":150}"
       ;;
     status)
       echo "{\"type\":\"status_ok\",\"id\":\"$id\",\"model\":\"mock/test\",\"messages_count\":2,\"session_id\":\"mock-sess-001\",\"active\":true}"

@@ -68,6 +68,8 @@ pub async fn aggregate(
         init_timeout: worker_config.init_timeout,
         send_timeout: worker_config.send_timeout,
         shutdown_timeout: worker_config.shutdown_timeout,
+        task_id: None,
+        worker_id: None,
     };
 
     info!("Spawning aggregation worker");
@@ -139,6 +141,8 @@ mod tests {
             init_timeout: None,
             send_timeout: None,
             shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
         }
     }
 
@@ -151,6 +155,11 @@ mod tests {
             response: Some(response.into()),
             usage: None,
             retries: 0,
+            dispatched_at: None,
+            completed_at: None,
+            model_latency_ms: None,
+            tool_latency_ms: None,
+            total_latency_ms: None,
         }
     }
 
@@ -180,6 +189,11 @@ mod tests {
                 response: Some("Worker spawn failed".into()),
                 usage: None,
                 retries: 0,
+                dispatched_at: None,
+                completed_at: None,
+                model_latency_ms: None,
+                tool_latency_ms: None,
+                total_latency_ms: None,
             },
         ];
 
@@ -198,6 +212,11 @@ mod tests {
             response: None,
             usage: None,
             retries: 0,
+            dispatched_at: None,
+            completed_at: None,
+            model_latency_ms: None,
+            tool_latency_ms: None,
+            total_latency_ms: None,
         }];
 
         let prompt = build_aggregate_prompt("Task", &results);
@@ -244,6 +263,11 @@ mod tests {
                 response: None,
                 usage: None,
                 retries: 0,
+                dispatched_at: None,
+                completed_at: None,
+                model_latency_ms: None,
+                tool_latency_ms: None,
+                total_latency_ms: None,
             },
         ];
 

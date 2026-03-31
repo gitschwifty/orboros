@@ -127,6 +127,12 @@ pub struct SubtaskOutcome {
     pub usage: Option<Usage>,
     /// Number of retries performed before this result.
     pub retries: u32,
+    /// Model latency reported by the harness (ms).
+    pub model_latency_ms: Option<u64>,
+    /// Tool latency reported by the harness (ms).
+    pub tool_latency_ms: Option<u64>,
+    /// Total latency reported by the harness (ms).
+    pub total_latency_ms: Option<u64>,
 }
 
 /// Extracts tool names from `PermissionDenied` events.
@@ -180,6 +186,9 @@ async fn run_worker_once(
         permission_denials: vec![],
         usage: None,
         retries: 0,
+        model_latency_ms: None,
+        tool_latency_ms: None,
+        total_latency_ms: None,
     };
 
     let mut fsm = WorkerFsm::new(config.clone());
@@ -233,6 +242,9 @@ async fn run_worker_once(
         permission_denials,
         usage: outcome.usage.clone(),
         retries: 0,
+        model_latency_ms: outcome.model_latency_ms,
+        tool_latency_ms: outcome.tool_latency_ms,
+        total_latency_ms: outcome.total_latency_ms,
     }
 }
 
@@ -259,6 +271,8 @@ mod tests {
             init_timeout: None,
             send_timeout: None,
             shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
         }
     }
 
@@ -363,6 +377,8 @@ mod tests {
             init_timeout: None,
             send_timeout: None,
             shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
         };
 
         let mut task = Task::new("Doomed", "Will fail");
@@ -416,6 +432,9 @@ mod tests {
             permission_denials: vec![],
             usage: None,
             retries: 0,
+            model_latency_ms: None,
+            tool_latency_ms: None,
+            total_latency_ms: None,
         };
         assert!(outcome.permission_denials.is_empty());
     }
@@ -483,6 +502,8 @@ mod tests {
             init_timeout: None,
             send_timeout: None,
             shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
         };
 
         // Run two failing tasks
@@ -593,6 +614,8 @@ mod tests {
             init_timeout: None,
             send_timeout: None,
             shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
         }
     }
 
@@ -669,6 +692,8 @@ mod tests {
             init_timeout: None,
             send_timeout: None,
             shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
         };
 
         let mut task = Task::new("Cancelled", "Should not retry");

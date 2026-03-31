@@ -8,4 +8,5 @@ pub mod orchestrator;
 pub mod routing;
 pub mod runner;
 pub mod state;
+pub mod trace;
 pub mod worker;

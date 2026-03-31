@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
@@ -62,6 +63,16 @@ pub struct SubtaskResult {
     pub usage: Option<crate::ipc::types::Usage>,
     /// Number of retries before this result.
     pub retries: u32,
+    /// When the subtask was dispatched to the pool.
+    pub dispatched_at: Option<DateTime<Utc>>,
+    /// When the subtask completed (pool.execute returned).
+    pub completed_at: Option<DateTime<Utc>>,
+    /// Model latency reported by the harness (ms).
+    pub model_latency_ms: Option<u64>,
+    /// Tool latency reported by the harness (ms).
+    pub tool_latency_ms: Option<u64>,
+    /// Total latency reported by the harness (ms).
+    pub total_latency_ms: Option<u64>,
 }
 
 /// Why the orchestration run ended.
@@ -246,6 +257,8 @@ pub async fn orchestrate(
             init_timeout: None,
             send_timeout: None,
             shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
         };
 
         match aggregate(&parent.description, &all_results, &agg_config).await {
@@ -327,6 +340,8 @@ fn prepare_subtask(
         init_timeout: None,
         send_timeout: None,
         shutdown_timeout: None,
+        task_id: Some(task.id.to_string()),
+        worker_id: Some(Uuid::new_v4().to_string()),
     };
     Ok((task, prompt, worker_config))
 }
@@ -352,6 +367,7 @@ async fn execute_order_group(
     // Single subtask: execute inline via pool, no spawn overhead
     if items.len() == 1 {
         let (mut task, prompt, worker_config) = items.into_iter().next().unwrap();
+        let dispatched_at = Utc::now();
         let outcome = pool
             .execute(
                 store,
@@ -361,6 +377,7 @@ async fn execute_order_group(
                 root_token.child_token(),
             )
             .await;
+        let completed_at = Utc::now();
         if let (Some(budget), Some(usage)) = (budget, &outcome.usage) {
             budget.record(usage.total_tokens);
         }
@@ -372,6 +389,11 @@ async fn execute_order_group(
             response: outcome.response,
             usage: outcome.usage,
             retries: outcome.retries,
+            dispatched_at: Some(dispatched_at),
+            completed_at: Some(completed_at),
+            model_latency_ms: outcome.model_latency_ms,
+            tool_latency_ms: outcome.tool_latency_ms,
+            total_latency_ms: outcome.total_latency_ms,
         };
         info!(
             task_id = %task.id,
@@ -430,9 +452,11 @@ async fn execute_subtask_owned(
     token: CancellationToken,
     budget: Option<BudgetTracker>,
 ) -> SubtaskResult {
+    let dispatched_at = Utc::now();
     let outcome = pool
         .execute(&store, &mut task, &prompt, &config, token)
         .await;
+    let completed_at = Utc::now();
     if let (Some(budget), Some(usage)) = (&budget, &outcome.usage) {
         budget.record(usage.total_tokens);
     }
@@ -444,6 +468,11 @@ async fn execute_subtask_owned(
         response: outcome.response,
         usage: outcome.usage,
         retries: outcome.retries,
+        dispatched_at: Some(dispatched_at),
+        completed_at: Some(completed_at),
+        model_latency_ms: outcome.model_latency_ms,
+        tool_latency_ms: outcome.tool_latency_ms,
+        total_latency_ms: outcome.total_latency_ms,
     }
 }
 
@@ -478,6 +507,8 @@ mod tests {
             init_timeout: None,
             send_timeout: None,
             shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
         }
     }
 
@@ -498,6 +529,8 @@ mod tests {
             init_timeout: None,
             send_timeout: None,
             shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
         }
     }
 
@@ -582,6 +615,11 @@ mod tests {
                 response: Some("Found some patterns".into()),
                 usage: None,
                 retries: 0,
+                dispatched_at: None,
+                completed_at: None,
+                model_latency_ms: None,
+                tool_latency_ms: None,
+                total_latency_ms: None,
             },
             SubtaskResult {
                 task_id: Uuid::new_v4(),
@@ -591,6 +629,11 @@ mod tests {
                 response: Some("Wrote initial draft".into()),
                 usage: None,
                 retries: 0,
+                dispatched_at: None,
+                completed_at: None,
+                model_latency_ms: None,
+                tool_latency_ms: None,
+                total_latency_ms: None,
             },
         ];
 
@@ -612,6 +655,11 @@ mod tests {
             response: Some(long_response),
             usage: None,
             retries: 0,
+            dispatched_at: None,
+            completed_at: None,
+            model_latency_ms: None,
+            tool_latency_ms: None,
+            total_latency_ms: None,
         }];
 
         let prompt = build_prompt("Next step", &prior, CONTEXT_RESULT_MAX_CHARS);
@@ -632,6 +680,11 @@ mod tests {
             response: None,
             usage: None,
             retries: 0,
+            dispatched_at: None,
+            completed_at: None,
+            model_latency_ms: None,
+            tool_latency_ms: None,
+            total_latency_ms: None,
         }];
 
         let prompt = build_prompt("Continue anyway", &prior, CONTEXT_RESULT_MAX_CHARS);
@@ -649,6 +702,11 @@ mod tests {
             response: Some(long_response),
             usage: None,
             retries: 0,
+            dispatched_at: None,
+            completed_at: None,
+            model_latency_ms: None,
+            tool_latency_ms: None,
+            total_latency_ms: None,
         }];
 
         let prompt = build_prompt("Next step", &prior, 50);
@@ -740,6 +798,8 @@ mod tests {
             init_timeout: None,
             send_timeout: None,
             shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
         };
 
         let mut task = Task::new("Doomed", "This will fail");

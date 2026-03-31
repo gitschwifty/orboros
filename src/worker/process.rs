@@ -39,6 +39,10 @@ pub struct WorkerConfig {
     pub send_timeout: Option<Duration>,
     /// Timeout for shutdown handshake. `None` means no timeout.
     pub shutdown_timeout: Option<Duration>,
+    /// Task ID to send in init config (for trace correlation).
+    pub task_id: Option<String>,
+    /// Worker ID to send in init config (for trace correlation).
+    pub worker_id: Option<String>,
 }
 
 /// A running worker process communicating over JSON-line IPC.
@@ -62,6 +66,12 @@ pub struct SendOutcome {
     pub iterations: u32,
     pub error: Option<ErrorEnvelope>,
     pub events: Vec<WorkerEvent>,
+    /// Model latency reported by the harness (ms).
+    pub model_latency_ms: Option<u64>,
+    /// Tool latency reported by the harness (ms).
+    pub tool_latency_ms: Option<u64>,
+    /// Total latency reported by the harness (ms).
+    pub total_latency_ms: Option<u64>,
 }
 
 /// Handle for sending a cancel request to a running worker.
@@ -153,8 +163,8 @@ impl Worker {
                 system_prompt: config.system_prompt.clone(),
                 tools: config.tools.clone(),
                 max_iterations: config.max_iterations,
-                task_id: None,
-                worker_id: None,
+                task_id: config.task_id.clone(),
+                worker_id: config.worker_id.clone(),
             },
         };
 
@@ -254,6 +264,9 @@ impl Worker {
                     usage,
                     iterations,
                     error,
+                    model_latency_ms,
+                    tool_latency_ms,
+                    total_latency_ms,
                     ..
                 } => {
                     return Ok(SendOutcome {
@@ -265,6 +278,9 @@ impl Worker {
                         iterations,
                         error,
                         events,
+                        model_latency_ms,
+                        tool_latency_ms,
+                        total_latency_ms,
                     });
                 }
                 other => {
@@ -393,6 +409,9 @@ impl Worker {
                     usage,
                     iterations,
                     error,
+                    model_latency_ms,
+                    tool_latency_ms,
+                    total_latency_ms,
                     ..
                 } => {
                     return Ok(SendOutcome {
@@ -404,6 +423,9 @@ impl Worker {
                         iterations,
                         error,
                         events,
+                        model_latency_ms,
+                        tool_latency_ms,
+                        total_latency_ms,
                     });
                 }
                 _ => {} // ignore other responses during cancel drain
@@ -433,6 +455,8 @@ mod tests {
             init_timeout: None,
             send_timeout: None,
             shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
         }
     }
 
@@ -453,6 +477,8 @@ mod tests {
             init_timeout: None,
             send_timeout: None,
             shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
         }
     }
 
@@ -473,6 +499,8 @@ mod tests {
             init_timeout: None,
             send_timeout: None,
             shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
         }
     }
 
@@ -539,6 +567,8 @@ mod tests {
             init_timeout: Some(Duration::from_secs(10)),
             send_timeout: None,
             shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
         };
 
         let worker = Worker::spawn(&config).await.unwrap();
@@ -566,6 +596,8 @@ mod tests {
             init_timeout: Some(Duration::from_secs(10)),
             send_timeout: Some(Duration::from_secs(30)),
             shutdown_timeout: Some(Duration::from_secs(5)),
+            task_id: None,
+            worker_id: None,
         };
 
         let mut worker = Worker::spawn(&config).await.unwrap();
@@ -619,6 +651,8 @@ mod tests {
             init_timeout: None,
             send_timeout: Some(Duration::from_millis(100)),
             shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
         };
 
         let mut worker = Worker::spawn(&config).await.unwrap();
@@ -737,6 +771,8 @@ mod tests {
             init_timeout: None,
             send_timeout: None,
             shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
         };
         let worker = Worker::spawn(&config).await.unwrap();
         // Very short grace period — should trigger kill

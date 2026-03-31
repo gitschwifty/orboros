@@ -75,6 +75,8 @@ pub async fn decompose(
         init_timeout: worker_config.init_timeout,
         send_timeout: worker_config.send_timeout,
         shutdown_timeout: worker_config.shutdown_timeout,
+        task_id: None,
+        worker_id: None,
     };
 
     info!("Spawning coordinator worker for task decomposition");

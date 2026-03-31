@@ -124,6 +124,8 @@ fn make_worker_config(binary: &str, model: &str, system_prompt: &str) -> WorkerC
         init_timeout: None,
         send_timeout: None,
         shutdown_timeout: None,
+        task_id: None,
+        worker_id: None,
     }
 }
 

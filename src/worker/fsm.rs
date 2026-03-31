@@ -344,6 +344,8 @@ mod tests {
             init_timeout: None,
             send_timeout: None,
             shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
         }
     }
 
@@ -360,6 +362,8 @@ mod tests {
             init_timeout: None,
             send_timeout: None,
             shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
         }
     }
 
