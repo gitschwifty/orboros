@@ -250,11 +250,10 @@ Workers are heddle processes spawned as subprocesses. JSON lines over stdin/stdo
 - Events stream between `send` and `result`
 - Always spawn with `kill_on_drop(true)` and a shutdown timeout
 
-See `private/heddle-readiness-for-orboros.md` for the full IPC contract.
+See `compatibility.md` for the full IPC protocol versioning policy and changelog.
 
 ## Commit Practices
 
 - Commit tests and implementation together (test proves the impl works).
-- No `.md` files in commits (planning docs live in `private/`, gitignored).
 - Keep commits focused — one logical change per commit.
 - Run `cargo test && cargo clippy && cargo fmt --check` before committing.
