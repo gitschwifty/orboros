@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use orboros::config;
 use orboros::coordinator::decompose::decompose;
 use orboros::orchestrator::{orchestrate, OrchestrateConfig, CONTEXT_RESULT_MAX_CHARS};
 use orboros::routing::rules::RoutingConfig;
@@ -73,6 +74,8 @@ enum Commands {
     },
     /// List tasks awaiting review.
     Review,
+    /// Initialize a new project in the current directory.
+    Init,
 }
 
 fn resolve_state_dir(raw: &str) -> PathBuf {
@@ -172,6 +175,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Tasks { status } => cmd_tasks(&store, status.as_deref()),
         Commands::Status { id } => cmd_status(&store, &id),
         Commands::Review => cmd_review(&store),
+        Commands::Init => cmd_init(),
     }
 }
 
@@ -408,6 +412,26 @@ fn cmd_review(store: &TaskStore) -> anyhow::Result<()> {
         }
         println!("\n{} task(s) awaiting review", tasks.len());
     }
+    Ok(())
+}
+
+fn cmd_init() -> anyhow::Result<()> {
+    let project_dir = std::env::current_dir()?;
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+
+    config::init_project(&home, &project_dir)?;
+
+    println!("Initialized orboros project in {}", project_dir.display());
+    println!("  Created .orbs/config.toml");
+    println!("  Created .orbs/orbs.jsonl");
+    println!(
+        "  Registered project \"{}\" in ~/.orboros/projects.toml",
+        project_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unnamed")
+    );
     Ok(())
 }
 
