@@ -9,6 +9,7 @@ pub mod dep_store;
 pub mod id;
 pub mod orb;
 pub mod orb_store;
+pub mod pipeline;
 pub mod store;
 pub mod task;
 pub mod trace;
