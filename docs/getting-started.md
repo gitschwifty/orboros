@@ -2,47 +2,165 @@
 
 ## Prerequisites
 
-- **Heddle** -- the `heddle-headless` binary, built and on your PATH (or at a known location)
-- **API key** -- configured in heddle (OpenRouter, Anthropic, etc.)
+- **Rust** stable toolchain
+- **Heddle** — the `heddle-headless` binary (for worker execution)
+- **API key** — configured in heddle (OpenRouter, Anthropic, etc.)
 
 ## Setup
 
-### 1. Worker binary
-
-Orboros needs to know where `heddle-headless` lives. Pass it on every command:
+### 1. Build
 
 ```bash
-orboros --worker-binary /path/to/heddle-headless run "Hello world"
+cd main/
+cargo build
 ```
 
-Or export it in your shell profile so you don't have to repeat it:
+### 2. Initialize a project
 
 ```bash
+# In your project directory
+cargo run -- init
+```
+
+This creates:
+- `.orbs/config.toml` — project config with defaults
+- `.orbs/orbs.jsonl` — empty orb store
+- Registers the project in `~/.orboros/projects.toml`
+
+### 3. Worker binary
+
+Orboros spawns heddle-headless as worker processes. Configure the path:
+
+```bash
+# Via environment variable (recommended)
 export HEDDLE_BINARY=/path/to/heddle-headless
-orboros run "Hello world"
+
+# Or per-command
+cargo run -- --worker-binary /path/to/heddle-headless run "Hello"
 ```
 
-> A proper config file (`~/.orboros/config.toml`) is planned for Phase 3. For now, the CLI flag or environment variable is the interface.
+### 4. Configuration (optional)
 
-### 2. State directory
+Edit `.orbs/config.toml` in your project:
 
-Orboros stores task state in a project directory. Default: `~/.orboros/default/`. Created automatically on first use.
+```toml
+default_model = "anthropic/claude-sonnet-4-20250514"
+max_concurrency = 4
+
+[review]
+requires_approval_by_default = false
+
+[notifications]
+enabled = true
+desktop = true
+```
+
+Global defaults go in `~/.orboros/config.toml`. Project config overrides global.
+
+## Basic Usage
+
+### Create and manage orbs
+
+Orbs are tracked work items — tasks, bugs, epics, features, etc.
 
 ```bash
-# Use the default
-orboros tasks
+# Create a task
+cargo run -- orb create "Fix login bug" --type task --priority 2
 
-# Point at a project-specific directory
-orboros --state-dir ~/projects/my-app tasks
+# Create an epic
+cargo run -- orb create "User management system" --type epic
+
+# List all orbs
+cargo run -- orb list
+
+# Filter by type or status
+cargo run -- orb list --type task --status pending
+
+# Show details
+cargo run -- orb show orb-k4f
+
+# Update
+cargo run -- orb update orb-k4f --priority 1 --status active
+
+# Soft delete
+cargo run -- orb delete orb-k4f --reason "duplicate"
 ```
 
-Each state directory gets its own `tasks.jsonl` (task history) and can have its own `routing.toml`.
+### Manage dependencies
 
-### 3. Model routing (optional)
+```bash
+# orb-b blocks orb-a (a can't start until b is done)
+cargo run -- orb dep add orb-b orb-a --type blocks
 
-Without configuration, all workers use the `--model` flag (default: `openrouter/free`).
+# orb-a depends on orb-c
+cargo run -- orb dep add orb-a orb-c --type depends_on
 
-To route different subtask types to different models, place a `routing.toml` in your state directory:
+# View deps
+cargo run -- orb deps orb-a
+
+# Remove
+cargo run -- orb dep rm orb-b orb-a --type blocks
+```
+
+Edge types: `blocks`, `depends_on`, `parent`, `child`, `related`, `duplicates`, `follows`.
+
+### Plan an epic
+
+Break a high-level goal into subtasks:
+
+```bash
+# From inline description
+cargo run -- plan "Build a REST API for user management"
+
+# From a markdown file (first line = title, rest = description)
+cargo run -- plan --file spec.md
+```
+
+This creates an epic orb, decomposes it into child tasks with dependency edges, and prints the plan tree.
+
+### Execute tasks
+
+```bash
+# Run a single task directly
+cargo run -- run "What is the capital of France?"
+
+# Full orchestration: decompose + route + execute
+cargo run -- orchestrate "Refactor the authentication module"
+```
+
+### Review orbs
+
+```bash
+# Apply a review decision
+cargo run -- orb review orb-k4f approve
+cargo run -- orb review orb-k4f reject
+cargo run -- orb review orb-k4f revise
+```
+
+### Daemon mode
+
+The daemon runs a background loop that processes the pipeline:
+
+```bash
+# Start
+cargo run -- daemon
+
+# Check status
+cargo run -- daemon --status
+
+# Stop
+cargo run -- daemon --stop
+```
+
+The daemon loop:
+1. Detects pending epics/features → starts pipeline (speccing)
+2. Finds ready (unblocked) orbs → marks for execution
+3. Checks root completion → marks parent done when all children done
+4. Finds waiting orbs → triggers re-evaluation
+
+## Model Routing
+
+Place `routing.toml` in your state directory to route subtask types to different models:
 
 ```toml
 default_model = "openrouter/auto"
@@ -50,86 +168,39 @@ default_model = "openrouter/auto"
 [[rules]]
 worker_type = "research"
 model = "google/gemini-2.0-flash-001"
-reason = "cheap, fast for search tasks"
 
 [[rules]]
 worker_type = "edit"
 model = "anthropic/claude-sonnet-4-20250514"
-reason = "good at code generation"
-```
 
-You can also define tool profiles to restrict which tools each worker type can use:
-
-```toml
 [profiles.edit]
-allowed_tools = ["read", "write", "execute", "glob", "grep"]
-
-[profiles.research]
-allowed_tools = ["read", "web_search", "glob", "grep"]
+allowed_tools = ["read", "write", "glob", "grep"]
 ```
 
 See `examples/routing.toml` for a complete example.
 
-## Commands
+## What Happens During Orchestration
 
-### Run a single task
+1. **Coordinator** decomposes the task into typed subtasks with ordering
+2. **Router** maps each subtask type to a model and tool profile
+3. **Workers** execute in parallel (within order groups), sequential across groups
+4. **Budget/timeout** enforcement cancels remaining work if limits hit
+5. **Aggregator** synthesizes results into a unified response
+6. State persisted to JSONL — check back anytime with `orb list` / `orb show`
 
-```bash
-orboros run "What is the capital of France?"
+## Project Structure
+
 ```
-
-Spawns one worker, sends the prompt, prints the result. Good for testing your setup.
-
-### Decompose a task
-
-```bash
-orboros decompose "Add error handling to the REST API"
+your-project/
+  .orbs/
+    config.toml     # Project config
+    orbs.jsonl      # Orb store
+    deps.jsonl      # Dependency edges
+    events.jsonl    # Audit log
+    pipelines/      # Per-pipeline working directories
+      epic-k4f/
+        orbs.jsonl
+        deps.jsonl
+        snapshots/
+        history/
 ```
-
-Uses a coordinator worker to break the task into structured subtasks. Prints the plan without executing.
-
-### Full orchestration
-
-```bash
-orboros orchestrate "Refactor the authentication module"
-```
-
-This is the main workflow: decompose into subtasks, route each to a model, execute (parallel within order groups, sequential across groups), aggregate results.
-
-### Task management
-
-```bash
-# List all tasks
-orboros tasks
-
-# Filter by status
-orboros tasks --status done
-orboros tasks --status failed
-
-# Show details for a specific task
-orboros status <task-uuid>
-
-# List tasks awaiting review
-orboros review
-```
-
-### Options
-
-| Flag | Env Var | Default | Description |
-|------|---------|---------|-------------|
-| `--worker-binary` | `HEDDLE_BINARY` | -- | Path to heddle-headless binary |
-| `--state-dir` | -- | `~/.orboros/default` | Project state directory |
-| `--model` | -- | `openrouter/free` | Default model for workers |
-
-## What to expect
-
-A successful `orchestrate` run will:
-
-1. Create a parent task in the store
-2. Decompose it into numbered subtasks with types and order groups
-3. Execute order groups sequentially, subtasks within a group in parallel
-4. Print status for each subtask as it completes
-5. Aggregate all results into a summary
-6. Report the final status (completed, partial failure, timeout, etc.)
-
-Task state is persisted to `tasks.jsonl` in the state directory -- you can always check back with `orboros tasks` or `orboros status <id>`.

@@ -1,205 +1,246 @@
 # Orboros
 
-Multi-agent orchestrator for software development tasks. Decomposes complex work into subtasks, routes each to an appropriate model, and executes them through worker processes with cancellation, budgets, retries, tool profiles, and end-to-end tracing.
+Multi-agent orchestrator and ticketing system for software development. Decomposes complex work into orbs (tracked work items), manages dependencies and lifecycles, and executes through worker processes with cancellation, budgets, retries, and tracing.
 
-## How It Works
+## Workspace
 
-```
-User task → Coordinator (LLM) → Subtasks → Router → Workers → Results → Aggregation
-```
+Two crates:
 
-1. **Coordinator** breaks a high-level task into structured subtasks with types (research, edit, review, test)
-2. **Router** maps each subtask's type to a model and tool profile based on TOML config
-3. **Workers** (heddle-headless processes) execute each subtask via JSON-line IPC, bounded by a semaphore-based pool
-4. **Orchestrator** manages execution order groups (sequential phases, parallel within each), cancellation, budgets, retries, and timeline tracing
-5. **Aggregator** synthesizes subtask results into a unified response
-6. **Task store** tracks status in append-only JSONL
+- **`orbs`** — Core library: Orb schema, stores, dependency graph, audit log, tree reconstruction, pipeline management
+- **`orboros`** — CLI binary: orchestration, phases, queue loop, daemon, configuration
 
 ## Quick Start
 
 ```bash
-# Build
-cargo build
+# Initialize a project
+cargo run -- init
 
-# Set up environment (API key + worker binary)
-cp ../examples-env .env  # or create your own
-# .env needs:
-#   OPENROUTER_API_KEY=sk-or-v1-...
-#   HEDDLE_BINARY=/path/to/heddle-headless
+# Create an orb (work item)
+cargo run -- orb create "Add authentication" --type task --priority 2
 
-# Run a single task
+# Plan an epic (decompose into subtasks)
+cargo run -- plan "Build user management system"
+
+# Run a single task via worker
 cargo run -- run "What is the capital of France?"
 
-# Decompose without executing
-cargo run -- decompose "Add error handling to the REST API"
-
-# Full orchestration: decompose → route → execute all subtasks
+# Full orchestration: decompose + route + execute
 cargo run -- orchestrate "Refactor the authentication module"
 
-# List tasks
-cargo run -- tasks
-cargo run -- tasks --status done
-
-# Check a specific task
-cargo run -- status <task-uuid>
+# Start the daemon (background processing)
+cargo run -- daemon
 ```
 
 ## CLI Commands
 
+### Task Execution
+
 | Command | Description |
 |---------|-------------|
-| `run <task>` | Execute a single task directly |
+| `run <task>` | Execute a single task directly via worker |
 | `decompose <task>` | Break into subtasks, print plan |
 | `orchestrate <task>` | Decompose + execute all subtasks |
-| `tasks [-s status]` | List tasks, optionally filtered |
-| `status <id>` | Show details for a specific task |
-| `review` | List tasks awaiting human review |
+| `plan <description>` | Create an epic with shallow decomposition |
+| `plan --file <path>` | Plan from a markdown file |
+
+### Orb Management
+
+| Command | Description |
+|---------|-------------|
+| `orb create <title>` | Create a new orb (`--type`, `--priority`) |
+| `orb show <id>` | Show full orb details |
+| `orb list` | List orbs (`--type`, `--status` filters) |
+| `orb update <id>` | Update fields (`--title`, `--priority`, `--status`) |
+| `orb delete <id>` | Soft-delete (tombstone) an orb |
+| `orb dep add <from> <to>` | Add dependency edge (`--type blocks`) |
+| `orb dep rm <from> <to>` | Remove dependency edge |
+| `orb deps <id>` | List dependencies for an orb |
+| `orb review <id> <decision>` | Apply review decision (approve/reject/revise) |
+
+### Project & System
+
+| Command | Description |
+|---------|-------------|
+| `init` | Initialize `.orbs/` in current directory |
+| `daemon` | Start background queue loop |
+| `daemon --stop` | Stop running daemon |
+| `daemon --status` | Check daemon status |
+| `tasks [-s status]` | List legacy tasks |
+| `status <id>` | Show legacy task details |
+| `review` | List tasks awaiting review |
 
 ### Global Options
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--state-dir` | -- | `~/.orboros/default` | Project state directory |
-| `--worker-binary` | `HEDDLE_BINARY` | -- | Path to heddle-headless binary |
-| `--model` | -- | `openrouter/free` | Default model |
+| `--state-dir` | — | `~/.orboros/default` | Project state directory |
+| `--worker-binary` | `HEDDLE_BINARY` | — | Path to heddle-headless binary |
+| `--model` | — | `openrouter/free` | Default model |
 
-## Features
+## Orb Schema
 
-### Cancellation & Timeout
+An **orb** is a tracked work item with content-addressed IDs, dual lifecycle, and rich metadata.
 
-- **Cooperative cancellation** via `CancellationToken` (tokio-util) with parent/child hierarchy
-- **`CancelSender` handle** sends IPC cancel requests to in-flight workers without `&mut self` aliasing
-- **Task-level timeout** fires the cancellation token after a configurable duration
-- **Orphan prevention** via `force_stop()` -- graceful shutdown with kill fallback, `kill_on_drop(true)` on all child processes
+### Identity
 
-### Budget Enforcement
+- **Content-hash IDs**: SHA-256 of seed fields, base36 encoded (e.g. `orb-k4f`)
+- **Hierarchical children**: `orb-k4f.1`, `orb-k4f.2` (monotonic counter)
+- **Content hash**: Separate hash of mutable fields for change detection
 
-- **Token budget tracking** via `BudgetTracker` -- fires the shared cancellation token when cumulative usage exceeds the configured limit
-- Budget is an orchestrator concern, not pool-level -- each subtask's usage is recorded after completion
+### Types
 
-### Retry
+`epic` | `feature` | `task` | `bug` | `chore` | `docs` | `Custom(String)`
 
-- **One-shot retry** for transient failures (Crash/Timeout failure classes)
-- Retry is transparent to semaphore management (holds same pool permit)
-- No retry on protocol errors, cancellation, or after successful completion
+### Lifecycle
 
-### Tool Profiles
+**Tasks, bugs, chores, docs** use `status`:
+```
+draft → pending → active → [review] → done | failed
+any → cancelled | tombstone
+pending → deferred (reversible)
+```
 
-- **Role-based tool restrictions** -- profiles define allowed tools per worker type
-- Profiles constrain (ceiling) rather than replace coordinator output
-- Denied tools are logged as warnings and captured in `SubtaskOutcome.permission_denials`
+**Epics, features** use `phase`:
+```
+draft → pending → speccing → decomposing → refining → [review] → waiting → executing → [review] → done | failed
+any → cancelled | tombstone
+pending | waiting → deferred (reversible)
+waiting → reevaluating → executing (when deps change)
+```
 
-### Trace & Observability
+### Priority
 
-- **Harness latency fields** (`model_latency_ms`, `tool_latency_ms`, `total_latency_ms`) flow from IPC through `SendOutcome` → `SubtaskOutcome` → `SubtaskResult`
-- **Orchestrator timestamps** (`dispatched_at`, `completed_at`) captured around pool execution
-- **`task_id` / `worker_id` correlation** -- set in `WorkerConfig`, sent in IPC `init`, echoed back on events and results
-- **`build_timeline()`** reconstructs a `TaskTimeline` from `OrchestrateOutcome` with:
-  - Per-subtask `TraceSpan` (wall clock, overhead, latency breakdown, retries)
-  - Gap detection: `MissingHarnessLatency`, `MissingTimestamps`, `NegativeOverhead`, `InterGroupGap`, `LatencyMismatch`
-  - `TerminationReason` (Completed, PartialFailure, Timeout, BudgetExceeded, Cancelled)
+| Level | Name |
+|-------|------|
+| 1 | Critical |
+| 2 | High |
+| 3 | Medium (default) |
+| 4 | Low |
+| 5 | Backlog |
+
+## Dependency Graph
+
+Seven edge types: `Blocks`, `DependsOn`, `Parent`, `Child`, `Related`, `Duplicates`, `Follows`.
+
+- Blocking edges (`Blocks`, `DependsOn`) enforce execution ordering
+- Cycle detection (BFS) on blocking edges prevents deadlocks
+- `pipeline()` returns topological sort with priority tie-breaking
+- `ready()` / `waiting()` queries drive the queue loop
+- Effective priority propagates upstream through blocking deps
+
+## Pipeline Phases
+
+The phase pipeline for epics/features:
+
+1. **Speccing** — Detect or generate design + acceptance criteria
+2. **Decomposition** — Break into child orbs with hierarchical IDs and dep edges
+3. **Refinement** — Iterative passes until content hash stabilizes (or max rounds)
+4. **Review** — Human-in-the-loop checkpoint (configurable per project)
+5. **Re-evaluation** — Check upstream deps before execution; escalate on failures
+
+## Configuration
+
+Layered config with TOML:
+
+```
+~/.orboros/config.toml          # Global defaults
+.orbs/config.toml               # Project overrides
+CLI flags                       # Per-invocation overrides
+```
+
+```toml
+# Example .orbs/config.toml
+default_model = "anthropic/claude-sonnet-4-20250514"
+max_concurrency = 4
+
+[review]
+requires_approval_by_default = false
+review_on_completion = true
+
+[notifications]
+enabled = true
+desktop = true
+```
+
+Projects are registered in `~/.orboros/projects.toml` automatically on `orboros init`.
 
 ## Model Routing
 
-Place a `routing.toml` in your state directory to route subtask types to different models:
-
 ```toml
+# routing.toml in state directory
 default_model = "openrouter/auto"
 
 [[rules]]
 worker_type = "research"
 model = "google/gemini-2.0-flash-001"
-reason = "cheap, fast for search tasks"
 
 [[rules]]
 worker_type = "edit"
 model = "anthropic/claude-sonnet-4-20250514"
-reason = "good at code generation"
-```
 
-Profiles can restrict tools per worker type:
-
-```toml
 [profiles.edit]
 allowed_tools = ["read", "write", "glob", "grep"]
-
-[profiles.research]
-allowed_tools = ["read", "glob", "grep", "web_search"]
 ```
-
-See `examples/routing.toml` for a full example.
 
 ## Architecture
 
 ```
-src/
-  main.rs           # CLI entry point (clap + tracing)
-  lib.rs            # Public API surface
-  runner.rs         # Single-task execution: CLI -> worker -> store
-  orchestrator.rs   # Multi-subtask orchestration with ordering, cancellation, budgets
-  trace.rs          # Timeline reconstruction and gap detection
-  coordinator/
-    decompose.rs    # LLM-powered task decomposition
-    aggregate.rs    # Result aggregation (LLM-powered with fallback)
-  ipc/
-    types.rs        # Request/Response enums (serde tagged)
-    transport.rs    # Read/write JSON lines on child stdin/stdout
-    error.rs        # IpcError (thiserror)
-  routing/
-    rules.rs        # Match worker type -> model (TOML config)
-    profile.rs      # Tool profiles -- per-worker-type tool restrictions
-  worker/
-    process.rs      # Spawn heddle, send/receive, cancel, force_stop
-    fsm.rs          # Worker lifecycle state machine (Idle/Initializing/Ready/Running/Draining/Stopped)
-    pool.rs         # Semaphore-based concurrency limiter, retry logic
-    budget.rs       # Token budget enforcement
-  state/
-    task.rs         # Task struct + status enum (Pending/Active/Done/Failed/Cancelled)
-    store.rs        # Mutex-protected JSONL append + read
+crates/
+  orbs/                   # Core library
+    src/
+      id.rs               # Content-hash ID generation (SHA-256 base36)
+      orb.rs              # Orb struct, types, lifecycle enums
+      orb_store.rs        # JSONL persistence with tombstone filtering
+      store.rs            # Legacy TaskStore
+      task.rs             # Legacy Task struct
+      trace.rs            # Trace types, TerminationReason
+      dep.rs              # Dependency edge schema
+      dep_store.rs        # Dep persistence, cycle detection, topological sort
+      audit.rs            # Audit events + comments
+      audit_store.rs      # JSONL audit persistence
+      tree.rs             # Tree reconstruction + query helpers
+      pipeline.rs         # Pipeline directory lifecycle + snapshots
+
+  orboros/                # CLI binary
+    src/
+      main.rs             # CLI entry point (clap)
+      lib.rs              # Module exports
+      config.rs           # Layered config loading + project registry
+      runner.rs           # Single-task execution
+      orchestrator.rs     # Multi-subtask orchestration
+      trace.rs            # Timeline builder (bridges orbs types)
+      queue_loop.rs       # Tick-based daemon loop
+      daemon.rs           # PID management, signal handling, log rotation
+      plan.rs             # Plan pipeline + file parsing
+      notify.rs           # Terminal + desktop notifications
+      slop.rs             # Post-completion quality checks
+      orb_cmd.rs          # Orb CRUD CLI implementations
+      coordinator/        # LLM-powered decomposition + aggregation
+      ipc/                # JSON-line protocol with heddle workers
+      routing/            # Model selection + tool profiles
+      worker/             # Process lifecycle, pool, budget, FSM
+      phases/             # Pipeline phase implementations
+        speccing.rs
+        decompose.rs
+        refinement.rs
+        review.rs
+        re_evaluation.rs
 ```
-
-### Worker Lifecycle (FSM)
-
-```
-Idle -> Initializing -> Ready -> Running -> Ready (on success)
-                                         -> Draining -> Stopped (on failure/cancel)
-```
-
-Failure classes (`Crash`, `Timeout`, `Protocol`, `Cancelled`) map to restart policies (`None`, `RetryOnce`).
-
-### IPC Protocol
-
-Workers communicate over JSON lines on stdin/stdout. Protocol v0.2.0:
-
-- **Requests** (orboros -> worker): `init`, `send`, `status`, `shutdown`, `cancel`
-- **Responses** (worker -> orboros): `init_ok`, `event`, `result`, `status_ok`, `shutdown_ok`
-- **Events** stream between `send` and `result`: `content_delta`, `tool_start`, `tool_end`, `usage`, `error`, `heartbeat`, `permission_request`, `permission_denied`, `plan_complete`, `context_prune`, `context_compact`, `context_handoff`
-- **Result fields** include `session_id`, `task_id`, `worker_id` (correlation), `model_latency_ms`, `tool_latency_ms`, `total_latency_ms` (trace)
-- **Error envelope**: `{ code, message, retryable, details? }` on Result and InitOk
-
-Golden transcripts in `test-fixtures/ipc/` are the canonical contract. See `compatibility.md` for the full protocol changelog and compatibility policy.
 
 ## Development
 
 ```bash
-cargo test           # 200 tests (197 unit + 3 integration)
-cargo clippy         # lint (pedantic)
-cargo fmt            # format
+cargo test                # 540 tests
+cargo clippy --workspace  # lint (pedantic)
+cargo fmt --all           # format
 ```
 
-Tests use mock worker scripts (`test-fixtures/mock-worker*.sh`) for fast unit tests without external dependencies. Set `HEDDLE_BINARY` to run integration tests against a real heddle-headless instance.
+Tests use mock worker scripts (`test-fixtures/mock-worker*.sh`) for fast unit tests. Set `HEDDLE_BINARY` for integration tests against a real heddle instance.
 
 ## Project Layout
 
-This repo uses a bare repo + worktree layout:
-
 ```
 ~/repos/orboros/
-  .bare/            # bare git repo
-  worktree.sh       # creates worktrees with shared file symlinks
-  main/             # main branch worktree (this code)
+  worktree.sh       # Creates worktrees with shared file symlinks
+  main/             # Main branch worktree (this code)
 ```
-
-## Sister Project
-
-**[Heddle](https://github.com/...)** -- TypeScript LLM harness. Orboros spawns heddle-headless instances as workers. The IPC protocol is defined here and synced to heddle via `scripts/sync-ipc.sh`.
