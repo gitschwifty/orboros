@@ -2,6 +2,8 @@
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::must_use_candidate)]
 
+pub mod audit;
+pub mod audit_store;
 pub mod dep;
 pub mod dep_store;
 pub mod id;
