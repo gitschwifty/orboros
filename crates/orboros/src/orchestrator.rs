@@ -3,10 +3,11 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+pub use orbs::trace::TerminationReason;
 
 use crate::coordinator::aggregate::{aggregate, fallback_concatenate};
 use crate::coordinator::decompose::Subtask;
@@ -73,22 +74,6 @@ pub struct SubtaskResult {
     pub tool_latency_ms: Option<u64>,
     /// Total latency reported by the harness (ms).
     pub total_latency_ms: Option<u64>,
-}
-
-/// Why the orchestration run ended.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TerminationReason {
-    /// All subtasks completed successfully.
-    Completed,
-    /// Some subtasks failed but the run wasn't cancelled.
-    PartialFailure,
-    /// Task-level timeout fired.
-    Timeout,
-    /// Budget limit was exceeded.
-    BudgetExceeded,
-    /// Explicitly cancelled (token fired for other reasons).
-    Cancelled,
 }
 
 /// Outcome of a full orchestration run.

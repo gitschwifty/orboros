@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::state::task::{Task, TaskStatus};
+use crate::task::{Task, TaskStatus};
 
 /// Append-only JSONL task store.
 ///
