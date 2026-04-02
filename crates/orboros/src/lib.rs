@@ -5,6 +5,7 @@
 pub mod config;
 pub mod coordinator;
 pub mod ipc;
+pub mod notify;
 pub mod orchestrator;
 pub mod phases;
 pub mod plan;
