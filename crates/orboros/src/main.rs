@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use orboros::config;
 use orboros::coordinator::decompose::decompose;
 use orboros::orchestrator::{orchestrate, OrchestrateConfig, CONTEXT_RESULT_MAX_CHARS};
+use orboros::plan::{self, PlanConfig};
 use orboros::routing::rules::RoutingConfig;
 use orboros::runner::execute_task;
 use orboros::state::store::TaskStore;
@@ -74,6 +75,17 @@ enum Commands {
     },
     /// List tasks awaiting review.
     Review,
+    /// Create a plan by decomposing a description into an epic with subtasks.
+    Plan {
+        /// The task description (or use --file to read from a markdown file).
+        description: Option<String>,
+        /// Read the plan description from a markdown file.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Only run shallow decomposition (no refinement).
+        #[arg(long)]
+        shallow: bool,
+    },
     /// Initialize a new project in the current directory.
     Init,
 }
@@ -175,6 +187,11 @@ fn main() -> anyhow::Result<()> {
         Commands::Tasks { status } => cmd_tasks(&store, status.as_deref()),
         Commands::Status { id } => cmd_status(&store, &id),
         Commands::Review => cmd_review(&store),
+        Commands::Plan {
+            description,
+            file,
+            shallow,
+        } => cmd_plan(&state_dir, description.as_deref(), file.as_deref(), shallow),
         Commands::Init => cmd_init(),
     }
 }
@@ -412,6 +429,39 @@ fn cmd_review(store: &TaskStore) -> anyhow::Result<()> {
         }
         println!("\n{} task(s) awaiting review", tasks.len());
     }
+    Ok(())
+}
+
+fn cmd_plan(
+    state_dir: &std::path::Path,
+    description: Option<&str>,
+    file: Option<&std::path::Path>,
+    shallow: bool,
+) -> anyhow::Result<()> {
+    let config = PlanConfig {
+        shallow,
+        file: file.map(PathBuf::from),
+    };
+
+    let (epic, pipeline) = if let Some(file_path) = file {
+        plan::create_plan_from_file(file_path, state_dir, &config)?
+    } else if let Some(desc) = description {
+        // Use first line as title if multi-line, otherwise use full text as both
+        let (title, body) = if let Some((first, rest)) = desc.split_once('\n') {
+            (first.trim().to_string(), rest.trim().to_string())
+        } else {
+            (desc.to_string(), desc.to_string())
+        };
+        plan::create_plan(&title, &body, state_dir, &config)?
+    } else {
+        anyhow::bail!("Provide a description or use --file <path>");
+    };
+
+    let store = pipeline.orb_store();
+    let dep_store = orbs::dep_store::DepStore::new(pipeline.deps_path());
+
+    plan::print_plan_tree(&store, &dep_store, &epic);
+
     Ok(())
 }
 
