@@ -7,6 +7,7 @@ pub mod coordinator;
 pub mod daemon;
 pub mod ipc;
 pub mod notify;
+pub mod orb_cmd;
 pub mod orchestrator;
 pub mod phases;
 pub mod plan;
