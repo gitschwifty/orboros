@@ -5,6 +5,7 @@
 pub mod config;
 pub mod coordinator;
 pub mod ipc;
+pub mod orb_cmd;
 pub mod orchestrator;
 pub mod phases;
 pub mod queue_loop;

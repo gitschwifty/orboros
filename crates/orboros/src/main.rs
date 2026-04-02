@@ -6,8 +6,12 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use orbs::dep_store::DepStore;
+use orbs::orb_store::OrbStore;
+
 use orboros::config;
 use orboros::coordinator::decompose::decompose;
+use orboros::orb_cmd;
 use orboros::orchestrator::{orchestrate, OrchestrateConfig, CONTEXT_RESULT_MAX_CHARS};
 use orboros::routing::rules::RoutingConfig;
 use orboros::runner::execute_task;
@@ -76,6 +80,109 @@ enum Commands {
     Review,
     /// Initialize a new project in the current directory.
     Init,
+    /// Manage orbs (create, show, list, update, delete, deps, review).
+    Orb {
+        #[command(subcommand)]
+        action: OrbAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum OrbAction {
+    /// Create a new orb.
+    Create {
+        /// Title for the orb.
+        title: String,
+        /// Description (defaults to title if not provided).
+        #[arg(short, long)]
+        description: Option<String>,
+        /// Orb type: task, epic, feature, bug, chore, docs.
+        #[arg(short = 't', long = "type", default_value = "task")]
+        orb_type: String,
+        /// Priority (1=critical, 5=backlog).
+        #[arg(short, long, default_value = "3")]
+        priority: u8,
+    },
+    /// Show details of an orb.
+    Show {
+        /// Orb ID (e.g. orb-k4f).
+        id: String,
+    },
+    /// List orbs with optional filters.
+    List {
+        /// Filter by type (task, epic, feature, bug, chore, docs).
+        #[arg(short = 't', long = "type")]
+        orb_type: Option<String>,
+        /// Filter by status (draft, pending, active, review, done, failed, cancelled, deferred).
+        #[arg(short, long)]
+        status: Option<String>,
+    },
+    /// Update fields on an existing orb.
+    Update {
+        /// Orb ID.
+        id: String,
+        /// New title.
+        #[arg(long)]
+        title: Option<String>,
+        /// New description.
+        #[arg(long)]
+        description: Option<String>,
+        /// New priority (1-5).
+        #[arg(short, long)]
+        priority: Option<u8>,
+        /// New status.
+        #[arg(short, long)]
+        status: Option<String>,
+    },
+    /// Soft-delete (tombstone) an orb.
+    Delete {
+        /// Orb ID.
+        id: String,
+        /// Reason for deletion.
+        #[arg(short, long)]
+        reason: Option<String>,
+    },
+    /// Manage dependencies between orbs.
+    Dep {
+        #[command(subcommand)]
+        dep_action: DepAction,
+    },
+    /// List dependencies for an orb.
+    Deps {
+        /// Orb ID.
+        id: String,
+    },
+    /// Apply a review decision (approve, reject, revise).
+    Review {
+        /// Orb ID.
+        id: String,
+        /// Decision: approve, reject, or revise.
+        decision: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum DepAction {
+    /// Add a dependency edge.
+    Add {
+        /// Source orb ID.
+        from: String,
+        /// Target orb ID.
+        to: String,
+        /// Edge type: blocks, `depends_on`, parent, child, related, duplicates, follows.
+        #[arg(short = 't', long = "type", default_value = "blocks")]
+        edge_type: String,
+    },
+    /// Remove a dependency edge.
+    Rm {
+        /// Source orb ID.
+        from: String,
+        /// Target orb ID.
+        to: String,
+        /// Edge type.
+        #[arg(short = 't', long = "type", default_value = "blocks")]
+        edge_type: String,
+    },
 }
 
 fn resolve_state_dir(raw: &str) -> PathBuf {
@@ -176,6 +283,66 @@ fn main() -> anyhow::Result<()> {
         Commands::Status { id } => cmd_status(&store, &id),
         Commands::Review => cmd_review(&store),
         Commands::Init => cmd_init(),
+        Commands::Orb { action } => {
+            let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
+            let dep_store = DepStore::new(state_dir.join("deps.jsonl"));
+            match action {
+                OrbAction::Create {
+                    title,
+                    description,
+                    orb_type,
+                    priority,
+                } => {
+                    let parsed_type = orb_cmd::parse_orb_type(&orb_type)?;
+                    let desc = description.as_deref().unwrap_or(&title);
+                    orb_cmd::cmd_orb_create(&orb_store, &title, desc, parsed_type, priority)?;
+                    Ok(())
+                }
+                OrbAction::Show { id } => orb_cmd::cmd_orb_show(&orb_store, &id),
+                OrbAction::List { orb_type, status } => {
+                    orb_cmd::cmd_orb_list(&orb_store, orb_type.as_deref(), status.as_deref())
+                }
+                OrbAction::Update {
+                    id,
+                    title,
+                    description,
+                    priority,
+                    status,
+                } => orb_cmd::cmd_orb_update(
+                    &orb_store,
+                    &id,
+                    title.as_deref(),
+                    description.as_deref(),
+                    priority,
+                    status.as_deref(),
+                ),
+                OrbAction::Delete { id, reason } => {
+                    orb_cmd::cmd_orb_delete(&orb_store, &id, reason.as_deref())
+                }
+                OrbAction::Dep { dep_action } => match dep_action {
+                    DepAction::Add {
+                        from,
+                        to,
+                        edge_type,
+                    } => {
+                        let et = orb_cmd::parse_edge_type(&edge_type)?;
+                        orb_cmd::cmd_orb_dep_add(&dep_store, &from, &to, et)
+                    }
+                    DepAction::Rm {
+                        from,
+                        to,
+                        edge_type,
+                    } => {
+                        let et = orb_cmd::parse_edge_type(&edge_type)?;
+                        orb_cmd::cmd_orb_dep_remove(&dep_store, &from, &to, et)
+                    }
+                },
+                OrbAction::Deps { id } => orb_cmd::cmd_orb_deps(&dep_store, &id),
+                OrbAction::Review { id, decision } => {
+                    orb_cmd::cmd_orb_review(&orb_store, &id, &decision)
+                }
+            }
+        }
     }
 }
 
