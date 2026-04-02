@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod coordinator;
+pub mod daemon;
 pub mod ipc;
 pub mod notify;
 pub mod orchestrator;
