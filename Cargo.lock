@@ -562,6 +562,7 @@ dependencies = [
  "clap",
  "dirs",
  "dotenvy",
+ "libc",
  "orbs",
  "predicates",
  "serde",

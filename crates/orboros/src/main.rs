@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 
 use orboros::config;
 use orboros::coordinator::decompose::decompose;
+use orboros::daemon::DaemonConfig;
 use orboros::orchestrator::{orchestrate, OrchestrateConfig, CONTEXT_RESULT_MAX_CHARS};
 use orboros::routing::rules::RoutingConfig;
 use orboros::runner::execute_task;
@@ -76,6 +77,24 @@ enum Commands {
     Review,
     /// Initialize a new project in the current directory.
     Init,
+    /// Run or manage the daemon process.
+    Daemon {
+        /// Stop a running daemon.
+        #[arg(long)]
+        stop: bool,
+        /// Show daemon status.
+        #[arg(long)]
+        status: bool,
+        /// PID file path (default: ~/.orboros/orboros.pid).
+        #[arg(long)]
+        pid_file: Option<String>,
+        /// Log file path.
+        #[arg(long)]
+        log_file: Option<String>,
+        /// Tick interval in milliseconds (default: 1000).
+        #[arg(long)]
+        tick_interval: Option<u64>,
+    },
 }
 
 fn resolve_state_dir(raw: &str) -> PathBuf {
@@ -176,6 +195,32 @@ fn main() -> anyhow::Result<()> {
         Commands::Status { id } => cmd_status(&store, &id),
         Commands::Review => cmd_review(&store),
         Commands::Init => cmd_init(),
+        Commands::Daemon {
+            stop,
+            status,
+            pid_file,
+            log_file,
+            tick_interval,
+        } => {
+            let mut daemon_config = DaemonConfig::default();
+            if let Some(pf) = pid_file {
+                daemon_config.pid_file = resolve_state_dir(&pf);
+            }
+            if let Some(lf) = log_file {
+                daemon_config.log_file = Some(resolve_state_dir(&lf));
+            }
+            if let Some(ti) = tick_interval {
+                daemon_config.tick_interval_ms = ti;
+            }
+
+            if stop {
+                cmd_daemon_stop(&daemon_config)
+            } else if status {
+                cmd_daemon_status(&daemon_config)
+            } else {
+                cmd_daemon_start(&store, &state_dir, daemon_config)
+            }
+        }
     }
 }
 
@@ -411,6 +456,68 @@ fn cmd_review(store: &TaskStore) -> anyhow::Result<()> {
             }
         }
         println!("\n{} task(s) awaiting review", tasks.len());
+    }
+    Ok(())
+}
+
+fn cmd_daemon_start(
+    _store: &TaskStore,
+    state_dir: &std::path::Path,
+    daemon_config: DaemonConfig,
+) -> anyhow::Result<()> {
+    if orboros::daemon::is_running(&daemon_config) {
+        let pid = orboros::daemon::read_pid_file(&daemon_config)?;
+        anyhow::bail!(
+            "Daemon is already running (PID {}). Use --stop first.",
+            pid.unwrap_or(0)
+        );
+    }
+
+    println!("Starting daemon...");
+
+    let orb_store = orbs::orb_store::OrbStore::new(state_dir.join("orbs.jsonl"));
+    let dep_store = orbs::dep_store::DepStore::new(state_dir.join("deps.jsonl"));
+    let queue = orboros::queue_loop::QueueLoop::new(orb_store, dep_store, state_dir.to_path_buf());
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(orboros::daemon::run_daemon(daemon_config, queue))?;
+
+    Ok(())
+}
+
+fn cmd_daemon_stop(daemon_config: &DaemonConfig) -> anyhow::Result<()> {
+    match orboros::daemon::read_pid_file(daemon_config)? {
+        Some(pid) => {
+            if orboros::daemon::is_running(daemon_config) {
+                println!("Sending SIGTERM to daemon (PID {pid})...");
+                // Safety: sending SIGTERM to a known PID
+                unsafe {
+                    libc::kill(pid.cast_signed(), libc::SIGTERM);
+                }
+                println!("Stop signal sent.");
+            } else {
+                println!("Daemon is not running (stale PID file). Cleaning up.");
+                orboros::daemon::remove_pid_file(daemon_config)?;
+            }
+        }
+        None => {
+            println!("No daemon is running (no PID file found).");
+        }
+    }
+    Ok(())
+}
+
+fn cmd_daemon_status(daemon_config: &DaemonConfig) -> anyhow::Result<()> {
+    if orboros::daemon::is_running(daemon_config) {
+        let pid = orboros::daemon::read_pid_file(daemon_config)?;
+        println!("Daemon is running (PID {}).", pid.unwrap_or(0));
+    } else if daemon_config.pid_file.exists() {
+        println!(
+            "Daemon is not running (stale PID file at {}).",
+            daemon_config.pid_file.display()
+        );
+    } else {
+        println!("Daemon is not running.");
     }
     Ok(())
 }
