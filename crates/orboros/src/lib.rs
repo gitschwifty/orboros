@@ -7,6 +7,7 @@ pub mod coordinator;
 pub mod ipc;
 pub mod orchestrator;
 pub mod phases;
+pub mod queue_loop;
 pub mod routing;
 pub mod runner;
 pub mod state;
