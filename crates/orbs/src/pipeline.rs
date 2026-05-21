@@ -527,9 +527,9 @@ mod tests {
 
         // Write multiple versions
         store.append(&orb).unwrap();
-        orb.set_status(OrbStatus::Active);
+        orb.set_status(OrbStatus::Active).unwrap();
         store.append(&orb).unwrap();
-        orb.set_status(OrbStatus::Done);
+        orb.set_status(OrbStatus::Done).unwrap();
         orb.result = Some("done".into());
         store.append(&orb).unwrap();
 
@@ -750,7 +750,7 @@ mod tests {
         snapshot(&pipeline, "early").unwrap();
 
         // Second state + snapshot (this should be "latest")
-        orb.set_status(OrbStatus::Active);
+        orb.set_status(OrbStatus::Active).unwrap();
         orb.result = Some("active state".into());
         // Rewrite the pipeline orbs file entirely for the new state
         std::fs::write(pipeline.orbs_path(), "").unwrap();

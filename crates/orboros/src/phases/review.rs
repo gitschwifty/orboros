@@ -49,8 +49,17 @@ pub fn needs_review(orb: &Orb, config: &OrbConfig) -> bool {
 /// Sets `orb.phase` to `Review`. The `checkpoint_type` is informational
 /// for the caller but does not affect the orb state directly (the orb
 /// only knows it is in Review).
-pub fn enter_review(orb: &mut Orb, _checkpoint_type: CheckpointType) {
-    orb.set_phase(OrbPhase::Review);
+///
+/// # Errors
+///
+/// Returns `TransitionError` if Review is not reachable from the orb's
+/// current phase (per the lifecycle diagram, Refining and Executing both
+/// reach Review).
+pub fn enter_review(
+    orb: &mut Orb,
+    _checkpoint_type: CheckpointType,
+) -> Result<(), orbs::orb::TransitionError> {
+    orb.set_phase(OrbPhase::Review)
 }
 
 /// Applies a review decision, transitioning the orb to the appropriate phase.
@@ -62,15 +71,22 @@ pub fn enter_review(orb: &mut Orb, _checkpoint_type: CheckpointType) {
 /// - `RequestChanges`:
 ///   - `PostRefinement` -> Refining
 ///   - `PostCompletion` -> Executing
-pub fn apply_decision(orb: &mut Orb, decision: &ReviewDecision, checkpoint_type: CheckpointType) {
+///
+/// # Errors
+///
+/// Returns `TransitionError` if the target phase is not reachable from the
+/// orb's current phase.
+pub fn apply_decision(
+    orb: &mut Orb,
+    decision: &ReviewDecision,
+    checkpoint_type: CheckpointType,
+) -> Result<(), orbs::orb::TransitionError> {
     match decision {
         ReviewDecision::Approve => match checkpoint_type {
             CheckpointType::PostRefinement => orb.set_phase(OrbPhase::Waiting),
             CheckpointType::PostCompletion => orb.set_phase(OrbPhase::Done),
         },
-        ReviewDecision::Reject { .. } => {
-            orb.set_phase(OrbPhase::Failed);
-        }
+        ReviewDecision::Reject { .. } => orb.set_phase(OrbPhase::Failed),
         ReviewDecision::RequestChanges { .. } => match checkpoint_type {
             CheckpointType::PostRefinement => orb.set_phase(OrbPhase::Refining),
             CheckpointType::PostCompletion => orb.set_phase(OrbPhase::Executing),
@@ -149,18 +165,18 @@ mod tests {
     #[test]
     fn enter_review_sets_phase_to_review() {
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Refining);
+        orb.phase = Some(OrbPhase::Refining); // test setup
 
-        enter_review(&mut orb, CheckpointType::PostRefinement);
+        enter_review(&mut orb, CheckpointType::PostRefinement).unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Review));
     }
 
     #[test]
     fn enter_review_post_completion() {
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Executing);
+        orb.phase = Some(OrbPhase::Executing); // test setup
 
-        enter_review(&mut orb, CheckpointType::PostCompletion);
+        enter_review(&mut orb, CheckpointType::PostCompletion).unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Review));
     }
 
@@ -169,26 +185,28 @@ mod tests {
     #[test]
     fn approve_post_refinement_transitions_to_waiting() {
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Review);
+        orb.phase = Some(OrbPhase::Review); // test setup
 
         apply_decision(
             &mut orb,
             &ReviewDecision::Approve,
             CheckpointType::PostRefinement,
-        );
+        )
+        .unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Waiting));
     }
 
     #[test]
     fn approve_post_completion_transitions_to_done() {
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Review);
+        orb.phase = Some(OrbPhase::Review); // test setup
 
         apply_decision(
             &mut orb,
             &ReviewDecision::Approve,
             CheckpointType::PostCompletion,
-        );
+        )
+        .unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Done));
     }
 
@@ -197,24 +215,24 @@ mod tests {
     #[test]
     fn reject_post_refinement_transitions_to_failed() {
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Review);
+        orb.phase = Some(OrbPhase::Review); // test setup
 
         let decision = ReviewDecision::Reject {
             reason: "design flawed".into(),
         };
-        apply_decision(&mut orb, &decision, CheckpointType::PostRefinement);
+        apply_decision(&mut orb, &decision, CheckpointType::PostRefinement).unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Failed));
     }
 
     #[test]
     fn reject_post_completion_transitions_to_failed() {
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Review);
+        orb.phase = Some(OrbPhase::Review); // test setup
 
         let decision = ReviewDecision::Reject {
             reason: "output unusable".into(),
         };
-        apply_decision(&mut orb, &decision, CheckpointType::PostCompletion);
+        apply_decision(&mut orb, &decision, CheckpointType::PostCompletion).unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Failed));
     }
 
@@ -223,24 +241,24 @@ mod tests {
     #[test]
     fn request_changes_post_refinement_returns_to_refining() {
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Review);
+        orb.phase = Some(OrbPhase::Review); // test setup
 
         let decision = ReviewDecision::RequestChanges {
             feedback: "needs more detail on error handling".into(),
         };
-        apply_decision(&mut orb, &decision, CheckpointType::PostRefinement);
+        apply_decision(&mut orb, &decision, CheckpointType::PostRefinement).unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Refining));
     }
 
     #[test]
     fn request_changes_post_completion_returns_to_executing() {
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Review);
+        orb.phase = Some(OrbPhase::Review); // test setup
 
         let decision = ReviewDecision::RequestChanges {
             feedback: "missing edge case handling".into(),
         };
-        apply_decision(&mut orb, &decision, CheckpointType::PostCompletion);
+        apply_decision(&mut orb, &decision, CheckpointType::PostCompletion).unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Executing));
     }
 
@@ -294,24 +312,24 @@ mod tests {
     fn full_post_refinement_review_flow() {
         let mut orb = feature_orb("Auth");
         orb.requires_approval = true;
-        orb.set_phase(OrbPhase::Refining);
+        orb.phase = Some(OrbPhase::Refining); // test setup
 
         let config = default_config();
         assert!(needs_review(&orb, &config));
 
         // Enter review
-        enter_review(&mut orb, CheckpointType::PostRefinement);
+        enter_review(&mut orb, CheckpointType::PostRefinement).unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Review));
 
         // Request changes -> back to refining
         let changes = ReviewDecision::RequestChanges {
             feedback: "add error handling".into(),
         };
-        apply_decision(&mut orb, &changes, CheckpointType::PostRefinement);
+        apply_decision(&mut orb, &changes, CheckpointType::PostRefinement).unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Refining));
 
         // Re-enter review
-        enter_review(&mut orb, CheckpointType::PostRefinement);
+        enter_review(&mut orb, CheckpointType::PostRefinement).unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Review));
 
         // Approve -> waiting
@@ -319,14 +337,15 @@ mod tests {
             &mut orb,
             &ReviewDecision::Approve,
             CheckpointType::PostRefinement,
-        );
+        )
+        .unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Waiting));
     }
 
     #[test]
     fn full_post_completion_review_flow() {
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Executing);
+        orb.phase = Some(OrbPhase::Executing); // test setup
         orb.result = Some("auth implemented".into());
         orb.acceptance_criteria = Some("handles 401".into());
 
@@ -335,7 +354,7 @@ mod tests {
         assert!(confidence_check(&orb));
 
         // Enter review
-        enter_review(&mut orb, CheckpointType::PostCompletion);
+        enter_review(&mut orb, CheckpointType::PostCompletion).unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Review));
 
         // Approve -> done
@@ -343,7 +362,8 @@ mod tests {
             &mut orb,
             &ReviewDecision::Approve,
             CheckpointType::PostCompletion,
-        );
+        )
+        .unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Done));
         assert!(orb.closed_at.is_some());
     }

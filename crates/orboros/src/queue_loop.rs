@@ -128,7 +128,9 @@ impl QueueLoop {
 
             // Transition to Speccing
             let mut updated = orb.clone();
-            updated.set_phase(OrbPhase::Speccing);
+            updated
+                .set_phase(OrbPhase::Speccing)
+                .map_err(std::io::Error::other)?;
             self.orb_store.update(&updated)?;
             count += 1;
         }
@@ -153,7 +155,9 @@ impl QueueLoop {
                 // Phase-type orbs in Waiting → Executing
                 if orb.phase == Some(OrbPhase::Waiting) {
                     let mut updated = orb.clone();
-                    updated.set_phase(OrbPhase::Executing);
+                    updated
+                        .set_phase(OrbPhase::Executing)
+                        .map_err(std::io::Error::other)?;
                     self.orb_store.update(&updated)?;
                     count += 1;
                 }
@@ -161,7 +165,9 @@ impl QueueLoop {
                 // Task-type orbs in Pending → Active
                 if orb.status == Some(OrbStatus::Pending) {
                     let mut updated = orb.clone();
-                    updated.set_status(OrbStatus::Active);
+                    updated
+                        .set_status(OrbStatus::Active)
+                        .map_err(std::io::Error::other)?;
                     self.orb_store.update(&updated)?;
                     count += 1;
                 }
@@ -196,9 +202,13 @@ impl QueueLoop {
             if all_children_done {
                 let mut updated = orb.clone();
                 if orb.orb_type.uses_phase() {
-                    updated.set_phase(OrbPhase::Done);
+                    updated
+                        .set_phase(OrbPhase::Done)
+                        .map_err(std::io::Error::other)?;
                 } else {
-                    updated.set_status(OrbStatus::Done);
+                    updated
+                        .set_status(OrbStatus::Done)
+                        .map_err(std::io::Error::other)?;
                 }
                 self.orb_store.update(&updated)?;
                 count += 1;
@@ -223,7 +233,9 @@ impl QueueLoop {
             // Only re-evaluate phase orbs in Waiting
             if orb.orb_type.uses_phase() && orb.phase == Some(OrbPhase::Waiting) {
                 let mut updated = orb.clone();
-                updated.set_phase(OrbPhase::Reevaluating);
+                updated
+                    .set_phase(OrbPhase::Reevaluating)
+                    .map_err(std::io::Error::other)?;
                 self.orb_store.update(&updated)?;
                 count += 1;
             }
@@ -318,7 +330,7 @@ mod tests {
         let (_tmp, orb_store, dep_store, base) = setup();
 
         let mut epic = Orb::new("Active epic", "Already running").with_type(OrbType::Epic);
-        epic.set_phase(OrbPhase::Speccing);
+        epic.set_phase(OrbPhase::Speccing).unwrap();
         orb_store.append(&epic).unwrap();
 
         let ql = QueueLoop::new(orb_store, dep_store, base);
@@ -389,7 +401,9 @@ mod tests {
         let (_tmp, orb_store, dep_store, base) = setup();
 
         let mut feature = Orb::new("Waiting feature", "Ready to go").with_type(OrbType::Feature);
-        feature.set_phase(OrbPhase::Waiting);
+        // Bypass step-by-step validation for test setup — we want the orb in
+        // Waiting for the purpose of this test, not exercise the pipeline.
+        feature.phase = Some(OrbPhase::Waiting);
         orb_store.append(&feature).unwrap();
 
         let ql = QueueLoop::new(orb_store.clone(), dep_store, base);
@@ -407,17 +421,17 @@ mod tests {
         let (_tmp, orb_store, dep_store, base) = setup();
 
         let mut parent = Orb::new("Parent epic", "Has children").with_type(OrbType::Epic);
-        parent.set_phase(OrbPhase::Executing);
+        parent.phase = Some(OrbPhase::Executing); // test setup; skip pipeline walk
         orb_store.append(&parent).unwrap();
 
         let mut child1 =
             Orb::new("Child 1", "First").with_parent(parent.id.clone(), Some(parent.id.clone()));
-        child1.set_status(OrbStatus::Done);
+        child1.status = Some(OrbStatus::Done); // test setup
         orb_store.append(&child1).unwrap();
 
         let mut child2 =
             Orb::new("Child 2", "Second").with_parent(parent.id.clone(), Some(parent.id.clone()));
-        child2.set_status(OrbStatus::Done);
+        child2.status = Some(OrbStatus::Done); // test setup
         orb_store.append(&child2).unwrap();
 
         let ql = QueueLoop::new(orb_store.clone(), dep_store, base);
@@ -433,12 +447,12 @@ mod tests {
         let (_tmp, orb_store, dep_store, base) = setup();
 
         let mut parent = Orb::new("Parent epic", "Has children").with_type(OrbType::Epic);
-        parent.set_phase(OrbPhase::Executing);
+        parent.phase = Some(OrbPhase::Executing); // test setup; skip pipeline walk
         orb_store.append(&parent).unwrap();
 
         let mut child1 =
             Orb::new("Child 1", "Done").with_parent(parent.id.clone(), Some(parent.id.clone()));
-        child1.set_status(OrbStatus::Done);
+        child1.status = Some(OrbStatus::Done); // test setup
         orb_store.append(&child1).unwrap();
 
         let child2 = Orb::new("Child 2", "Still pending")
@@ -458,12 +472,12 @@ mod tests {
         let (_tmp, orb_store, dep_store, base) = setup();
 
         let mut parent = Orb::new("Parent task", "Has subtasks");
-        parent.set_status(OrbStatus::Active);
+        parent.set_status(OrbStatus::Active).unwrap();
         orb_store.append(&parent).unwrap();
 
         let mut child =
             Orb::new("Subtask", "Done").with_parent(parent.id.clone(), Some(parent.id.clone()));
-        child.set_status(OrbStatus::Done);
+        child.status = Some(OrbStatus::Done); // test setup
         orb_store.append(&child).unwrap();
 
         let ql = QueueLoop::new(orb_store.clone(), dep_store, base);
@@ -484,7 +498,7 @@ mod tests {
         orb_store.append(&blocker).unwrap();
 
         let mut feature = Orb::new("Blocked feature", "Waiting").with_type(OrbType::Feature);
-        feature.set_phase(OrbPhase::Waiting);
+        feature.phase = Some(OrbPhase::Waiting); // test setup
         orb_store.append(&feature).unwrap();
 
         // blocker blocks feature

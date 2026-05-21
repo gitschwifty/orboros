@@ -51,12 +51,14 @@ pub fn create_plan(
         .map_err(|e| anyhow::anyhow!("failed to append epic orb: {e}"))?;
 
     // Transition: Pending -> Speccing -> Decomposing
-    epic.set_phase(OrbPhase::Speccing);
+    epic.set_phase(OrbPhase::Speccing)
+        .map_err(|e| anyhow::anyhow!("speccing transition rejected: {e}"))?;
     store
         .update(&epic)
         .map_err(|e| anyhow::anyhow!("failed to update epic phase: {e}"))?;
 
-    epic.set_phase(OrbPhase::Decomposing);
+    epic.set_phase(OrbPhase::Decomposing)
+        .map_err(|e| anyhow::anyhow!("decomposing transition rejected: {e}"))?;
     store
         .update(&epic)
         .map_err(|e| anyhow::anyhow!("failed to update epic phase: {e}"))?;
@@ -69,7 +71,8 @@ pub fn create_plan(
     snapshot_decomposition(&pipeline)?;
 
     // Transition to Refining (or Done if shallow)
-    epic.set_phase(OrbPhase::Refining);
+    epic.set_phase(OrbPhase::Refining)
+        .map_err(|e| anyhow::anyhow!("refining transition rejected: {e}"))?;
     store
         .update(&epic)
         .map_err(|e| anyhow::anyhow!("failed to update epic phase: {e}"))?;

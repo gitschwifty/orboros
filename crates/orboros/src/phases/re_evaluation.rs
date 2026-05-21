@@ -121,8 +121,13 @@ pub fn check_upstream(orb: &Orb, orb_store: &OrbStore, dep_store: &DepStore) -> 
 }
 
 /// Transitions an orb from Waiting to Reevaluating.
-pub fn begin_reevaluation(orb: &mut Orb) {
-    orb.set_phase(OrbPhase::Reevaluating);
+///
+/// # Errors
+///
+/// Returns `TransitionError` if the orb is not in a phase from which
+/// Reevaluating is reachable (per the lifecycle diagram, only Waiting).
+pub fn begin_reevaluation(orb: &mut Orb) -> Result<(), orbs::orb::TransitionError> {
+    orb.set_phase(OrbPhase::Reevaluating)
 }
 
 /// Applies the re-evaluation decision, transitioning the orb to the appropriate phase.
@@ -131,7 +136,16 @@ pub fn begin_reevaluation(orb: &mut Orb) {
 /// - `StillWaiting` -> back to Waiting
 /// - `NeedsPatching` -> back to Refining (needs another refinement pass)
 /// - `Escalate` -> Review (needs human)
-pub fn apply_reeval(orb: &mut Orb, result: &ReEvalResult) {
+///
+/// # Errors
+///
+/// Returns `TransitionError` if the target phase is not reachable from the
+/// orb's current phase (should not happen if `begin_reevaluation` was just
+/// called).
+pub fn apply_reeval(
+    orb: &mut Orb,
+    result: &ReEvalResult,
+) -> Result<(), orbs::orb::TransitionError> {
     match result {
         ReEvalResult::ReadyToExecute => orb.set_phase(OrbPhase::Executing),
         ReEvalResult::StillWaiting { .. } => orb.set_phase(OrbPhase::Waiting),
@@ -169,9 +183,9 @@ mod tests {
     #[test]
     fn begin_reevaluation_transitions_from_waiting() {
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Waiting);
+        orb.phase = Some(OrbPhase::Waiting); // test setup
 
-        begin_reevaluation(&mut orb);
+        begin_reevaluation(&mut orb).unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Reevaluating));
     }
 
@@ -180,45 +194,45 @@ mod tests {
     #[test]
     fn apply_reeval_ready_to_execute_transitions_to_executing() {
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Reevaluating);
+        orb.phase = Some(OrbPhase::Reevaluating); // test setup
 
-        apply_reeval(&mut orb, &ReEvalResult::ReadyToExecute);
+        apply_reeval(&mut orb, &ReEvalResult::ReadyToExecute).unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Executing));
     }
 
     #[test]
     fn apply_reeval_still_waiting_transitions_to_waiting() {
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Reevaluating);
+        orb.phase = Some(OrbPhase::Reevaluating);
 
         let result = ReEvalResult::StillWaiting {
             blocking: vec![OrbId::from_raw("orb-dep1")],
         };
-        apply_reeval(&mut orb, &result);
+        apply_reeval(&mut orb, &result).unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Waiting));
     }
 
     #[test]
     fn apply_reeval_needs_patching_transitions_to_refining() {
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Reevaluating);
+        orb.phase = Some(OrbPhase::Reevaluating);
 
         let result = ReEvalResult::NeedsPatching {
             reason: "upstream spec changed".into(),
         };
-        apply_reeval(&mut orb, &result);
+        apply_reeval(&mut orb, &result).unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Refining));
     }
 
     #[test]
     fn apply_reeval_escalate_transitions_to_review() {
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Reevaluating);
+        orb.phase = Some(OrbPhase::Reevaluating);
 
         let result = ReEvalResult::Escalate {
             reason: "dep failed".into(),
         };
-        apply_reeval(&mut orb, &result);
+        apply_reeval(&mut orb, &result).unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Review));
     }
 
@@ -241,15 +255,15 @@ mod tests {
         let (orb_store, dep_store) = make_stores();
 
         let mut dep1 = feature_orb("Dep 1");
-        dep1.set_phase(OrbPhase::Done);
+        dep1.phase = Some(OrbPhase::Done);
         orb_store.append(&dep1).unwrap();
 
         let mut dep2 = feature_orb("Dep 2");
-        dep2.set_phase(OrbPhase::Done);
+        dep2.phase = Some(OrbPhase::Done);
         orb_store.append(&dep2).unwrap();
 
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Waiting);
+        orb.phase = Some(OrbPhase::Waiting);
         orb_store.append(&orb).unwrap();
 
         // orb depends on dep1 and dep2
@@ -279,15 +293,15 @@ mod tests {
         let (orb_store, dep_store) = make_stores();
 
         let mut dep_done = feature_orb("Dep Done");
-        dep_done.set_phase(OrbPhase::Done);
+        dep_done.phase = Some(OrbPhase::Done);
         orb_store.append(&dep_done).unwrap();
 
         let mut dep_active = feature_orb("Dep Active");
-        dep_active.set_phase(OrbPhase::Executing);
+        dep_active.phase = Some(OrbPhase::Executing);
         orb_store.append(&dep_active).unwrap();
 
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Waiting);
+        orb.phase = Some(OrbPhase::Waiting);
         orb_store.append(&orb).unwrap();
 
         dep_store
@@ -322,11 +336,11 @@ mod tests {
         let (orb_store, dep_store) = make_stores();
 
         let mut dep_failed = feature_orb("Dep Failed");
-        dep_failed.set_phase(OrbPhase::Failed);
+        dep_failed.phase = Some(OrbPhase::Failed); // test setup
         orb_store.append(&dep_failed).unwrap();
 
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Waiting);
+        orb.phase = Some(OrbPhase::Waiting);
         orb_store.append(&orb).unwrap();
 
         dep_store
@@ -354,11 +368,11 @@ mod tests {
         let (orb_store, dep_store) = make_stores();
 
         let mut blocker = feature_orb("Blocker");
-        blocker.set_phase(OrbPhase::Executing);
+        blocker.phase = Some(OrbPhase::Executing); // test setup
         orb_store.append(&blocker).unwrap();
 
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Waiting);
+        orb.phase = Some(OrbPhase::Waiting);
         orb_store.append(&orb).unwrap();
 
         // blocker blocks orb (from=blocker, to=orb)
@@ -387,7 +401,7 @@ mod tests {
         let (orb_store, dep_store) = make_stores();
 
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Waiting);
+        orb.phase = Some(OrbPhase::Waiting);
         orb_store.append(&orb).unwrap();
 
         // Dependency on a non-existent orb
@@ -417,11 +431,11 @@ mod tests {
 
         // Task-type dep (uses status, not phase)
         let mut dep_task = Orb::new("Task dep", "a task");
-        dep_task.set_status(orbs::orb::OrbStatus::Done);
+        dep_task.status = Some(orbs::orb::OrbStatus::Done); // test setup
         orb_store.append(&dep_task).unwrap();
 
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Waiting);
+        orb.phase = Some(OrbPhase::Waiting);
         orb_store.append(&orb).unwrap();
 
         dep_store
@@ -441,11 +455,11 @@ mod tests {
         let (orb_store, dep_store) = make_stores();
 
         let mut dep_task = Orb::new("Task dep", "a task");
-        dep_task.set_status(orbs::orb::OrbStatus::Failed);
+        dep_task.status = Some(orbs::orb::OrbStatus::Failed); // test setup
         orb_store.append(&dep_task).unwrap();
 
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Waiting);
+        orb.phase = Some(OrbPhase::Waiting);
         orb_store.append(&orb).unwrap();
 
         dep_store
@@ -473,11 +487,11 @@ mod tests {
 
         // A related orb that is still executing — should NOT block
         let mut related = feature_orb("Related");
-        related.set_phase(OrbPhase::Executing);
+        related.phase = Some(OrbPhase::Executing); // test setup
         orb_store.append(&related).unwrap();
 
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Waiting);
+        orb.phase = Some(OrbPhase::Waiting);
         orb_store.append(&orb).unwrap();
 
         dep_store
@@ -499,11 +513,11 @@ mod tests {
         let (orb_store, dep_store) = make_stores();
 
         let mut dep = feature_orb("Dep");
-        dep.set_phase(OrbPhase::Done);
+        dep.phase = Some(OrbPhase::Done); // test setup
         orb_store.append(&dep).unwrap();
 
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Waiting);
+        orb.phase = Some(OrbPhase::Waiting);
         orb_store.append(&orb).unwrap();
 
         dep_store
@@ -515,7 +529,7 @@ mod tests {
             .unwrap();
 
         // 1. Begin re-evaluation
-        begin_reevaluation(&mut orb);
+        begin_reevaluation(&mut orb).unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Reevaluating));
 
         // 2. Check upstream
@@ -523,7 +537,7 @@ mod tests {
         assert_eq!(result, ReEvalResult::ReadyToExecute);
 
         // 3. Apply result
-        apply_reeval(&mut orb, &result);
+        apply_reeval(&mut orb, &result).unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Executing));
     }
 
@@ -532,11 +546,11 @@ mod tests {
         let (orb_store, dep_store) = make_stores();
 
         let mut dep = feature_orb("Dep");
-        dep.set_phase(OrbPhase::Executing);
+        dep.phase = Some(OrbPhase::Executing); // test setup
         orb_store.append(&dep).unwrap();
 
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Waiting);
+        orb.phase = Some(OrbPhase::Waiting);
         orb_store.append(&orb).unwrap();
 
         dep_store
@@ -548,7 +562,7 @@ mod tests {
             .unwrap();
 
         // 1. Begin re-evaluation
-        begin_reevaluation(&mut orb);
+        begin_reevaluation(&mut orb).unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Reevaluating));
 
         // 2. Check upstream — still waiting
@@ -561,7 +575,7 @@ mod tests {
         }
 
         // 3. Apply result — back to waiting
-        apply_reeval(&mut orb, &result);
+        apply_reeval(&mut orb, &result).unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Waiting));
     }
 
@@ -570,11 +584,11 @@ mod tests {
         let (orb_store, dep_store) = make_stores();
 
         let mut dep = feature_orb("Dep");
-        dep.set_phase(OrbPhase::Failed);
+        dep.phase = Some(OrbPhase::Failed); // test setup
         orb_store.append(&dep).unwrap();
 
         let mut orb = feature_orb("Auth");
-        orb.set_phase(OrbPhase::Waiting);
+        orb.phase = Some(OrbPhase::Waiting);
         orb_store.append(&orb).unwrap();
 
         dep_store
@@ -585,7 +599,7 @@ mod tests {
             ))
             .unwrap();
 
-        begin_reevaluation(&mut orb);
+        begin_reevaluation(&mut orb).unwrap();
         let result = check_upstream(&orb, &orb_store, &dep_store);
 
         match &result {
@@ -593,7 +607,7 @@ mod tests {
             other => panic!("expected Escalate, got {other:?}"),
         }
 
-        apply_reeval(&mut orb, &result);
+        apply_reeval(&mut orb, &result).unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Review));
     }
 }

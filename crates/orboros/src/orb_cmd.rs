@@ -247,7 +247,8 @@ pub fn cmd_orb_update(
     }
     if let Some(s) = status {
         let new_status = parse_orb_status(s)?;
-        orb.set_status(new_status);
+        orb.set_status(new_status)
+            .with_context(|| format!("invalid status transition to {new_status:?}"))?;
     }
     orb.updated_at = chrono::Utc::now();
     orb.update_content_hash();
@@ -395,25 +396,31 @@ pub fn cmd_orb_review(store: &OrbStore, id: &str, decision: &str) -> anyhow::Res
     match decision.to_lowercase().as_str() {
         "approve" => {
             if orb.status.is_some() {
-                orb.set_status(OrbStatus::Done);
+                orb.set_status(OrbStatus::Done)
+                    .context("approve: status transition rejected")?;
             } else {
-                orb.set_phase(OrbPhase::Done);
+                orb.set_phase(OrbPhase::Done)
+                    .context("approve: phase transition rejected")?;
             }
             println!("Approved orb {id} -> Done");
         }
         "reject" => {
             if orb.status.is_some() {
-                orb.set_status(OrbStatus::Failed);
+                orb.set_status(OrbStatus::Failed)
+                    .context("reject: status transition rejected")?;
             } else {
-                orb.set_phase(OrbPhase::Failed);
+                orb.set_phase(OrbPhase::Failed)
+                    .context("reject: phase transition rejected")?;
             }
             println!("Rejected orb {id} -> Failed");
         }
         "revise" => {
             if orb.status.is_some() {
-                orb.set_status(OrbStatus::Active);
+                orb.set_status(OrbStatus::Active)
+                    .context("revise: status transition rejected")?;
             } else {
-                orb.set_phase(OrbPhase::Executing);
+                orb.set_phase(OrbPhase::Executing)
+                    .context("revise: phase transition rejected")?;
             }
             println!("Sent orb {id} back for revision -> Active");
         }
@@ -565,7 +572,7 @@ mod tests {
 
         // Update to active
         let mut updated = orb;
-        updated.set_status(OrbStatus::Active);
+        updated.set_status(OrbStatus::Active).unwrap();
         store.update(&updated).unwrap();
 
         cmd_orb_create(&store, "Pending orb", "stays pending", OrbType::Task, 3).unwrap();
@@ -698,7 +705,8 @@ mod tests {
 
         // Move to review state first
         let mut o = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
-        o.set_status(OrbStatus::Review);
+        o.set_status(OrbStatus::Active).unwrap();
+        o.set_status(OrbStatus::Review).unwrap();
         store.update(&o).unwrap();
 
         cmd_orb_review(&store, &id, "approve").unwrap();
@@ -714,7 +722,8 @@ mod tests {
         let id = orb.id.as_str().to_string();
 
         let mut o = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
-        o.set_status(OrbStatus::Review);
+        o.set_status(OrbStatus::Active).unwrap();
+        o.set_status(OrbStatus::Review).unwrap();
         store.update(&o).unwrap();
 
         cmd_orb_review(&store, &id, "reject").unwrap();
@@ -730,7 +739,8 @@ mod tests {
         let id = orb.id.as_str().to_string();
 
         let mut o = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
-        o.set_status(OrbStatus::Review);
+        o.set_status(OrbStatus::Active).unwrap();
+        o.set_status(OrbStatus::Review).unwrap();
         store.update(&o).unwrap();
 
         cmd_orb_review(&store, &id, "revise").unwrap();
@@ -756,7 +766,8 @@ mod tests {
         let id = orb.id.as_str().to_string();
 
         let mut o = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
-        o.set_status(OrbStatus::Review);
+        o.set_status(OrbStatus::Active).unwrap();
+        o.set_status(OrbStatus::Review).unwrap();
         store.update(&o).unwrap();
 
         let result = cmd_orb_review(&store, &id, "maybe");
