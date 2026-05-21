@@ -3,6 +3,7 @@
 #![allow(clippy::must_use_candidate)]
 
 pub mod config;
+pub mod convo;
 pub mod coordinator;
 pub mod daemon;
 pub mod ipc;
