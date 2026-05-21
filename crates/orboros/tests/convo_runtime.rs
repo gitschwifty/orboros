@@ -250,3 +250,33 @@ async fn send_turn_with_dropped_receiver_still_persists_transcript() {
 fn result_status_ok_maps_to_turn_ok() {
     assert_eq!(ResultStatus::Ok, ResultStatus::Ok);
 }
+
+#[tokio::test]
+async fn append_session_event_persists_without_a_turn() {
+    let dir = tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut runtime = ConvoRuntime::new(store);
+
+    let init = make_init("append");
+    runtime
+        .start_session(init.clone(), mock_worker_config())
+        .await
+        .unwrap();
+
+    let orb_id = orbs::id::OrbId::from_raw("orb-xyz");
+    let event = SessionEvent::OrbSpawned {
+        turn_id: orbs::session::TurnId::from_raw("turn-spawn"),
+        orb_id: orb_id.clone(),
+    };
+    runtime.append_session_event(&init.id, &event).unwrap();
+
+    runtime
+        .close_session(&init.id, CloseReason::UserExit)
+        .await
+        .unwrap();
+
+    let (_, events) = runtime.store().load(&init.id).unwrap();
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, SessionEvent::OrbSpawned { orb_id: o, .. } if o == &orb_id)));
+}

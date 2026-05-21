@@ -455,9 +455,15 @@ fn cmd_chat(
     };
     let worker_config = make_worker_config(binary, model, system_prompt);
     let runtime = orboros::convo::ConvoRuntime::new(session_store);
+    let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
 
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(orboros::convo::cli::run_chat(runtime, init, worker_config))
+    rt.block_on(orboros::convo::cli::run_chat(
+        runtime,
+        init,
+        worker_config,
+        Some(orb_store),
+    ))
 }
 
 fn cmd_run(

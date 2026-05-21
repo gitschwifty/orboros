@@ -86,6 +86,23 @@ impl ConvoRuntime {
         self.workers.keys()
     }
 
+    /// Appends a session event outside the context of a worker turn.
+    /// Used by slash commands (`/spawn`, `/await`) that record links and
+    /// outcomes into the transcript without round-tripping through the
+    /// LLM.
+    ///
+    /// # Errors
+    ///
+    /// `Store` if persistence fails (closed session, size cap, etc.).
+    pub fn append_session_event(
+        &self,
+        session_id: &SessionId,
+        event: &SessionEvent,
+    ) -> Result<(), ConvoError> {
+        self.store.append_event(session_id, event)?;
+        Ok(())
+    }
+
     /// Creates a new session: writes the init header to disk and spawns a
     /// worker against `worker_config`. The returned `SessionId` matches
     /// `init.id`.
