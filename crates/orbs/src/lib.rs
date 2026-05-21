@@ -10,6 +10,8 @@ pub mod id;
 pub mod orb;
 pub mod orb_store;
 pub mod pipeline;
+pub mod session;
+pub mod session_store;
 pub mod store;
 pub mod task;
 pub mod trace;
