@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use tokio::io::BufReader;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::sync::mpsc;
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
@@ -235,6 +236,41 @@ impl Worker {
     }
 
     async fn send_inner(&mut self, id: &str, message: &str) -> Result<SendOutcome, IpcError> {
+        self.send_inner_with_tx(id, message, None).await
+    }
+
+    /// Like `send()`, but forwards each `WorkerEvent` to `event_tx` as it arrives.
+    ///
+    /// The returned `SendOutcome` still contains the full event vec for callers
+    /// that want the totals together with the streamed feed (transcript
+    /// persistence, debugging). If the receiver is dropped mid-turn, the
+    /// remaining events are still collected into the outcome but not forwarded.
+    ///
+    /// # Errors
+    ///
+    /// Returns `IpcError` if writing the send request fails, reading responses
+    /// fails, the worker closes stdout unexpectedly, or `send_timeout` elapses.
+    pub async fn send_streaming(
+        &mut self,
+        id: &str,
+        message: &str,
+        event_tx: mpsc::Sender<WorkerEvent>,
+    ) -> Result<SendOutcome, IpcError> {
+        if let Some(dur) = self.send_timeout {
+            tokio::time::timeout(dur, self.send_inner_with_tx(id, message, Some(event_tx)))
+                .await
+                .map_err(|_| IpcError::SendTimeout(dur))?
+        } else {
+            self.send_inner_with_tx(id, message, Some(event_tx)).await
+        }
+    }
+
+    async fn send_inner_with_tx(
+        &mut self,
+        id: &str,
+        message: &str,
+        mut event_tx: Option<mpsc::Sender<WorkerEvent>>,
+    ) -> Result<SendOutcome, IpcError> {
         let request = IpcRequest::Send {
             id: id.into(),
             message: message.into(),
@@ -254,6 +290,14 @@ impl Worker {
 
             match response {
                 IpcResponse::Event { event, .. } => {
+                    if let Some(tx) = event_tx.as_ref() {
+                        // Drop the forwarder if the receiver hangs up, but
+                        // keep collecting into `events` so the outcome stays
+                        // complete.
+                        if tx.send(event.clone()).await.is_err() {
+                            event_tx = None;
+                        }
+                    }
                     events.push(event);
                 }
                 IpcResponse::Result {
@@ -778,5 +822,83 @@ mod tests {
         // Very short grace period — should trigger kill
         worker.force_stop(Duration::from_millis(50)).await;
         // No panic/hang = success
+    }
+
+    #[tokio::test]
+    async fn send_streaming_forwards_events_in_order_and_returns_outcome() {
+        let mut worker = Worker::spawn(&mock_worker_config()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel(8);
+
+        let send_fut = worker.send_streaming("msg-stream", "hello", tx);
+        let drain_fut = async {
+            let mut received = Vec::new();
+            while let Some(ev) = rx.recv().await {
+                received.push(ev);
+            }
+            received
+        };
+
+        let (outcome_res, received) = tokio::join!(send_fut, drain_fut);
+        let outcome = outcome_res.unwrap();
+
+        // Outcome matches the non-streaming `send` semantics.
+        assert_eq!(outcome.status, ResultStatus::Ok);
+        assert_eq!(outcome.response.as_deref(), Some("Hello from mock worker"));
+        assert_eq!(outcome.events.len(), 2);
+
+        // Streamed events arrived in the same order and same count.
+        assert_eq!(received.len(), 2);
+        assert!(matches!(
+            &received[0],
+            WorkerEvent::ContentDelta { text } if text == "Hello from mock"
+        ));
+        assert!(matches!(received[1], WorkerEvent::Usage { .. }));
+
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_streaming_completes_even_if_receiver_dropped() {
+        let mut worker = Worker::spawn(&mock_worker_config()).await.unwrap();
+        let (tx, rx) = mpsc::channel::<WorkerEvent>(8);
+        // Drop the receiver immediately — sender side should see channel
+        // closure on first event and stop forwarding without erroring the send.
+        drop(rx);
+
+        let outcome = worker
+            .send_streaming("msg-drop-rx", "hello", tx)
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ResultStatus::Ok);
+        // Events are still collected in the outcome despite no consumer.
+        assert_eq!(outcome.events.len(), 2);
+
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_streaming_after_send_uses_same_worker_for_multi_turn() {
+        // Demonstrates that streaming and non-streaming sends can be
+        // interleaved on a single worker — the precondition for the
+        // conversational session loop.
+        let mut worker = Worker::spawn(&mock_worker_config()).await.unwrap();
+
+        let first = worker.send("msg-1", "hello").await.unwrap();
+        assert_eq!(first.status, ResultStatus::Ok);
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let (outcome, received) =
+            tokio::join!(worker.send_streaming("msg-2", "world", tx), async {
+                let mut got = Vec::new();
+                while let Some(ev) = rx.recv().await {
+                    got.push(ev);
+                }
+                got
+            });
+        let outcome = outcome.unwrap();
+        assert_eq!(outcome.status, ResultStatus::Ok);
+        assert_eq!(received.len(), 2);
+
+        worker.shutdown().await.unwrap();
     }
 }
