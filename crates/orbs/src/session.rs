@@ -209,6 +209,14 @@ pub enum SessionEvent {
         turn_id: TurnId,
         at: DateTime<Utc>,
     },
+    /// The worker was restarted mid-session (e.g. `/clear` discarded the
+    /// LLM context, `/model` switched to a new model). The transcript
+    /// continues; subsequent turns run against a fresh worker.
+    ContextReset {
+        turn_id: TurnId,
+        reason: String,
+        at: DateTime<Utc>,
+    },
     StatusChanged {
         to: SessionStatus,
         reason: Option<CloseReason>,
@@ -348,6 +356,19 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert!(json.contains("\"type\":\"status_changed\""));
+        let back: SessionEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(ev, back);
+    }
+
+    #[test]
+    fn session_event_context_reset_round_trips() {
+        let ev = SessionEvent::ContextReset {
+            turn_id: TurnId::from_raw("turn-1"),
+            reason: "clear".into(),
+            at: now(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"type\":\"context_reset\""));
         let back: SessionEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(ev, back);
     }

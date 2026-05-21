@@ -119,6 +119,17 @@ impl<W: Write> Renderer<W> {
                 self.break_stream()?;
                 writeln!(self.out, "  ← {orb_id}: {summary}")?;
             }
+            SessionEvent::ContextReset { reason, .. } => {
+                self.break_stream()?;
+                if self.use_color {
+                    writeln!(
+                        self.out,
+                        "{ANSI_DIM}— context reset ({reason}) —{ANSI_RESET}"
+                    )?;
+                } else {
+                    writeln!(self.out, "— context reset ({reason}) —")?;
+                }
+            }
             // Usage events are not rendered inline — status line shows them.
             // StatusChanged events are control-plane and not rendered.
             SessionEvent::Usage { .. } | SessionEvent::StatusChanged { .. } => {}
@@ -300,6 +311,18 @@ mod tests {
         })
         .unwrap();
         assert_eq!(output(r), "");
+    }
+
+    #[test]
+    fn context_reset_renders_marker() {
+        let mut r = buf_renderer(false);
+        r.render(&SessionEvent::ContextReset {
+            turn_id: TurnId::from_raw("turn-1"),
+            reason: "clear".into(),
+            at: Utc::now(),
+        })
+        .unwrap();
+        assert!(output(r).contains("— context reset (clear) —"));
     }
 
     #[test]

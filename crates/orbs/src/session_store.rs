@@ -408,6 +408,7 @@ fn event_timestamp(event: &SessionEvent) -> Option<DateTime<Utc>> {
         | SessionEvent::AssistantMessage { at, .. }
         | SessionEvent::Error { at, .. }
         | SessionEvent::Cancelled { at, .. }
+        | SessionEvent::ContextReset { at, .. }
         | SessionEvent::StatusChanged { at, .. } => Some(*at),
         SessionEvent::AssistantDelta { .. }
         | SessionEvent::ToolStart { .. }
