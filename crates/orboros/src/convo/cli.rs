@@ -26,7 +26,10 @@ const HELP_TEXT: &str = "/exit                    — close the session and quit
                          /help                    — show this help\n\
                          /spawn <description>     — create an orb and continue chatting\n\
                          /await <orb-id>          — wait for an orb, inject its result\n\
-                                                    into your next message";
+                                                    into your next message\n\
+                         /clear                   — restart the worker; drops LLM context,\n\
+                                                    transcript continues\n\
+                         /model <name>            — restart the worker against a new model";
 
 /// Default time between polls when waiting on an orb via `/await`.
 const AWAIT_POLL_INTERVAL: Duration = Duration::from_millis(750);
@@ -40,9 +43,22 @@ const AWAIT_TIMEOUT: Duration = Duration::from_secs(600);
 pub enum SlashCommand {
     Exit,
     Help,
-    Spawn { description: String },
-    Await { orb_id: String },
-    MissingArg { name: String },
+    Spawn {
+        description: String,
+    },
+    Await {
+        orb_id: String,
+    },
+    /// Restart the worker with the same config — drops the LLM's context
+    /// while keeping the transcript.
+    Clear,
+    /// Restart the worker against a new model.
+    Model {
+        name: String,
+    },
+    MissingArg {
+        name: String,
+    },
     Unknown(String),
 }
 
@@ -81,6 +97,18 @@ pub fn parse_slash(line: &str) -> Option<SlashCommand> {
                 }
             }
         }
+        "clear" => SlashCommand::Clear,
+        "model" => {
+            if args_trimmed.is_empty() {
+                SlashCommand::MissingArg {
+                    name: "model".into(),
+                }
+            } else {
+                SlashCommand::Model {
+                    name: args_trimmed.to_string(),
+                }
+            }
+        }
         other => SlashCommand::Unknown(other.to_string()),
     })
 }
@@ -110,7 +138,7 @@ pub async fn run_chat(
     orb_store: Option<OrbStore>,
 ) -> anyhow::Result<()> {
     let session_id = init.id.clone();
-    runtime.start_session(init, worker_config).await?;
+    runtime.start_session(init, worker_config.clone()).await?;
 
     let stdout = io::stdout();
     let use_color = stdout.is_terminal() && std::env::var_os("NO_COLOR").is_none();
@@ -128,6 +156,7 @@ pub async fn run_chat(
         &mut editor,
         &mut renderer,
         orb_store.as_ref(),
+        worker_config,
     )
     .await?;
     runtime.close_session(&session_id, close_reason).await?;
@@ -141,6 +170,7 @@ async fn chat_loop<W: io::Write>(
     editor: &mut Editor<(), DefaultHistory>,
     renderer: &mut Renderer<W>,
     orb_store: Option<&OrbStore>,
+    mut worker_config: WorkerConfig,
 ) -> anyhow::Result<CloseReason> {
     // Buffered context to prepend to the next user turn (set by /await).
     let mut pending_context: Option<String> = None;
@@ -195,6 +225,40 @@ async fn chat_loop<W: io::Write>(
                         renderer.notice("/await unavailable (no orb store configured)")?;
                     }
                 },
+                SlashCommand::Clear => {
+                    match runtime
+                        .restart_worker(session_id, worker_config.clone(), "clear")
+                        .await
+                    {
+                        Ok(()) => {
+                            renderer.notice("worker restarted; context cleared.")?;
+                            // Also drop any pending /await injection so the
+                            // fresh worker starts truly fresh.
+                            pending_context = None;
+                        }
+                        Err(err) => {
+                            renderer.notice(&format!("/clear failed: {err}"))?;
+                        }
+                    }
+                }
+                SlashCommand::Model { name } => {
+                    let new_config = WorkerConfig {
+                        model: name.clone(),
+                        ..worker_config.clone()
+                    };
+                    match runtime
+                        .restart_worker(session_id, new_config.clone(), &format!("model: {name}"))
+                        .await
+                    {
+                        Ok(()) => {
+                            worker_config = new_config;
+                            renderer.notice(&format!("model switched to {name}."))?;
+                        }
+                        Err(err) => {
+                            renderer.notice(&format!("/model failed: {err}"))?;
+                        }
+                    }
+                }
                 SlashCommand::MissingArg { name } => {
                     renderer.notice(&format!("/{name} requires an argument (try /help)"))?;
                 }
@@ -476,6 +540,33 @@ mod tests {
             parse_slash("/await"),
             Some(SlashCommand::MissingArg {
                 name: "await".into()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_slash_clear_is_arg_free() {
+        assert_eq!(parse_slash("/clear"), Some(SlashCommand::Clear));
+        // Extra args are accepted but ignored — /clear takes none.
+        assert_eq!(parse_slash("/clear ignored"), Some(SlashCommand::Clear));
+    }
+
+    #[test]
+    fn parse_slash_model_captures_name() {
+        assert_eq!(
+            parse_slash("/model openrouter/auto"),
+            Some(SlashCommand::Model {
+                name: "openrouter/auto".into()
+            })
+        );
+    }
+
+    #[test]
+    fn parse_slash_model_without_arg_yields_missing_arg() {
+        assert_eq!(
+            parse_slash("/model"),
+            Some(SlashCommand::MissingArg {
+                name: "model".into()
             })
         );
     }

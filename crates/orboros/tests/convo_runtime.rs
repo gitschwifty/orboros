@@ -252,6 +252,74 @@ fn result_status_ok_maps_to_turn_ok() {
 }
 
 #[tokio::test]
+async fn restart_worker_appends_context_reset_and_keeps_session_active() {
+    let dir = tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut runtime = ConvoRuntime::new(store);
+
+    let init = make_init("restart");
+    runtime
+        .start_session(init.clone(), mock_worker_config())
+        .await
+        .unwrap();
+
+    // Send one turn so the transcript has real content before reset.
+    let (tx, _rx) = mpsc::channel::<SessionEvent>(8);
+    runtime
+        .send_turn(&init.id, "before reset", tx)
+        .await
+        .unwrap();
+
+    // Restart the worker — session stays active.
+    runtime
+        .restart_worker(&init.id, mock_worker_config(), "clear")
+        .await
+        .unwrap();
+    assert_eq!(runtime.active_session_ids().count(), 1);
+
+    // Send another turn — should succeed against the new worker.
+    let (tx2, _rx2) = mpsc::channel::<SessionEvent>(8);
+    let summary = runtime
+        .send_turn(&init.id, "after reset", tx2)
+        .await
+        .unwrap();
+    assert_eq!(summary.status, orboros::convo::TurnStatus::Ok);
+
+    runtime
+        .close_session(&init.id, CloseReason::UserExit)
+        .await
+        .unwrap();
+
+    let (snapshot, events) = runtime.store().load(&init.id).unwrap();
+    assert_eq!(snapshot.turn_count, 2);
+    let resets: Vec<&SessionEvent> = events
+        .iter()
+        .filter(|e| matches!(e, SessionEvent::ContextReset { .. }))
+        .collect();
+    assert_eq!(resets.len(), 1);
+    assert!(matches!(
+        resets[0],
+        SessionEvent::ContextReset { reason, .. } if reason == "clear"
+    ));
+}
+
+#[tokio::test]
+async fn restart_worker_on_unknown_session_errors() {
+    let dir = tempdir().unwrap();
+    let store = SessionStore::new(dir.path());
+    let mut runtime = ConvoRuntime::new(store);
+    let err = runtime
+        .restart_worker(
+            &SessionId::from_raw("session-ghost"),
+            mock_worker_config(),
+            "clear",
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").contains("not active"));
+}
+
+#[tokio::test]
 async fn append_session_event_persists_without_a_turn() {
     let dir = tempdir().unwrap();
     let store = SessionStore::new(dir.path());

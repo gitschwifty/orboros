@@ -328,6 +328,48 @@ impl ConvoRuntime {
             let _ = worker.shutdown().await;
         }
     }
+
+    /// Kills the current worker for `session_id` and spawns a fresh one
+    /// against `worker_config`. The transcript stays active; a
+    /// `SessionEvent::ContextReset` is appended with `reason`.
+    ///
+    /// Used by `/clear` (same `worker_config`, fresh heddle context) and
+    /// `/model` (`worker_config.model` swapped, fresh context).
+    ///
+    /// # Errors
+    ///
+    /// `SessionNotActive` if no worker is attached to `session_id`;
+    /// `Ipc` if the new worker fails to spawn; `Store` if appending the
+    /// reset event fails. If the new worker fails to spawn, the old
+    /// worker is already gone — caller should treat the session as
+    /// detached and either retry or close it.
+    pub async fn restart_worker(
+        &mut self,
+        session_id: &SessionId,
+        worker_config: WorkerConfig,
+        reason: &str,
+    ) -> Result<(), ConvoError> {
+        if !self.workers.contains_key(session_id) {
+            return Err(ConvoError::SessionNotActive(session_id.clone()));
+        }
+
+        // Persist the reset marker before killing the worker so the
+        // transcript records the intent even if shutdown hangs.
+        let event = SessionEvent::ContextReset {
+            turn_id: TurnId::new(),
+            reason: reason.to_string(),
+            at: Utc::now(),
+        };
+        self.store.append_event(session_id, &event)?;
+
+        if let Some(worker) = self.workers.remove(session_id) {
+            let _ = worker.shutdown().await;
+        }
+
+        let new_worker = Worker::spawn(&worker_config).await?;
+        self.workers.insert(session_id.clone(), new_worker);
+        Ok(())
+    }
 }
 
 fn turn_status_for(outcome: &SendOutcome) -> TurnStatus {
