@@ -128,6 +128,26 @@ enum Commands {
         #[arg(long)]
         link_orb: Option<String>,
     },
+    /// List or inspect past chat sessions.
+    Sessions {
+        #[command(subcommand)]
+        action: Option<SessionsAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionsAction {
+    /// List sessions, optionally filtered by status.
+    List {
+        /// Filter by status (active, idle, closed).
+        #[arg(short, long)]
+        status: Option<String>,
+    },
+    /// Replay a session's transcript.
+    Show {
+        /// Session id (e.g. session-abc12345).
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -428,6 +448,45 @@ fn main() -> anyhow::Result<()> {
             &system_prompt,
             link_orb.as_deref(),
         ),
+        Commands::Sessions { action } => cmd_sessions(&state_dir, action),
+    }
+}
+
+fn cmd_sessions(state_dir: &std::path::Path, action: Option<SessionsAction>) -> anyhow::Result<()> {
+    let session_store = orbs::session_store::SessionStore::new(state_dir.join("sessions"));
+    match action.unwrap_or(SessionsAction::List { status: None }) {
+        SessionsAction::List { status } => {
+            let status_filter = match status.as_deref() {
+                None => None,
+                Some(s) => Some(parse_session_status(s)?),
+            };
+            orboros::convo::sessions_cmd::cmd_sessions_list(
+                &session_store,
+                orboros::convo::sessions_cmd::SessionListFilter {
+                    status: status_filter,
+                },
+                std::io::stdout().lock(),
+            )?;
+            Ok(())
+        }
+        SessionsAction::Show { id } => {
+            orboros::convo::sessions_cmd::cmd_sessions_show_stdout(
+                &session_store,
+                &orbs::session::SessionId::from_raw(id),
+            )?;
+            Ok(())
+        }
+    }
+}
+
+fn parse_session_status(s: &str) -> anyhow::Result<orbs::session::SessionStatus> {
+    match s.to_ascii_lowercase().as_str() {
+        "active" => Ok(orbs::session::SessionStatus::Active),
+        "idle" => Ok(orbs::session::SessionStatus::Idle),
+        "closed" => Ok(orbs::session::SessionStatus::Closed),
+        other => Err(anyhow::anyhow!(
+            "unknown session status: {other} (expected active, idle, or closed)"
+        )),
     }
 }
 
