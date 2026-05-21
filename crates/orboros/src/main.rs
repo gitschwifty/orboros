@@ -37,6 +37,12 @@ struct Cli {
     #[arg(long, default_value = "openrouter/free")]
     model: String,
 
+    /// Skip startup validation of worker binary, model string, and
+    /// provider credentials. Use when running against a local proxy or
+    /// when the validator is being overly strict.
+    #[arg(long, global = true)]
+    skip_prereq_check: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -263,6 +269,29 @@ fn require_binary(worker_binary: Option<&str>) -> anyhow::Result<&str> {
     })
 }
 
+/// Combined entry point used by every worker-spawning command. Resolves
+/// the worker binary (errors if unset), then runs `validate_worker_prereqs`
+/// unless `skip_prereq_check` is true.
+///
+/// Returns the borrowed binary path for the caller to keep using.
+fn prereq_check<'a>(
+    worker_binary: Option<&'a str>,
+    model: &str,
+    skip: bool,
+) -> anyhow::Result<&'a str> {
+    let binary = require_binary(worker_binary)?;
+    if skip {
+        tracing::warn!("--skip-prereq-check set; trusting caller for binary/model/credentials");
+        return Ok(binary);
+    }
+    orboros::startup_check::validate_worker_prereqs(&orboros::startup_check::PrereqCheck {
+        worker_binary: binary,
+        model,
+        require_credentials: true,
+    })?;
+    Ok(binary)
+}
+
 fn load_routing_config(state_dir: Option<&std::path::Path>) -> RoutingConfig {
     if let Some(dir) = state_dir {
         let config_path = dir.join("routing.toml");
@@ -331,16 +360,21 @@ fn main() -> anyhow::Result<()> {
             &task,
             priority,
             queue,
+            cli.skip_prereq_check,
         ),
-        Commands::Decompose { task } => {
-            cmd_decompose(cli.worker_binary.as_deref(), &cli.model, &task)
-        }
+        Commands::Decompose { task } => cmd_decompose(
+            cli.worker_binary.as_deref(),
+            &cli.model,
+            &task,
+            cli.skip_prereq_check,
+        ),
         Commands::Orchestrate { task, priority } => cmd_orchestrate(
             &store,
             cli.worker_binary.as_deref(),
             &cli.model,
             &task,
             priority,
+            cli.skip_prereq_check,
         ),
         Commands::Tasks { status } => cmd_tasks(&store, status.as_deref()),
         Commands::Status { id } => cmd_status(&store, &id),
@@ -447,6 +481,7 @@ fn main() -> anyhow::Result<()> {
             chat_model.as_deref().unwrap_or(&cli.model),
             &system_prompt,
             link_orb.as_deref(),
+            cli.skip_prereq_check,
         ),
         Commands::Sessions { action } => cmd_sessions(&state_dir, action),
     }
@@ -496,8 +531,9 @@ fn cmd_chat(
     model: &str,
     system_prompt: &str,
     link_orb: Option<&str>,
+    skip_prereq_check: bool,
 ) -> anyhow::Result<()> {
-    let binary = require_binary(worker_binary)?;
+    let binary = prereq_check(worker_binary, model, skip_prereq_check)?;
     let sessions_dir = state_dir.join("sessions");
     std::fs::create_dir_all(&sessions_dir)?;
     let session_store = orbs::session_store::SessionStore::new(sessions_dir);
@@ -532,6 +568,7 @@ fn cmd_run(
     description: &str,
     priority: u8,
     queue: bool,
+    skip_prereq_check: bool,
 ) -> anyhow::Result<()> {
     let mut task = Task::new(description, description).with_priority(priority);
     store.append(&task)?;
@@ -543,7 +580,7 @@ fn cmd_run(
         return Ok(());
     }
 
-    let binary = require_binary(worker_binary)?;
+    let binary = prereq_check(worker_binary, model, skip_prereq_check)?;
     let config = make_worker_config(
         binary,
         model,
@@ -578,8 +615,9 @@ fn cmd_decompose(
     worker_binary: Option<&str>,
     model: &str,
     description: &str,
+    skip_prereq_check: bool,
 ) -> anyhow::Result<()> {
-    let binary = require_binary(worker_binary)?;
+    let binary = prereq_check(worker_binary, model, skip_prereq_check)?;
     let config = make_worker_config(binary, model, ""); // system prompt set by decompose()
 
     let rt = tokio::runtime::Runtime::new()?;
@@ -610,8 +648,9 @@ fn cmd_orchestrate(
     model: &str,
     description: &str,
     priority: u8,
+    skip_prereq_check: bool,
 ) -> anyhow::Result<()> {
-    let binary = require_binary(worker_binary)?;
+    let binary = prereq_check(worker_binary, model, skip_prereq_check)?;
     let config = make_worker_config(binary, model, ""); // system prompt set per step
 
     // Create parent task

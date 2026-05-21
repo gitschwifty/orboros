@@ -16,6 +16,7 @@ pub mod queue_loop;
 pub mod routing;
 pub mod runner;
 pub mod slop;
+pub mod startup_check;
 pub mod state;
 pub mod trace;
 pub mod worker;
