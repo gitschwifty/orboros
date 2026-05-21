@@ -116,6 +116,38 @@ enum Commands {
         #[command(subcommand)]
         action: OrbAction,
     },
+    /// Start an interactive conversation with an agent.
+    Chat {
+        /// Override the model for this session (defaults to top-level --model).
+        #[arg(long)]
+        chat_model: Option<String>,
+        /// System prompt for the session.
+        #[arg(long, default_value = "You are a helpful conversational agent.")]
+        system_prompt: String,
+        /// Tie this session to an existing orb id (recorded in transcript).
+        #[arg(long)]
+        link_orb: Option<String>,
+    },
+    /// List or inspect past chat sessions.
+    Sessions {
+        #[command(subcommand)]
+        action: Option<SessionsAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionsAction {
+    /// List sessions, optionally filtered by status.
+    List {
+        /// Filter by status (active, idle, closed).
+        #[arg(short, long)]
+        status: Option<String>,
+    },
+    /// Replay a session's transcript.
+    Show {
+        /// Session id (e.g. session-abc12345).
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -405,7 +437,92 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Commands::Chat {
+            chat_model,
+            system_prompt,
+            link_orb,
+        } => cmd_chat(
+            &state_dir,
+            cli.worker_binary.as_deref(),
+            chat_model.as_deref().unwrap_or(&cli.model),
+            &system_prompt,
+            link_orb.as_deref(),
+        ),
+        Commands::Sessions { action } => cmd_sessions(&state_dir, action),
     }
+}
+
+fn cmd_sessions(state_dir: &std::path::Path, action: Option<SessionsAction>) -> anyhow::Result<()> {
+    let session_store = orbs::session_store::SessionStore::new(state_dir.join("sessions"));
+    match action.unwrap_or(SessionsAction::List { status: None }) {
+        SessionsAction::List { status } => {
+            let status_filter = match status.as_deref() {
+                None => None,
+                Some(s) => Some(parse_session_status(s)?),
+            };
+            orboros::convo::sessions_cmd::cmd_sessions_list(
+                &session_store,
+                orboros::convo::sessions_cmd::SessionListFilter {
+                    status: status_filter,
+                },
+                std::io::stdout().lock(),
+            )?;
+            Ok(())
+        }
+        SessionsAction::Show { id } => {
+            orboros::convo::sessions_cmd::cmd_sessions_show_stdout(
+                &session_store,
+                &orbs::session::SessionId::from_raw(id),
+            )?;
+            Ok(())
+        }
+    }
+}
+
+fn parse_session_status(s: &str) -> anyhow::Result<orbs::session::SessionStatus> {
+    match s.to_ascii_lowercase().as_str() {
+        "active" => Ok(orbs::session::SessionStatus::Active),
+        "idle" => Ok(orbs::session::SessionStatus::Idle),
+        "closed" => Ok(orbs::session::SessionStatus::Closed),
+        other => Err(anyhow::anyhow!(
+            "unknown session status: {other} (expected active, idle, or closed)"
+        )),
+    }
+}
+
+fn cmd_chat(
+    state_dir: &std::path::Path,
+    worker_binary: Option<&str>,
+    model: &str,
+    system_prompt: &str,
+    link_orb: Option<&str>,
+) -> anyhow::Result<()> {
+    let binary = require_binary(worker_binary)?;
+    let sessions_dir = state_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir)?;
+    let session_store = orbs::session_store::SessionStore::new(sessions_dir);
+
+    let init = orbs::session::SessionInit {
+        id: orbs::session::SessionId::new(),
+        created_at: chrono::Utc::now(),
+        model: model.into(),
+        system_prompt: Some(system_prompt.into()),
+        cwd: std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
+        linked_orb: link_orb.map(orbs::id::OrbId::from_raw),
+    };
+    let worker_config = make_worker_config(binary, model, system_prompt);
+    let runtime = orboros::convo::ConvoRuntime::new(session_store);
+    let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(orboros::convo::cli::run_chat(
+        runtime,
+        init,
+        worker_config,
+        Some(orb_store),
+    ))
 }
 
 fn cmd_run(
