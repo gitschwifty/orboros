@@ -122,8 +122,7 @@ pub fn begin_refining(orb: &mut Orb) -> bool {
     if orb.phase != Some(OrbPhase::Decomposing) {
         return false;
     }
-    orb.set_phase(OrbPhase::Refining);
-    true
+    orb.set_phase(OrbPhase::Refining).is_ok()
 }
 
 /// Transitions an orb from Refining to Review.
@@ -133,8 +132,7 @@ pub fn finish_refining(orb: &mut Orb) -> bool {
     if orb.phase != Some(OrbPhase::Refining) {
         return false;
     }
-    orb.set_phase(OrbPhase::Review);
-    true
+    orb.set_phase(OrbPhase::Review).is_ok()
 }
 
 #[cfg(test)]
@@ -145,7 +143,7 @@ mod tests {
 
     fn feature_orb(title: &str, desc: &str) -> Orb {
         let mut orb = Orb::new(title, desc).with_type(OrbType::Feature);
-        orb.set_phase(OrbPhase::Refining);
+        orb.phase = Some(OrbPhase::Refining); // test setup
         orb
     }
 
@@ -163,7 +161,7 @@ mod tests {
     #[test]
     fn begin_refining_from_decomposing() {
         let mut orb = Orb::new("Auth", "Implement auth").with_type(OrbType::Feature);
-        orb.set_phase(OrbPhase::Decomposing);
+        orb.phase = Some(OrbPhase::Decomposing); // test setup
 
         assert!(begin_refining(&mut orb));
         assert_eq!(orb.phase, Some(OrbPhase::Refining));
@@ -188,7 +186,7 @@ mod tests {
     #[test]
     fn finish_refining_from_non_refining_fails() {
         let mut orb = Orb::new("Auth", "Implement auth").with_type(OrbType::Feature);
-        orb.set_phase(OrbPhase::Decomposing);
+        orb.phase = Some(OrbPhase::Decomposing); // test setup
 
         assert!(!finish_refining(&mut orb));
         assert_eq!(orb.phase, Some(OrbPhase::Decomposing));
@@ -314,7 +312,7 @@ mod tests {
             .with_type(OrbType::Feature);
 
         // 1. Start in Decomposing, transition to Refining
-        orb.set_phase(OrbPhase::Decomposing);
+        orb.phase = Some(OrbPhase::Decomposing); // test setup
         assert!(begin_refining(&mut orb));
         assert_eq!(orb.phase, Some(OrbPhase::Refining));
 

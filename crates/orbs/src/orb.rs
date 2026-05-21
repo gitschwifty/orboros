@@ -418,8 +418,24 @@ impl Orb {
         self.updated_at = now;
     }
 
-    /// Transitions status (for task/bug/chore/docs types).
-    pub fn set_status(&mut self, new_status: OrbStatus) {
+    /// Transitions status (for task/bug/chore/docs types). Validates the
+    /// transition against the table in `design/lifecycle-diagrams.md`.
+    ///
+    /// # Errors
+    ///
+    /// `TransitionError::InvalidStatus` if the move is not allowed;
+    /// `TransitionError::StatusNotSet` if the orb has no current status
+    /// and `new_status` is not `Draft`.
+    pub fn set_status(&mut self, new_status: OrbStatus) -> Result<(), TransitionError> {
+        if !status_transition_allowed(self.status, new_status) {
+            return Err(match self.status {
+                Some(from) => TransitionError::InvalidStatus {
+                    from,
+                    to: new_status,
+                },
+                None => TransitionError::StatusNotSet { to: new_status },
+            });
+        }
         self.status = Some(new_status);
         self.updated_at = Utc::now();
         if matches!(
@@ -428,10 +444,27 @@ impl Orb {
         ) {
             self.closed_at = Some(self.updated_at);
         }
+        Ok(())
     }
 
-    /// Transitions phase (for epic/feature types).
-    pub fn set_phase(&mut self, new_phase: OrbPhase) {
+    /// Transitions phase (for epic/feature types). Validates the transition
+    /// against the table in `design/lifecycle-diagrams.md`.
+    ///
+    /// # Errors
+    ///
+    /// `TransitionError::InvalidPhase` if the move is not allowed;
+    /// `TransitionError::PhaseNotSet` if the orb has no current phase and
+    /// `new_phase` is not `Draft`.
+    pub fn set_phase(&mut self, new_phase: OrbPhase) -> Result<(), TransitionError> {
+        if !phase_transition_allowed(self.phase, new_phase) {
+            return Err(match self.phase {
+                Some(from) => TransitionError::InvalidPhase {
+                    from,
+                    to: new_phase,
+                },
+                None => TransitionError::PhaseNotSet { to: new_phase },
+            });
+        }
         self.phase = Some(new_phase);
         self.updated_at = Utc::now();
         if matches!(
@@ -440,7 +473,123 @@ impl Orb {
         ) {
             self.closed_at = Some(self.updated_at);
         }
+        Ok(())
     }
+}
+
+// ── Lifecycle validation ──
+
+/// Errors returned by `Orb::set_status` and `Orb::set_phase` when a
+/// transition is not permitted by the lifecycle diagrams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TransitionError {
+    #[error("invalid status transition: {from:?} -> {to:?}")]
+    InvalidStatus { from: OrbStatus, to: OrbStatus },
+
+    #[error("invalid phase transition: {from:?} -> {to:?}")]
+    InvalidPhase { from: OrbPhase, to: OrbPhase },
+
+    #[error("orb has no status set; only Draft is reachable, requested {to:?}")]
+    StatusNotSet { to: OrbStatus },
+
+    #[error("orb has no phase set; only Draft is reachable, requested {to:?}")]
+    PhaseNotSet { to: OrbPhase },
+}
+
+impl OrbStatus {
+    /// True for `Done`, `Failed`, `Cancelled`, `Tombstone`. Terminal states
+    /// have no outgoing transitions other than `Tombstone` (which is
+    /// universally reachable as an admin override).
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            OrbStatus::Done | OrbStatus::Failed | OrbStatus::Cancelled | OrbStatus::Tombstone
+        )
+    }
+}
+
+impl OrbPhase {
+    /// True for `Done`, `Failed`, `Cancelled`, `Tombstone`.
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            OrbPhase::Done | OrbPhase::Failed | OrbPhase::Cancelled | OrbPhase::Tombstone
+        )
+    }
+}
+
+/// Returns true if moving from `from` (None means orb has no status yet)
+/// to `to` is permitted by the lifecycle diagram.
+fn status_transition_allowed(from: Option<OrbStatus>, to: OrbStatus) -> bool {
+    use OrbStatus::*;
+    // Tombstone is an admin override — reachable from any state.
+    if to == Tombstone {
+        return true;
+    }
+    let Some(from) = from else {
+        // Strict: from None, only Draft is reachable.
+        return to == Draft;
+    };
+    if from == to {
+        // Self-transitions are no-ops, allowed.
+        return true;
+    }
+    matches!(
+        (from, to),
+        (Draft, Pending | Deferred | Cancelled)
+            | (Pending, Active | Deferred | Cancelled)
+            | (Deferred, Pending)
+            | (Active, Review | Done | Failed | Cancelled)
+            | (Review, Done | Active | Failed | Cancelled)
+    )
+    // Terminal states (Done, Failed, Cancelled) have no outgoing except Tombstone (handled above).
+}
+
+/// Returns true if moving from `from` (None means orb has no phase yet)
+/// to `to` is permitted by the lifecycle diagram.
+fn phase_transition_allowed(from: Option<OrbPhase>, to: OrbPhase) -> bool {
+    use OrbPhase::*;
+    if to == Tombstone {
+        return true;
+    }
+    let Some(from) = from else {
+        return to == Draft;
+    };
+    if from == to {
+        // Self-transitions: allowed for Refining (additional rounds) and
+        // generally a no-op elsewhere.
+        return true;
+    }
+    // Universally reachable from any non-terminal phase: Cancelled, Failed, Deferred.
+    if matches!(to, Cancelled | Failed | Deferred) && !from.is_terminal() {
+        return true;
+    }
+    // Undefer.
+    if from == Deferred && matches!(to, Pending | Waiting) {
+        return true;
+    }
+    matches!(
+        (from, to),
+        (Draft, Pending)
+            | (Pending, Speccing)
+            | (Speccing, Decomposing)
+            | (Decomposing, Refining)
+            | (Refining, Review)
+            | (Review, Waiting)
+            | (Review, Done) // post-completion review approve
+            | (Review, Refining) // post-refinement review request-changes
+            | (Review, Executing) // post-completion review request-changes
+            | (Waiting, Executing)
+            | (Waiting, Reevaluating)
+            | (Reevaluating, Waiting)
+            | (Reevaluating, Executing)
+            | (Reevaluating, Refining)
+            | (Reevaluating, Review) // escalate to human review
+            | (Executing, Review) // post-completion review entry
+            | (Executing, Done)
+    )
 }
 
 #[cfg(test)]
@@ -488,10 +637,10 @@ mod tests {
         let mut orb = Orb::new("Test", "test");
         assert_eq!(orb.effective_status(), TaskStatus::Pending);
 
-        orb.set_status(OrbStatus::Active);
+        orb.set_status(OrbStatus::Active).unwrap();
         assert_eq!(orb.effective_status(), TaskStatus::Active);
 
-        orb.set_status(OrbStatus::Done);
+        orb.set_status(OrbStatus::Done).unwrap();
         assert_eq!(orb.effective_status(), TaskStatus::Done);
     }
 
@@ -500,13 +649,19 @@ mod tests {
         let mut orb = Orb::new("Epic", "big").with_type(OrbType::Epic);
         assert_eq!(orb.effective_status(), TaskStatus::Pending);
 
-        orb.set_phase(OrbPhase::Speccing);
+        orb.set_phase(OrbPhase::Speccing).unwrap();
         assert_eq!(orb.effective_status(), TaskStatus::Active);
 
-        orb.set_phase(OrbPhase::Waiting);
+        // Speccing -> Waiting is not direct; have to go through the pipeline.
+        // For this test we just want to verify effective_status mapping.
+        orb.set_phase(OrbPhase::Decomposing).unwrap();
+        orb.set_phase(OrbPhase::Refining).unwrap();
+        orb.set_phase(OrbPhase::Review).unwrap();
+        orb.set_phase(OrbPhase::Waiting).unwrap();
         assert_eq!(orb.effective_status(), TaskStatus::Pending);
 
-        orb.set_phase(OrbPhase::Done);
+        orb.set_phase(OrbPhase::Executing).unwrap();
+        orb.set_phase(OrbPhase::Done).unwrap();
         assert_eq!(orb.effective_status(), TaskStatus::Done);
     }
 
@@ -521,7 +676,7 @@ mod tests {
     #[test]
     fn defer_from_active_fails() {
         let mut orb = Orb::new("Test", "test");
-        orb.set_status(OrbStatus::Active);
+        orb.set_status(OrbStatus::Active).unwrap();
         assert!(!orb.can_defer());
         assert!(!orb.defer());
         assert_eq!(orb.status, Some(OrbStatus::Active));
@@ -530,7 +685,12 @@ mod tests {
     #[test]
     fn defer_epic_from_waiting() {
         let mut orb = Orb::new("Epic", "big").with_type(OrbType::Epic);
-        orb.set_phase(OrbPhase::Waiting);
+        // Walk through the pipeline to reach Waiting.
+        orb.set_phase(OrbPhase::Speccing).unwrap();
+        orb.set_phase(OrbPhase::Decomposing).unwrap();
+        orb.set_phase(OrbPhase::Refining).unwrap();
+        orb.set_phase(OrbPhase::Review).unwrap();
+        orb.set_phase(OrbPhase::Waiting).unwrap();
         assert!(orb.can_defer());
         assert!(orb.defer());
         assert_eq!(orb.phase, Some(OrbPhase::Deferred));
@@ -548,7 +708,7 @@ mod tests {
     fn undefer_epic_with_parent_restores_waiting() {
         let mut orb = Orb::new("Feature", "sub").with_type(OrbType::Feature);
         orb.parent_id = Some(OrbId::from_raw("orb-parent"));
-        orb.set_phase(OrbPhase::Waiting);
+        orb.phase = Some(OrbPhase::Waiting); // test setup
         orb.defer();
         orb.undefer();
         assert_eq!(orb.phase, Some(OrbPhase::Waiting));
@@ -569,8 +729,198 @@ mod tests {
     fn closed_at_set_on_terminal_status() {
         let mut orb = Orb::new("Test", "test");
         assert!(orb.closed_at.is_none());
-        orb.set_status(OrbStatus::Done);
+        orb.set_status(OrbStatus::Active).unwrap();
+        orb.set_status(OrbStatus::Done).unwrap();
         assert!(orb.closed_at.is_some());
+    }
+
+    // ── transition enforcement (task 53) ──────────────────────────────
+
+    #[test]
+    fn is_terminal_status() {
+        assert!(OrbStatus::Done.is_terminal());
+        assert!(OrbStatus::Failed.is_terminal());
+        assert!(OrbStatus::Cancelled.is_terminal());
+        assert!(OrbStatus::Tombstone.is_terminal());
+        assert!(!OrbStatus::Pending.is_terminal());
+        assert!(!OrbStatus::Active.is_terminal());
+        assert!(!OrbStatus::Review.is_terminal());
+        assert!(!OrbStatus::Draft.is_terminal());
+        assert!(!OrbStatus::Deferred.is_terminal());
+    }
+
+    #[test]
+    fn is_terminal_phase() {
+        assert!(OrbPhase::Done.is_terminal());
+        assert!(OrbPhase::Failed.is_terminal());
+        assert!(OrbPhase::Cancelled.is_terminal());
+        assert!(OrbPhase::Tombstone.is_terminal());
+        assert!(!OrbPhase::Refining.is_terminal());
+        assert!(!OrbPhase::Executing.is_terminal());
+    }
+
+    #[test]
+    fn happy_path_status_transitions_succeed() {
+        let mut orb = Orb::new("Test", "test"); // starts Pending
+        orb.set_status(OrbStatus::Active).unwrap();
+        orb.set_status(OrbStatus::Review).unwrap();
+        orb.set_status(OrbStatus::Done).unwrap();
+    }
+
+    #[test]
+    fn invalid_status_transition_done_to_pending_errors() {
+        let mut orb = Orb::new("Test", "test");
+        orb.set_status(OrbStatus::Active).unwrap();
+        orb.set_status(OrbStatus::Done).unwrap();
+        let err = orb.set_status(OrbStatus::Pending).unwrap_err();
+        assert!(matches!(
+            err,
+            TransitionError::InvalidStatus {
+                from: OrbStatus::Done,
+                to: OrbStatus::Pending
+            }
+        ));
+        // Orb state unchanged.
+        assert_eq!(orb.status, Some(OrbStatus::Done));
+    }
+
+    #[test]
+    fn invalid_status_transition_pending_to_done_errors() {
+        // Must go through Active first; can't skip from Pending.
+        let mut orb = Orb::new("Test", "test");
+        let err = orb.set_status(OrbStatus::Done).unwrap_err();
+        assert!(matches!(err, TransitionError::InvalidStatus { .. }));
+    }
+
+    #[test]
+    fn status_review_to_active_is_allowed_revise() {
+        let mut orb = Orb::new("Test", "test");
+        orb.set_status(OrbStatus::Active).unwrap();
+        orb.set_status(OrbStatus::Review).unwrap();
+        orb.set_status(OrbStatus::Active).unwrap();
+        assert_eq!(orb.status, Some(OrbStatus::Active));
+    }
+
+    #[test]
+    fn tombstone_reachable_from_any_status() {
+        for start in [
+            OrbStatus::Draft,
+            OrbStatus::Pending,
+            OrbStatus::Active,
+            OrbStatus::Review,
+            OrbStatus::Done,
+            OrbStatus::Failed,
+            OrbStatus::Cancelled,
+            OrbStatus::Deferred,
+        ] {
+            assert!(
+                status_transition_allowed(Some(start), OrbStatus::Tombstone),
+                "Tombstone should be reachable from {start:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_reachable_only_from_non_terminal_status() {
+        for non_terminal in [
+            OrbStatus::Draft,
+            OrbStatus::Pending,
+            OrbStatus::Active,
+            OrbStatus::Review,
+        ] {
+            assert!(status_transition_allowed(
+                Some(non_terminal),
+                OrbStatus::Cancelled
+            ));
+        }
+        for terminal in [OrbStatus::Done, OrbStatus::Failed, OrbStatus::Cancelled] {
+            assert!(
+                !status_transition_allowed(Some(terminal), OrbStatus::Cancelled)
+                    // self-transition is allowed (Cancelled -> Cancelled is a no-op);
+                    // others should reject.
+                    || terminal == OrbStatus::Cancelled
+            );
+        }
+    }
+
+    #[test]
+    fn status_from_none_only_draft_allowed() {
+        for s in [
+            OrbStatus::Pending,
+            OrbStatus::Active,
+            OrbStatus::Review,
+            OrbStatus::Done,
+        ] {
+            assert!(
+                !status_transition_allowed(None, s),
+                "None -> {s:?} should be rejected"
+            );
+        }
+        assert!(status_transition_allowed(None, OrbStatus::Draft));
+        // Tombstone admin override still works even from None.
+        assert!(status_transition_allowed(None, OrbStatus::Tombstone));
+    }
+
+    #[test]
+    fn set_status_on_none_orb_returns_status_not_set() {
+        // Manually construct an orb with status = None (not the normal path).
+        let mut orb = Orb::new("Test", "test");
+        orb.status = None;
+        let err = orb.set_status(OrbStatus::Active).unwrap_err();
+        assert!(matches!(
+            err,
+            TransitionError::StatusNotSet {
+                to: OrbStatus::Active
+            }
+        ));
+    }
+
+    #[test]
+    fn happy_path_phase_pipeline() {
+        let mut orb = Orb::new("Epic", "big").with_type(OrbType::Epic);
+        // Starts Pending.
+        orb.set_phase(OrbPhase::Speccing).unwrap();
+        orb.set_phase(OrbPhase::Decomposing).unwrap();
+        orb.set_phase(OrbPhase::Refining).unwrap();
+        // Self-loop allowed for additional refinement rounds.
+        orb.set_phase(OrbPhase::Refining).unwrap();
+        orb.set_phase(OrbPhase::Review).unwrap();
+        orb.set_phase(OrbPhase::Waiting).unwrap();
+        orb.set_phase(OrbPhase::Executing).unwrap();
+        orb.set_phase(OrbPhase::Done).unwrap();
+    }
+
+    #[test]
+    fn phase_waiting_reevaluating_round_trip() {
+        let mut orb = Orb::new("Epic", "big").with_type(OrbType::Epic);
+        orb.set_phase(OrbPhase::Speccing).unwrap();
+        orb.set_phase(OrbPhase::Decomposing).unwrap();
+        orb.set_phase(OrbPhase::Refining).unwrap();
+        orb.set_phase(OrbPhase::Review).unwrap();
+        orb.set_phase(OrbPhase::Waiting).unwrap();
+        orb.set_phase(OrbPhase::Reevaluating).unwrap();
+        orb.set_phase(OrbPhase::Waiting).unwrap();
+    }
+
+    #[test]
+    fn invalid_phase_transition_speccing_to_executing_errors() {
+        let mut orb = Orb::new("Epic", "big").with_type(OrbType::Epic);
+        orb.set_phase(OrbPhase::Speccing).unwrap();
+        let err = orb.set_phase(OrbPhase::Executing).unwrap_err();
+        assert!(matches!(err, TransitionError::InvalidPhase { .. }));
+    }
+
+    #[test]
+    fn phase_failed_reachable_from_any_non_terminal() {
+        let mut orb = Orb::new("Epic", "big").with_type(OrbType::Epic);
+        orb.set_phase(OrbPhase::Speccing).unwrap();
+        orb.set_phase(OrbPhase::Failed).unwrap();
+        assert_eq!(orb.phase, Some(OrbPhase::Failed));
+        // No transitions out of Failed except Tombstone.
+        let err = orb.set_phase(OrbPhase::Pending).unwrap_err();
+        assert!(matches!(err, TransitionError::InvalidPhase { .. }));
+        // But Tombstone works.
+        orb.set_phase(OrbPhase::Tombstone).unwrap();
     }
 
     #[test]

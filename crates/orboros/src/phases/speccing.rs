@@ -92,8 +92,7 @@ pub fn begin_speccing(orb: &mut Orb) -> bool {
     if orb.phase != Some(OrbPhase::Pending) {
         return false;
     }
-    orb.set_phase(OrbPhase::Speccing);
-    true
+    orb.set_phase(OrbPhase::Speccing).is_ok()
 }
 
 /// Transitions an orb from Speccing to Decomposing (spec is ready). Returns
@@ -102,8 +101,7 @@ pub fn finish_speccing(orb: &mut Orb) -> bool {
     if orb.phase != Some(OrbPhase::Speccing) {
         return false;
     }
-    orb.set_phase(OrbPhase::Decomposing);
-    true
+    orb.set_phase(OrbPhase::Decomposing).is_ok()
 }
 
 #[cfg(test)]
@@ -222,7 +220,7 @@ mod tests {
     #[test]
     fn begin_speccing_from_non_pending_fails() {
         let mut orb = feature_orb("Auth flow", "Implement OAuth");
-        orb.set_phase(OrbPhase::Decomposing);
+        orb.phase = Some(OrbPhase::Decomposing); // test setup
 
         assert!(!begin_speccing(&mut orb));
         assert_eq!(orb.phase, Some(OrbPhase::Decomposing));
@@ -231,7 +229,7 @@ mod tests {
     #[test]
     fn finish_speccing_transitions_to_decomposing() {
         let mut orb = feature_orb("Auth flow", "Implement OAuth");
-        orb.set_phase(OrbPhase::Speccing);
+        orb.set_phase(OrbPhase::Speccing).unwrap();
 
         assert!(finish_speccing(&mut orb));
         assert_eq!(orb.phase, Some(OrbPhase::Decomposing));

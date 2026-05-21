@@ -591,7 +591,8 @@ mod tests {
 
     fn make_done_orb(id: &str) -> Orb {
         let mut orb = make_orb(id, 3);
-        orb.set_status(OrbStatus::Done);
+        orb.set_status(OrbStatus::Active).unwrap();
+        orb.set_status(OrbStatus::Done).unwrap();
         orb
     }
 

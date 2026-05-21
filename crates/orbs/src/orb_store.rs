@@ -190,10 +190,10 @@ mod tests {
         let mut orb = Orb::new("Test orb", "description");
         store.append(&orb).unwrap();
 
-        orb.set_status(OrbStatus::Active);
+        orb.set_status(OrbStatus::Active).unwrap();
         store.update(&orb).unwrap();
 
-        orb.set_status(OrbStatus::Done);
+        orb.set_status(OrbStatus::Done).unwrap();
         orb.result = Some("completed".into());
         store.update(&orb).unwrap();
 

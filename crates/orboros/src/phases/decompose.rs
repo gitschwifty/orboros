@@ -147,8 +147,7 @@ pub fn begin_decomposing(orb: &mut Orb) -> bool {
     if orb.phase != Some(OrbPhase::Speccing) {
         return false;
     }
-    orb.set_phase(OrbPhase::Decomposing);
-    true
+    orb.set_phase(OrbPhase::Decomposing).is_ok()
 }
 
 /// Transitions an orb from Decomposing to Refining.
@@ -158,8 +157,7 @@ pub fn finish_decomposing(orb: &mut Orb) -> bool {
     if orb.phase != Some(OrbPhase::Decomposing) {
         return false;
     }
-    orb.set_phase(OrbPhase::Refining);
-    true
+    orb.set_phase(OrbPhase::Refining).is_ok()
 }
 
 #[cfg(test)]
@@ -186,7 +184,7 @@ mod tests {
     #[test]
     fn begin_decomposing_from_speccing() {
         let mut orb = feature_orb("Auth", "Implement auth");
-        orb.set_phase(OrbPhase::Speccing);
+        orb.phase = Some(OrbPhase::Speccing); // test setup
 
         assert!(begin_decomposing(&mut orb));
         assert_eq!(orb.phase, Some(OrbPhase::Decomposing));
@@ -203,7 +201,7 @@ mod tests {
     #[test]
     fn finish_decomposing_transitions_to_refining() {
         let mut orb = feature_orb("Auth", "Implement auth");
-        orb.set_phase(OrbPhase::Decomposing);
+        orb.phase = Some(OrbPhase::Decomposing); // test setup
 
         assert!(finish_decomposing(&mut orb));
         assert_eq!(orb.phase, Some(OrbPhase::Refining));
@@ -212,7 +210,7 @@ mod tests {
     #[test]
     fn finish_decomposing_from_non_decomposing_fails() {
         let mut orb = feature_orb("Auth", "Implement auth");
-        orb.set_phase(OrbPhase::Speccing);
+        orb.phase = Some(OrbPhase::Speccing); // test setup
 
         assert!(!finish_decomposing(&mut orb));
         assert_eq!(orb.phase, Some(OrbPhase::Speccing));
@@ -234,7 +232,7 @@ mod tests {
     fn decompose_creates_children_with_hierarchical_ids() {
         let (_dir, store, dep_store) = tmp_stores();
         let mut orb = feature_orb("Auth", "Step one\nStep two\nStep three");
-        orb.set_phase(OrbPhase::Decomposing);
+        orb.phase = Some(OrbPhase::Decomposing); // test setup
 
         let result = decompose_orb(&orb, &store, &dep_store).unwrap();
 
@@ -248,7 +246,7 @@ mod tests {
     fn decompose_sets_parent_and_root_ids() {
         let (_dir, store, dep_store) = tmp_stores();
         let mut orb = feature_orb("Auth", "Step one\nStep two");
-        orb.set_phase(OrbPhase::Decomposing);
+        orb.phase = Some(OrbPhase::Decomposing); // test setup
 
         let result = decompose_orb(&orb, &store, &dep_store).unwrap();
 
@@ -264,7 +262,7 @@ mod tests {
         let (_dir, store, dep_store) = tmp_stores();
         let mut orb = feature_orb("Auth", "Step one\nStep two");
         orb.root_id = Some(OrbId::from_raw("orb-epic1"));
-        orb.set_phase(OrbPhase::Decomposing);
+        orb.phase = Some(OrbPhase::Decomposing); // test setup
 
         let result = decompose_orb(&orb, &store, &dep_store).unwrap();
 
@@ -281,7 +279,7 @@ mod tests {
     fn decompose_creates_parent_child_edges() {
         let (_dir, store, dep_store) = tmp_stores();
         let mut orb = feature_orb("Auth", "Step one\nStep two");
-        orb.set_phase(OrbPhase::Decomposing);
+        orb.phase = Some(OrbPhase::Decomposing); // test setup
 
         let result = decompose_orb(&orb, &store, &dep_store).unwrap();
 
@@ -314,7 +312,7 @@ mod tests {
     fn decompose_creates_sequential_ordering_edges() {
         let (_dir, store, dep_store) = tmp_stores();
         let mut orb = feature_orb("Auth", "Step one\nStep two\nStep three");
-        orb.set_phase(OrbPhase::Decomposing);
+        orb.phase = Some(OrbPhase::Decomposing); // test setup
 
         let result = decompose_orb(&orb, &store, &dep_store).unwrap();
 
@@ -344,7 +342,7 @@ mod tests {
     fn decompose_single_line_creates_one_child() {
         let (_dir, store, dep_store) = tmp_stores();
         let mut orb = feature_orb("Auth", "Implement the whole thing");
-        orb.set_phase(OrbPhase::Decomposing);
+        orb.phase = Some(OrbPhase::Decomposing); // test setup
 
         let result = decompose_orb(&orb, &store, &dep_store).unwrap();
 
@@ -366,7 +364,7 @@ mod tests {
     fn apply_decomposition_persists_children_and_edges() {
         let (_dir, store, dep_store) = tmp_stores();
         let mut orb = feature_orb("Auth", "Step one\nStep two");
-        orb.set_phase(OrbPhase::Decomposing);
+        orb.phase = Some(OrbPhase::Decomposing); // test setup
 
         let result = decompose_orb(&orb, &store, &dep_store).unwrap();
         apply_decomposition(&result, &store, &dep_store).unwrap();
@@ -384,7 +382,7 @@ mod tests {
     fn apply_decomposition_children_loadable_by_parent() {
         let (_dir, store, dep_store) = tmp_stores();
         let mut orb = feature_orb("Auth", "Step one\nStep two\nStep three");
-        orb.set_phase(OrbPhase::Decomposing);
+        orb.phase = Some(OrbPhase::Decomposing); // test setup
 
         let result = decompose_orb(&orb, &store, &dep_store).unwrap();
         apply_decomposition(&result, &store, &dep_store).unwrap();
@@ -426,7 +424,7 @@ mod tests {
         let mut orb = feature_orb("Auth flow", "Design auth\nImplement login\nAdd tests");
 
         // 1. Start in Speccing, transition to Decomposing
-        orb.set_phase(OrbPhase::Speccing);
+        orb.phase = Some(OrbPhase::Speccing); // test setup
         assert!(begin_decomposing(&mut orb));
         assert_eq!(orb.phase, Some(OrbPhase::Decomposing));
 
