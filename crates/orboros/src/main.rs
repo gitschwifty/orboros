@@ -116,6 +116,18 @@ enum Commands {
         #[command(subcommand)]
         action: OrbAction,
     },
+    /// Start an interactive conversation with an agent.
+    Chat {
+        /// Override the model for this session (defaults to top-level --model).
+        #[arg(long)]
+        chat_model: Option<String>,
+        /// System prompt for the session.
+        #[arg(long, default_value = "You are a helpful conversational agent.")]
+        system_prompt: String,
+        /// Tie this session to an existing orb id (recorded in transcript).
+        #[arg(long)]
+        link_orb: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -405,7 +417,47 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Commands::Chat {
+            chat_model,
+            system_prompt,
+            link_orb,
+        } => cmd_chat(
+            &state_dir,
+            cli.worker_binary.as_deref(),
+            chat_model.as_deref().unwrap_or(&cli.model),
+            &system_prompt,
+            link_orb.as_deref(),
+        ),
     }
+}
+
+fn cmd_chat(
+    state_dir: &std::path::Path,
+    worker_binary: Option<&str>,
+    model: &str,
+    system_prompt: &str,
+    link_orb: Option<&str>,
+) -> anyhow::Result<()> {
+    let binary = require_binary(worker_binary)?;
+    let sessions_dir = state_dir.join("sessions");
+    std::fs::create_dir_all(&sessions_dir)?;
+    let session_store = orbs::session_store::SessionStore::new(sessions_dir);
+
+    let init = orbs::session::SessionInit {
+        id: orbs::session::SessionId::new(),
+        created_at: chrono::Utc::now(),
+        model: model.into(),
+        system_prompt: Some(system_prompt.into()),
+        cwd: std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
+        linked_orb: link_orb.map(orbs::id::OrbId::from_raw),
+    };
+    let worker_config = make_worker_config(binary, model, system_prompt);
+    let runtime = orboros::convo::ConvoRuntime::new(session_store);
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(orboros::convo::cli::run_chat(runtime, init, worker_config))
 }
 
 fn cmd_run(

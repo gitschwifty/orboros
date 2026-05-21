@@ -10,6 +10,9 @@
 //! integration yet — Step 4 of the conversational interface adds Ctrl-C
 //! semantics on top of the existing `Worker::send_cancellable` infra.
 
+pub mod cli;
+pub mod render;
+
 use std::collections::HashMap;
 
 use chrono::Utc;
