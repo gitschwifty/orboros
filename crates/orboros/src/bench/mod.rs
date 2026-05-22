@@ -12,3 +12,4 @@
 //! list / run / show / compare / calibration`.
 
 pub mod case;
+pub mod store;
