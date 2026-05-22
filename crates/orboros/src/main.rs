@@ -248,6 +248,9 @@ enum OrbAction {
         /// Priority (1=critical, 5=backlog).
         #[arg(short, long, default_value = "3")]
         priority: u8,
+        /// Attach a label to the orb. Repeatable: `--label db --label external`.
+        #[arg(long = "label", value_name = "LABEL")]
+        labels: Vec<String>,
     },
     /// Show details of an orb.
     Show {
@@ -271,6 +274,10 @@ enum OrbAction {
         /// Filter by second-opinion reviewer verdict (accept, reject, revise, any, missing).
         #[arg(long)]
         review_status: Option<String>,
+        /// Show only orbs with at least one of these labels (any-of).
+        /// Repeatable: `--label db --label external`.
+        #[arg(long = "label", value_name = "LABEL")]
+        label: Vec<String>,
     },
     /// Update fields on an existing orb.
     Update {
@@ -292,6 +299,16 @@ enum OrbAction {
         /// harness and manual reviewer scoring.
         #[arg(long)]
         confidence: Option<f32>,
+        /// Add a label to the orb. Repeatable: `--add-label db --add-label external`.
+        #[arg(long = "add-label", value_name = "LABEL")]
+        add_label: Vec<String>,
+        /// Remove a label from the orb. Repeatable.
+        #[arg(long = "remove-label", value_name = "LABEL")]
+        remove_label: Vec<String>,
+        /// Replace the orb's labels entirely. Comma-separated:
+        /// `--set-labels db,external,wip`. Wins over --add-label / --remove-label.
+        #[arg(long = "set-labels", value_name = "CSV")]
+        set_labels: Option<String>,
     },
     /// Soft-delete (tombstone) an orb.
     Delete {
@@ -517,6 +534,7 @@ fn main() -> anyhow::Result<()> {
                     description,
                     orb_type,
                     priority,
+                    labels,
                 } => {
                     let parsed_type = orb_cmd::parse_orb_type(&orb_type)?;
                     let desc = description.as_deref().unwrap_or(&title);
@@ -526,6 +544,7 @@ fn main() -> anyhow::Result<()> {
                         desc,
                         parsed_type,
                         priority,
+                        labels,
                         hooks_ref,
                     )?;
                     Ok(())
@@ -537,6 +556,7 @@ fn main() -> anyhow::Result<()> {
                     min_confidence,
                     max_confidence,
                     review_status,
+                    label,
                 } => orb_cmd::cmd_orb_list(
                     &orb_store,
                     orb_type.as_deref(),
@@ -544,6 +564,7 @@ fn main() -> anyhow::Result<()> {
                     min_confidence,
                     max_confidence,
                     review_status.as_deref(),
+                    &label,
                 ),
                 OrbAction::Update {
                     id,
@@ -552,16 +573,28 @@ fn main() -> anyhow::Result<()> {
                     priority,
                     status,
                     confidence,
-                } => orb_cmd::cmd_orb_update(
-                    &orb_store,
-                    &id,
-                    title.as_deref(),
-                    description.as_deref(),
-                    priority,
-                    status.as_deref(),
-                    confidence,
-                    hooks_ref,
-                ),
+                    add_label,
+                    remove_label,
+                    set_labels,
+                } => {
+                    let label_edits = orb_cmd::LabelEdits {
+                        add: add_label,
+                        remove: remove_label,
+                        set: set_labels
+                            .map(|csv| csv.split(',').map(|s| s.trim().to_string()).collect()),
+                    };
+                    orb_cmd::cmd_orb_update(
+                        &orb_store,
+                        &id,
+                        title.as_deref(),
+                        description.as_deref(),
+                        priority,
+                        status.as_deref(),
+                        confidence,
+                        label_edits,
+                        hooks_ref,
+                    )
+                }
                 OrbAction::Delete { id, reason } => {
                     orb_cmd::cmd_orb_delete(&orb_store, &id, reason.as_deref(), hooks_ref)
                 }
