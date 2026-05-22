@@ -414,6 +414,13 @@ fn main() -> anyhow::Result<()> {
         Commands::Orb { action } => {
             let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
             let dep_store = DepStore::new(state_dir.join("deps.jsonl"));
+            let project_cwd = std::env::current_dir().unwrap_or_else(|_| state_dir.clone());
+            let hooks = orboros::hooks::HookSink::from_state_dir(&state_dir, &project_cwd)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "failed to load hooks; continuing without them");
+                    None
+                });
+            let hooks_ref = hooks.as_ref();
             match action {
                 OrbAction::Create {
                     title,
@@ -423,7 +430,14 @@ fn main() -> anyhow::Result<()> {
                 } => {
                     let parsed_type = orb_cmd::parse_orb_type(&orb_type)?;
                     let desc = description.as_deref().unwrap_or(&title);
-                    orb_cmd::cmd_orb_create(&orb_store, &title, desc, parsed_type, priority)?;
+                    orb_cmd::cmd_orb_create(
+                        &orb_store,
+                        &title,
+                        desc,
+                        parsed_type,
+                        priority,
+                        hooks_ref,
+                    )?;
                     Ok(())
                 }
                 OrbAction::Show { id } => orb_cmd::cmd_orb_show(&orb_store, &id),
@@ -443,9 +457,10 @@ fn main() -> anyhow::Result<()> {
                     description.as_deref(),
                     priority,
                     status.as_deref(),
+                    hooks_ref,
                 ),
                 OrbAction::Delete { id, reason } => {
-                    orb_cmd::cmd_orb_delete(&orb_store, &id, reason.as_deref())
+                    orb_cmd::cmd_orb_delete(&orb_store, &id, reason.as_deref(), hooks_ref)
                 }
                 OrbAction::Dep { dep_action } => match dep_action {
                     DepAction::Add {
@@ -467,7 +482,7 @@ fn main() -> anyhow::Result<()> {
                 },
                 OrbAction::Deps { id } => orb_cmd::cmd_orb_deps(&dep_store, &id),
                 OrbAction::Review { id, decision } => {
-                    orb_cmd::cmd_orb_review(&orb_store, &id, &decision)
+                    orb_cmd::cmd_orb_review(&orb_store, &id, &decision, hooks_ref)
                 }
             }
         }
