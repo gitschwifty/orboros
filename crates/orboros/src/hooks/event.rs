@@ -21,6 +21,10 @@ pub enum HookEvent {
     OnReviewApprove,
     OnReviewRevise,
     OnReviewReject,
+    /// Automated second-opinion reviewer (task 58) produced a verdict.
+    /// Distinct from the HITL `OnReviewApprove`/`Reject`/`Revise`
+    /// events which fire on human decisions.
+    OnReviewSecondOpinion,
     OnCancel,
     OnDelete,
     OnUndefer,
@@ -73,6 +77,7 @@ impl fmt::Display for HookEvent {
             HookEvent::OnReviewApprove => f.write_str("on-review-approve"),
             HookEvent::OnReviewRevise => f.write_str("on-review-revise"),
             HookEvent::OnReviewReject => f.write_str("on-review-reject"),
+            HookEvent::OnReviewSecondOpinion => f.write_str("on-review-second-opinion"),
             HookEvent::OnCancel => f.write_str("on-cancel"),
             HookEvent::OnDelete => f.write_str("on-delete"),
             HookEvent::OnUndefer => f.write_str("on-undefer"),
@@ -126,6 +131,7 @@ impl FromStr for HookEvent {
             "on-review-approve" => HookEvent::OnReviewApprove,
             "on-review-revise" => HookEvent::OnReviewRevise,
             "on-review-reject" => HookEvent::OnReviewReject,
+            "on-review-second-opinion" => HookEvent::OnReviewSecondOpinion,
             "on-cancel" => HookEvent::OnCancel,
             "on-delete" => HookEvent::OnDelete,
             "on-undefer" => HookEvent::OnUndefer,
@@ -252,6 +258,14 @@ mod tests {
             .parse::<HookEvent>()
             .unwrap_err();
         assert!(matches!(err, HookEventParseError::UnknownPhase(_)));
+    }
+
+    #[test]
+    fn parse_on_review_second_opinion() {
+        let ev = "on-review-second-opinion".parse::<HookEvent>().unwrap();
+        assert_eq!(ev, HookEvent::OnReviewSecondOpinion);
+        // Round-trips through Display.
+        assert_eq!(ev.to_string(), "on-review-second-opinion");
     }
 
     #[test]

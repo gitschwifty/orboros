@@ -9,6 +9,7 @@ use orbs::orb::Orb;
 use rand::Rng;
 
 use crate::config::{SecondOpinionConfig, SecondOpinionMode};
+use crate::hooks::{event::HookEvent, runner::FireCtx, sink::HookSink};
 
 /// Decides whether to dispatch the second-opinion reviewer for `orb`.
 ///
@@ -52,12 +53,19 @@ pub fn should_review<R: Rng + ?Sized>(orb: &Orb, cfg: &SecondOpinionConfig, rng:
 /// or Done → Refining for re-decomposition) is deferred to a
 /// separate follow-up that relaxes the terminal-state invariant
 /// and adds a revision counter to prevent infinite loops.
-pub fn apply_review_outcome(orb: &mut Orb, report: orbs::review::ReviewReport) {
+pub fn apply_review_outcome(
+    orb: &mut Orb,
+    report: orbs::review::ReviewReport,
+    hooks: Option<&HookSink>,
+) {
     use orbs::review::ReviewVerdict;
     if matches!(report.verdict, ReviewVerdict::Revise { .. }) && !report.critique.is_empty() {
         orb.review_critique = Some(report.critique.clone());
     }
     orb.review_report = Some(report);
+    if let Some(sink) = hooks {
+        let _ = sink.fire_blocking(HookEvent::OnReviewSecondOpinion, FireCtx::for_orb(orb));
+    }
 }
 
 #[cfg(test)]
@@ -200,7 +208,11 @@ mod tests {
     #[test]
     fn apply_accept_sets_report_without_critique_copy() {
         let mut o = done_orb_with_confidence(None);
-        apply_review_outcome(&mut o, make_report(ReviewVerdict::Accept, "looks good"));
+        apply_review_outcome(
+            &mut o,
+            make_report(ReviewVerdict::Accept, "looks good"),
+            None,
+        );
         assert!(o.review_report.is_some());
         // Critique field is only populated on Revise — Accept shouldn't
         // leak any "guidance" into the orb's prompt context.
@@ -210,7 +222,11 @@ mod tests {
     #[test]
     fn apply_reject_sets_report_without_critique_copy() {
         let mut o = done_orb_with_confidence(None);
-        apply_review_outcome(&mut o, make_report(ReviewVerdict::Reject, "unrecoverable"));
+        apply_review_outcome(
+            &mut o,
+            make_report(ReviewVerdict::Reject, "unrecoverable"),
+            None,
+        );
         assert!(o.review_report.is_some());
         assert!(o.review_critique.is_none());
     }
@@ -226,6 +242,7 @@ mod tests {
                 },
                 "wrong tool call sequence",
             ),
+            None,
         );
         assert!(o.review_report.is_some());
         assert_eq!(
@@ -245,6 +262,7 @@ mod tests {
                 },
                 "missing migration step",
             ),
+            None,
         );
         assert_eq!(o.review_critique.as_deref(), Some("missing migration step"));
     }
@@ -260,11 +278,40 @@ mod tests {
                 },
                 "",
             ),
+            None,
         );
         assert!(o.review_report.is_some());
         assert!(
             o.review_critique.is_none(),
             "empty critique shouldn't write a misleading hint"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_fires_on_review_second_opinion_hook_when_sink_present() {
+        use crate::hooks::sink::HookSink;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("hooks.toml"),
+            r#"
+            [[hook]]
+            name = "marker"
+            on = "on-review-second-opinion"
+            run = "true"
+            sync = true
+            "#,
+        )
+        .unwrap();
+        let sink = HookSink::from_state_dir(dir.path(), dir.path())
+            .unwrap()
+            .expect("hooks.toml loaded");
+        let mut o = done_orb_with_confidence(None);
+        apply_review_outcome(&mut o, make_report(ReviewVerdict::Accept, ""), Some(&sink));
+        let log = std::fs::read_to_string(dir.path().join("hooks.log.jsonl")).unwrap_or_default();
+        assert!(
+            log.contains("marker") && log.contains("on-review-second-opinion"),
+            "expected hook firing in log: {log}",
         );
     }
 
@@ -280,6 +327,7 @@ mod tests {
                 },
                 "x",
             ),
+            None,
         );
         assert_eq!(o.status, prior_status, "lifecycle re-entry is deferred");
     }
