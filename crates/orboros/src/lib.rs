@@ -2,6 +2,7 @@
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::must_use_candidate)]
 
+pub mod bench;
 pub mod config;
 pub mod convo;
 pub mod coordinator;
