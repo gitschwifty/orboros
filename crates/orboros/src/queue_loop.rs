@@ -41,6 +41,7 @@ pub struct QueueLoop {
     base_dir: PathBuf,
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    hooks: Option<Arc<crate::hooks::HookSink>>,
 }
 
 impl QueueLoop {
@@ -52,7 +53,16 @@ impl QueueLoop {
             base_dir,
             running: Arc::new(AtomicBool::new(true)),
             paused: Arc::new(AtomicBool::new(false)),
+            hooks: None,
         }
+    }
+
+    /// Attaches a `HookSink` so the queue fires `on-queue-tick` after
+    /// each non-paused tick.
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: crate::hooks::HookSink) -> Self {
+        self.hooks = Some(Arc::new(hooks));
+        self
     }
 
     /// Pauses the loop. While paused, `tick()` returns immediately with zero counts.
@@ -250,14 +260,26 @@ impl QueueLoop {
     /// Runs the queue loop until stopped.
     ///
     /// Calls `tick()` in a loop with a short sleep between iterations,
-    /// checking the `running` flag each time.
+    /// checking the `running` flag each time. After each non-paused
+    /// tick, fires the `on-queue-tick` hook (if a `HookSink` is
+    /// attached and any hooks match — the matcher rejects orb-bound
+    /// rules when no orb is in context).
     ///
     /// # Errors
     ///
     /// Returns an IO error if any tick fails.
     pub async fn run(&self) -> std::io::Result<()> {
         while self.running.load(Ordering::SeqCst) {
-            self.tick()?;
+            let result = self.tick()?;
+            if !self.is_paused() {
+                if let Some(sink) = &self.hooks {
+                    let ctx = crate::hooks::FireCtx::default();
+                    let (_outcome, _invs) =
+                        sink.fire(crate::hooks::HookEvent::OnQueueTick, ctx).await;
+                    // tick hooks are best-effort — never gate the next tick.
+                }
+            }
+            let _ = result;
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         Ok(())

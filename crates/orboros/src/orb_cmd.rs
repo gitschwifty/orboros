@@ -10,6 +10,8 @@ use orbs::id::OrbId;
 use orbs::orb::{Orb, OrbPhase, OrbStatus, OrbType};
 use orbs::orb_store::OrbStore;
 
+use crate::hooks::{FireCtx, HookEvent, HookSink};
+
 // ── Parsing helpers ────────────────────────────────────────────
 
 /// Parses a string into an `OrbType`.
@@ -84,6 +86,7 @@ pub fn cmd_orb_create(
     description: &str,
     orb_type: OrbType,
     priority: u8,
+    hooks: Option<&HookSink>,
 ) -> anyhow::Result<Orb> {
     let orb = Orb::new(title, description)
         .with_type(orb_type)
@@ -99,6 +102,9 @@ pub fn cmd_orb_create(
     }
     if let Some(phase) = orb.phase {
         println!("  phase:    {phase:?}");
+    }
+    if let Some(sink) = hooks {
+        let _ = sink.fire_blocking(HookEvent::OnOrbCreate, FireCtx::for_orb(&orb));
     }
     Ok(orb)
 }
@@ -229,12 +235,14 @@ pub fn cmd_orb_update(
     description: Option<&str>,
     priority: Option<u8>,
     status: Option<&str>,
+    hooks: Option<&HookSink>,
 ) -> anyhow::Result<()> {
     let orb_id = OrbId::from_raw(id);
     let mut orb = store
         .load_by_id(&orb_id)
         .context("failed to load orb")?
         .ok_or_else(|| anyhow::anyhow!("orb {id} not found"))?;
+    let prior_status = orb.status;
 
     if let Some(t) = title {
         orb.title = t.to_string();
@@ -256,6 +264,14 @@ pub fn cmd_orb_update(
     store.update(&orb).context("failed to persist orb update")?;
 
     println!("Updated orb {}", orb.id);
+
+    if let Some(sink) = hooks {
+        let became_cancelled =
+            orb.status == Some(OrbStatus::Cancelled) && prior_status != Some(OrbStatus::Cancelled);
+        if became_cancelled {
+            let _ = sink.fire_blocking(HookEvent::OnCancel, FireCtx::for_orb(&orb));
+        }
+    }
     Ok(())
 }
 
@@ -264,7 +280,12 @@ pub fn cmd_orb_update(
 /// # Errors
 ///
 /// Returns an error if the orb is not found or the store write fails.
-pub fn cmd_orb_delete(store: &OrbStore, id: &str, reason: Option<&str>) -> anyhow::Result<()> {
+pub fn cmd_orb_delete(
+    store: &OrbStore,
+    id: &str,
+    reason: Option<&str>,
+    hooks: Option<&HookSink>,
+) -> anyhow::Result<()> {
     let orb_id = OrbId::from_raw(id);
     let mut orb = store
         .load_by_id(&orb_id)
@@ -280,6 +301,9 @@ pub fn cmd_orb_delete(store: &OrbStore, id: &str, reason: Option<&str>) -> anyho
     println!("Deleted orb {} (tombstoned)", orb.id);
     if let Some(r) = reason {
         println!("  reason: {r}");
+    }
+    if let Some(sink) = hooks {
+        let _ = sink.fire_blocking(HookEvent::OnDelete, FireCtx::for_orb(&orb));
     }
     Ok(())
 }
@@ -380,7 +404,12 @@ pub fn cmd_orb_deps(dep_store: &DepStore, id: &str) -> anyhow::Result<()> {
 ///
 /// Returns an error if the orb is not found, not in review state,
 /// the decision is invalid, or the store write fails.
-pub fn cmd_orb_review(store: &OrbStore, id: &str, decision: &str) -> anyhow::Result<()> {
+pub fn cmd_orb_review(
+    store: &OrbStore,
+    id: &str,
+    decision: &str,
+    hooks: Option<&HookSink>,
+) -> anyhow::Result<()> {
     let orb_id = OrbId::from_raw(id);
     let mut orb = store
         .load_by_id(&orb_id)
@@ -393,7 +422,7 @@ pub fn cmd_orb_review(store: &OrbStore, id: &str, decision: &str) -> anyhow::Res
         bail!("orb {id} is not in review state");
     }
 
-    match decision.to_lowercase().as_str() {
+    let event = match decision.to_lowercase().as_str() {
         "approve" => {
             if orb.status.is_some() {
                 orb.set_status(OrbStatus::Done)
@@ -403,6 +432,7 @@ pub fn cmd_orb_review(store: &OrbStore, id: &str, decision: &str) -> anyhow::Res
                     .context("approve: phase transition rejected")?;
             }
             println!("Approved orb {id} -> Done");
+            HookEvent::OnReviewApprove
         }
         "reject" => {
             if orb.status.is_some() {
@@ -413,6 +443,7 @@ pub fn cmd_orb_review(store: &OrbStore, id: &str, decision: &str) -> anyhow::Res
                     .context("reject: phase transition rejected")?;
             }
             println!("Rejected orb {id} -> Failed");
+            HookEvent::OnReviewReject
         }
         "revise" => {
             if orb.status.is_some() {
@@ -423,13 +454,18 @@ pub fn cmd_orb_review(store: &OrbStore, id: &str, decision: &str) -> anyhow::Res
                     .context("revise: phase transition rejected")?;
             }
             println!("Sent orb {id} back for revision -> Active");
+            HookEvent::OnReviewRevise
         }
         other => bail!("unknown review decision: {other}. Use: approve, reject, revise"),
-    }
+    };
 
     store
         .update(&orb)
         .context("failed to persist review decision")?;
+
+    if let Some(sink) = hooks {
+        let _ = sink.fire_blocking(event, FireCtx::for_orb(&orb));
+    }
 
     Ok(())
 }
@@ -500,7 +536,8 @@ mod tests {
     #[test]
     fn create_orb_persists_and_returns() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "My task", "Do the thing", OrbType::Task, 2).unwrap();
+        let orb =
+            cmd_orb_create(&store, "My task", "Do the thing", OrbType::Task, 2, None).unwrap();
         assert_eq!(orb.title, "My task");
         assert_eq!(orb.description, "Do the thing");
         assert_eq!(orb.orb_type, OrbType::Task);
@@ -516,7 +553,8 @@ mod tests {
     #[test]
     fn create_epic_uses_phase() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Big epic", "Large effort", OrbType::Epic, 1).unwrap();
+        let orb =
+            cmd_orb_create(&store, "Big epic", "Large effort", OrbType::Epic, 1, None).unwrap();
         assert_eq!(orb.orb_type, OrbType::Epic);
         assert_eq!(orb.phase, Some(OrbPhase::Pending));
         assert_eq!(orb.status, None);
@@ -527,7 +565,8 @@ mod tests {
     #[test]
     fn show_existing_orb() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Show me", "Details here", OrbType::Task, 3).unwrap();
+        let orb =
+            cmd_orb_create(&store, "Show me", "Details here", OrbType::Task, 3, None).unwrap();
         // Should not error
         cmd_orb_show(&store, orb.id.as_str()).unwrap();
     }
@@ -544,8 +583,8 @@ mod tests {
     #[test]
     fn list_all_orbs() {
         let (_dir, store) = temp_orb_store();
-        cmd_orb_create(&store, "One", "first", OrbType::Task, 3).unwrap();
-        cmd_orb_create(&store, "Two", "second", OrbType::Bug, 2).unwrap();
+        cmd_orb_create(&store, "One", "first", OrbType::Task, 3, None).unwrap();
+        cmd_orb_create(&store, "Two", "second", OrbType::Bug, 2, None).unwrap();
         // Should list both
         cmd_orb_list(&store, None, None).unwrap();
     }
@@ -553,8 +592,8 @@ mod tests {
     #[test]
     fn list_with_type_filter() {
         let (_dir, store) = temp_orb_store();
-        cmd_orb_create(&store, "Task one", "t1", OrbType::Task, 3).unwrap();
-        cmd_orb_create(&store, "Bug one", "b1", OrbType::Bug, 2).unwrap();
+        cmd_orb_create(&store, "Task one", "t1", OrbType::Task, 3, None).unwrap();
+        cmd_orb_create(&store, "Bug one", "b1", OrbType::Bug, 2, None).unwrap();
 
         // Verify internal filtering by checking store directly
         let all = store.load_all().unwrap();
@@ -568,14 +607,30 @@ mod tests {
     #[test]
     fn list_with_status_filter() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Active orb", "will be active", OrbType::Task, 3).unwrap();
+        let orb = cmd_orb_create(
+            &store,
+            "Active orb",
+            "will be active",
+            OrbType::Task,
+            3,
+            None,
+        )
+        .unwrap();
 
         // Update to active
         let mut updated = orb;
         updated.set_status(OrbStatus::Active).unwrap();
         store.update(&updated).unwrap();
 
-        cmd_orb_create(&store, "Pending orb", "stays pending", OrbType::Task, 3).unwrap();
+        cmd_orb_create(
+            &store,
+            "Pending orb",
+            "stays pending",
+            OrbType::Task,
+            3,
+            None,
+        )
+        .unwrap();
 
         // Filter for active: should get 1
         let all = store.load_all().unwrap();
@@ -598,10 +653,19 @@ mod tests {
     #[test]
     fn update_title_and_priority() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Original", "desc", OrbType::Task, 3).unwrap();
+        let orb = cmd_orb_create(&store, "Original", "desc", OrbType::Task, 3, None).unwrap();
         let id = orb.id.as_str().to_string();
 
-        cmd_orb_update(&store, &id, Some("Updated title"), None, Some(1), None).unwrap();
+        cmd_orb_update(
+            &store,
+            &id,
+            Some("Updated title"),
+            None,
+            Some(1),
+            None,
+            None,
+        )
+        .unwrap();
 
         let loaded = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
         assert_eq!(loaded.title, "Updated title");
@@ -612,10 +676,10 @@ mod tests {
     #[test]
     fn update_status() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Orb", "desc", OrbType::Task, 3).unwrap();
+        let orb = cmd_orb_create(&store, "Orb", "desc", OrbType::Task, 3, None).unwrap();
         let id = orb.id.as_str().to_string();
 
-        cmd_orb_update(&store, &id, None, None, None, Some("active")).unwrap();
+        cmd_orb_update(&store, &id, None, None, None, Some("active"), None).unwrap();
 
         let loaded = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
         assert_eq!(loaded.status, Some(OrbStatus::Active));
@@ -624,7 +688,7 @@ mod tests {
     #[test]
     fn update_nonexistent_orb_errors() {
         let (_dir, store) = temp_orb_store();
-        let result = cmd_orb_update(&store, "orb-nope", Some("new"), None, None, None);
+        let result = cmd_orb_update(&store, "orb-nope", Some("new"), None, None, None, None);
         assert!(result.is_err());
     }
 
@@ -633,10 +697,10 @@ mod tests {
     #[test]
     fn delete_tombstones_orb() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Delete me", "bye", OrbType::Task, 3).unwrap();
+        let orb = cmd_orb_create(&store, "Delete me", "bye", OrbType::Task, 3, None).unwrap();
         let id = orb.id.as_str().to_string();
 
-        cmd_orb_delete(&store, &id, Some("duplicate")).unwrap();
+        cmd_orb_delete(&store, &id, Some("duplicate"), None).unwrap();
 
         // Should not appear in normal load_all
         let all = store.load_all().unwrap();
@@ -652,7 +716,7 @@ mod tests {
     #[test]
     fn delete_nonexistent_orb_errors() {
         let (_dir, store) = temp_orb_store();
-        let result = cmd_orb_delete(&store, "orb-nope", None);
+        let result = cmd_orb_delete(&store, "orb-nope", None, None);
         assert!(result.is_err());
     }
 
@@ -700,7 +764,7 @@ mod tests {
     #[test]
     fn review_approve() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Review me", "check", OrbType::Task, 3).unwrap();
+        let orb = cmd_orb_create(&store, "Review me", "check", OrbType::Task, 3, None).unwrap();
         let id = orb.id.as_str().to_string();
 
         // Move to review state first
@@ -709,7 +773,7 @@ mod tests {
         o.set_status(OrbStatus::Review).unwrap();
         store.update(&o).unwrap();
 
-        cmd_orb_review(&store, &id, "approve").unwrap();
+        cmd_orb_review(&store, &id, "approve", None).unwrap();
 
         let loaded = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
         assert_eq!(loaded.status, Some(OrbStatus::Done));
@@ -718,7 +782,7 @@ mod tests {
     #[test]
     fn review_reject() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Reject me", "nope", OrbType::Task, 3).unwrap();
+        let orb = cmd_orb_create(&store, "Reject me", "nope", OrbType::Task, 3, None).unwrap();
         let id = orb.id.as_str().to_string();
 
         let mut o = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
@@ -726,7 +790,7 @@ mod tests {
         o.set_status(OrbStatus::Review).unwrap();
         store.update(&o).unwrap();
 
-        cmd_orb_review(&store, &id, "reject").unwrap();
+        cmd_orb_review(&store, &id, "reject", None).unwrap();
 
         let loaded = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
         assert_eq!(loaded.status, Some(OrbStatus::Failed));
@@ -735,7 +799,7 @@ mod tests {
     #[test]
     fn review_revise() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Revise me", "again", OrbType::Task, 3).unwrap();
+        let orb = cmd_orb_create(&store, "Revise me", "again", OrbType::Task, 3, None).unwrap();
         let id = orb.id.as_str().to_string();
 
         let mut o = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
@@ -743,7 +807,7 @@ mod tests {
         o.set_status(OrbStatus::Review).unwrap();
         store.update(&o).unwrap();
 
-        cmd_orb_review(&store, &id, "revise").unwrap();
+        cmd_orb_review(&store, &id, "revise", None).unwrap();
 
         let loaded = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
         assert_eq!(loaded.status, Some(OrbStatus::Active));
@@ -752,17 +816,17 @@ mod tests {
     #[test]
     fn review_not_in_review_state_errors() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Not ready", "pending", OrbType::Task, 3).unwrap();
+        let orb = cmd_orb_create(&store, "Not ready", "pending", OrbType::Task, 3, None).unwrap();
         let id = orb.id.as_str().to_string();
 
-        let result = cmd_orb_review(&store, &id, "approve");
+        let result = cmd_orb_review(&store, &id, "approve", None);
         assert!(result.is_err());
     }
 
     #[test]
     fn review_invalid_decision_errors() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Review me", "check", OrbType::Task, 3).unwrap();
+        let orb = cmd_orb_create(&store, "Review me", "check", OrbType::Task, 3, None).unwrap();
         let id = orb.id.as_str().to_string();
 
         let mut o = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
@@ -770,7 +834,7 @@ mod tests {
         o.set_status(OrbStatus::Review).unwrap();
         store.update(&o).unwrap();
 
-        let result = cmd_orb_review(&store, &id, "maybe");
+        let result = cmd_orb_review(&store, &id, "maybe", None);
         assert!(result.is_err());
     }
 }
