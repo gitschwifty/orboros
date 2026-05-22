@@ -14,6 +14,7 @@ pub struct OrbConfig {
     pub max_concurrency: usize,
     pub worker_binary: Option<String>,
     pub review: ReviewConfig,
+    pub second_opinion: SecondOpinionConfig,
     pub notification: NotificationConfig,
 }
 
@@ -24,6 +25,7 @@ impl Default for OrbConfig {
             max_concurrency: 4,
             worker_binary: None,
             review: ReviewConfig::default(),
+            second_opinion: SecondOpinionConfig::default(),
             notification: NotificationConfig::default(),
         }
     }
@@ -42,6 +44,83 @@ impl Default for ReviewConfig {
             requires_approval_by_default: false,
             review_on_completion: true,
         }
+    }
+}
+
+/// How to trigger the automated second-opinion reviewer (task 58).
+///
+/// Distinct from [`ReviewConfig`] which governs the human-in-the-loop
+/// review checkpoints. The second-opinion reviewer runs after an orb
+/// reaches `Done` and emits an automated verdict (Accept / Reject /
+/// Revise) without blocking the human.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SecondOpinionMode {
+    /// Reviewer never runs.
+    #[default]
+    Off,
+    /// Reviewer always runs after `Done`.
+    Always,
+    /// Reviewer runs when `confidence < confidence_threshold`.
+    Confidence,
+    /// Reviewer runs on a random sample (`sampling_rate` fraction
+    /// of completed orbs).
+    Sampling,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct SecondOpinionConfig {
+    /// Trigger mode (see [`SecondOpinionMode`]).
+    pub mode: SecondOpinionMode,
+    /// Confidence threshold used when `mode = "confidence"`.
+    /// Orbs with `confidence < threshold` are routed for review.
+    pub confidence_threshold: f32,
+    /// Fraction of completed orbs to review when `mode = "sampling"`,
+    /// in `[0.0, 1.0]`.
+    pub sampling_rate: f32,
+    /// Reviewer model identifier. When `None`, falls back to the
+    /// project's `default_model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_model: Option<String>,
+}
+
+impl Default for SecondOpinionConfig {
+    fn default() -> Self {
+        Self {
+            mode: SecondOpinionMode::Off,
+            confidence_threshold: 0.7,
+            sampling_rate: 0.1,
+            reviewer_model: None,
+        }
+    }
+}
+
+impl SecondOpinionConfig {
+    /// Validates the config values, returning an error if any field is
+    /// out of range. Called at config load time so misconfiguration
+    /// surfaces immediately rather than at trigger evaluation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `confidence_threshold` or `sampling_rate`
+    /// are outside `[0.0, 1.0]` or non-finite.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.confidence_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.confidence_threshold)
+        {
+            return Err(format!(
+                "second_opinion.confidence_threshold must be in [0.0, 1.0]; got {}",
+                self.confidence_threshold
+            ));
+        }
+        if !self.sampling_rate.is_finite() || !(0.0..=1.0).contains(&self.sampling_rate) {
+            return Err(format!(
+                "second_opinion.sampling_rate must be in [0.0, 1.0]; got {}",
+                self.sampling_rate
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -115,6 +194,10 @@ pub(crate) fn load_config_with_home(
     }
 
     let config: OrbConfig = toml::Value::Table(base_table).try_into()?;
+    config
+        .second_opinion
+        .validate()
+        .map_err(|e| anyhow::anyhow!(e))?;
     Ok(config)
 }
 
@@ -260,6 +343,115 @@ mod tests {
         assert!(cfg.review.review_on_completion);
         assert!(cfg.notification.enabled);
         assert!(!cfg.notification.desktop_enabled);
+        assert_eq!(cfg.second_opinion.mode, SecondOpinionMode::Off);
+        assert!((cfg.second_opinion.confidence_threshold - 0.7).abs() < f32::EPSILON);
+        assert!((cfg.second_opinion.sampling_rate - 0.1).abs() < f32::EPSILON);
+        assert!(cfg.second_opinion.reviewer_model.is_none());
+    }
+
+    #[test]
+    fn second_opinion_parses_from_toml_with_all_fields() {
+        let toml_str = r#"
+            [second_opinion]
+            mode = "confidence"
+            confidence_threshold = 0.6
+            sampling_rate = 0.25
+            reviewer_model = "anthropic/claude-sonnet-4-6"
+        "#;
+        let parsed: OrbConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.second_opinion.mode, SecondOpinionMode::Confidence);
+        assert!((parsed.second_opinion.confidence_threshold - 0.6).abs() < f32::EPSILON);
+        assert!((parsed.second_opinion.sampling_rate - 0.25).abs() < f32::EPSILON);
+        assert_eq!(
+            parsed.second_opinion.reviewer_model.as_deref(),
+            Some("anthropic/claude-sonnet-4-6")
+        );
+    }
+
+    #[test]
+    fn second_opinion_modes_serialize_snake_case() {
+        for (mode, expected) in [
+            (SecondOpinionMode::Off, "off"),
+            (SecondOpinionMode::Always, "always"),
+            (SecondOpinionMode::Confidence, "confidence"),
+            (SecondOpinionMode::Sampling, "sampling"),
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            assert_eq!(json, format!("\"{expected}\""), "mode {mode:?}");
+        }
+    }
+
+    #[test]
+    fn second_opinion_validate_rejects_threshold_above_one() {
+        let mut cfg = SecondOpinionConfig::default();
+        cfg.confidence_threshold = 1.2;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn second_opinion_validate_rejects_threshold_below_zero() {
+        let mut cfg = SecondOpinionConfig::default();
+        cfg.confidence_threshold = -0.1;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn second_opinion_validate_rejects_sampling_rate_out_of_range() {
+        let mut cfg = SecondOpinionConfig::default();
+        cfg.sampling_rate = 1.5;
+        assert!(cfg.validate().is_err());
+        cfg.sampling_rate = -0.5;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn second_opinion_validate_rejects_non_finite() {
+        let mut cfg = SecondOpinionConfig::default();
+        cfg.confidence_threshold = f32::NAN;
+        assert!(cfg.validate().is_err());
+        cfg.confidence_threshold = 0.5;
+        cfg.sampling_rate = f32::INFINITY;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn second_opinion_validate_accepts_boundary_values() {
+        let cfg = SecondOpinionConfig {
+            mode: SecondOpinionMode::Sampling,
+            confidence_threshold: 0.0,
+            sampling_rate: 1.0,
+            reviewer_model: None,
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn second_opinion_rejects_unknown_field_in_toml() {
+        // Strict — typos at the section level surface immediately.
+        let toml_str = r#"
+            [second_opinion]
+            mode = "off"
+            confidence_threshhold = 0.5
+        "#;
+        let parsed: Result<OrbConfig, _> = toml::from_str(toml_str);
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn load_config_propagates_validation_error() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".orboros")).unwrap();
+        std::fs::write(
+            home.join(".orboros").join("config.toml"),
+            r#"[second_opinion]
+mode = "confidence"
+confidence_threshold = 2.0
+"#,
+        )
+        .unwrap();
+        let result = load_config_with_home(Some(&home), None);
+        assert!(result.is_err(), "validation should bubble up");
     }
 
     #[test]
@@ -378,6 +570,12 @@ review_on_completion = true
             review: ReviewConfig {
                 requires_approval_by_default: true,
                 review_on_completion: false,
+            },
+            second_opinion: SecondOpinionConfig {
+                mode: SecondOpinionMode::Always,
+                confidence_threshold: 0.6,
+                sampling_rate: 0.2,
+                reviewer_model: Some("test-reviewer".into()),
             },
             notification: NotificationConfig {
                 enabled: false,
