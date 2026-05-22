@@ -162,6 +162,9 @@ pub fn cmd_orb_show(store: &OrbStore, id: &str) -> anyhow::Result<()> {
             if let Some(ref result) = orb.result {
                 println!("Result:      {result}");
             }
+            if let Some(confidence) = orb.confidence {
+                println!("Confidence:  {confidence:.2}");
+            }
             if orb.is_tombstoned() {
                 println!(
                     "DELETED:     {}",
@@ -188,6 +191,8 @@ pub fn cmd_orb_list(
     store: &OrbStore,
     filter_type: Option<&str>,
     filter_status: Option<&str>,
+    min_confidence: Option<f32>,
+    max_confidence: Option<f32>,
 ) -> anyhow::Result<()> {
     let mut orbs = store.load_all().context("failed to load orbs")?;
 
@@ -201,6 +206,14 @@ pub fn cmd_orb_list(
         orbs.retain(|o| o.status == Some(status));
     }
 
+    if let Some(min) = min_confidence {
+        orbs.retain(|o| o.confidence.is_some_and(|c| c >= min));
+    }
+
+    if let Some(max) = max_confidence {
+        orbs.retain(|o| o.confidence.is_some_and(|c| c <= max));
+    }
+
     if orbs.is_empty() {
         println!("No orbs found.");
     } else {
@@ -212,9 +225,12 @@ pub fn cmd_orb_list(
             } else {
                 "Unknown".to_string()
             };
+            let conf = orb
+                .confidence
+                .map_or(String::new(), |c| format!(" conf={c:.2}"));
             println!(
-                "[{lifecycle}] {} — {} ({:?}, p{})",
-                orb.id, orb.title, orb.orb_type, orb.priority
+                "[{lifecycle}] {} — {} ({:?}, p{}){}",
+                orb.id, orb.title, orb.orb_type, orb.priority, conf
             );
         }
         println!("\n{} orb(s)", orbs.len());
@@ -586,7 +602,64 @@ mod tests {
         cmd_orb_create(&store, "One", "first", OrbType::Task, 3, None).unwrap();
         cmd_orb_create(&store, "Two", "second", OrbType::Bug, 2, None).unwrap();
         // Should list both
-        cmd_orb_list(&store, None, None).unwrap();
+        cmd_orb_list(&store, None, None, None, None).unwrap();
+    }
+
+    #[test]
+    fn list_min_confidence_filters_below_threshold() {
+        let (_dir, store) = temp_orb_store();
+        let orb = cmd_orb_create(&store, "Low", "x", OrbType::Task, 3, None).unwrap();
+        let mut low = orb;
+        low.confidence = Some(0.3);
+        store.update(&low).unwrap();
+        let orb2 = cmd_orb_create(&store, "High", "y", OrbType::Task, 3, None).unwrap();
+        let mut high = orb2;
+        high.confidence = Some(0.9);
+        store.update(&high).unwrap();
+        let orb3 = cmd_orb_create(&store, "None", "z", OrbType::Task, 3, None).unwrap();
+
+        // Sanity-check the filter logic the CLI uses.
+        let all = store.load_all().unwrap();
+        let above_half: Vec<_> = all
+            .iter()
+            .filter(|o| o.confidence.is_some_and(|c| c >= 0.7))
+            .collect();
+        assert_eq!(above_half.len(), 1);
+        assert_eq!(above_half[0].title, "High");
+
+        // CLI command should not error.
+        cmd_orb_list(&store, None, None, Some(0.7), None).unwrap();
+
+        // The None-confidence orb is excluded even by lax threshold.
+        let any_conf: Vec<_> = all
+            .iter()
+            .filter(|o| o.confidence.is_some_and(|c| c >= 0.0))
+            .collect();
+        assert_eq!(any_conf.len(), 2);
+        assert!(!any_conf.iter().any(|o| o.id == orb3.id));
+    }
+
+    #[test]
+    fn list_max_confidence_excludes_high_scores() {
+        let (_dir, store) = temp_orb_store();
+        let orb = cmd_orb_create(&store, "Doubtful", "x", OrbType::Task, 3, None).unwrap();
+        let mut doubtful = orb;
+        doubtful.confidence = Some(0.2);
+        store.update(&doubtful).unwrap();
+        let orb2 = cmd_orb_create(&store, "Sure", "y", OrbType::Task, 3, None).unwrap();
+        let mut sure = orb2;
+        sure.confidence = Some(0.95);
+        store.update(&sure).unwrap();
+
+        let all = store.load_all().unwrap();
+        let doubtful_only: Vec<_> = all
+            .iter()
+            .filter(|o| o.confidence.is_some_and(|c| c <= 0.5))
+            .collect();
+        assert_eq!(doubtful_only.len(), 1);
+        assert_eq!(doubtful_only[0].title, "Doubtful");
+
+        cmd_orb_list(&store, None, None, None, Some(0.5)).unwrap();
     }
 
     #[test]
@@ -645,7 +718,7 @@ mod tests {
     #[test]
     fn list_empty_store() {
         let (_dir, store) = temp_orb_store();
-        cmd_orb_list(&store, None, None).unwrap();
+        cmd_orb_list(&store, None, None, None, None).unwrap();
     }
 
     // ── cmd_orb_update ─────────────────────────────────────────
