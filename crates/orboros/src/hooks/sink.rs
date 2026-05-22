@@ -11,15 +11,18 @@ use std::path::{Path, PathBuf};
 
 use crate::hooks::config::HooksConfig;
 use crate::hooks::event::HookEvent;
+use crate::hooks::log::HookLog;
 use crate::hooks::runner::{fire, FireCtx, FireOutcome, HookInvocation};
 
 /// Bundles a `HooksConfig` with the state and working directories
-/// hooks need at fire time.
+/// hooks need at fire time, plus a `HookLog` for audit-trail
+/// persistence.
 #[derive(Debug, Clone)]
 pub struct HookSink {
     pub config: HooksConfig,
     pub state_dir: PathBuf,
     pub project_cwd: PathBuf,
+    pub log: HookLog,
 }
 
 impl HookSink {
@@ -44,16 +47,24 @@ impl HookSink {
             config,
             state_dir: state_dir.to_path_buf(),
             project_cwd: project_cwd.to_path_buf(),
+            log: HookLog::new(state_dir),
         }))
     }
 
-    /// Asynchronous firing path. Call from async contexts.
+    /// Asynchronous firing path. Call from async contexts. Records
+    /// each invocation to the hook log; persistence failures are
+    /// logged via tracing but never propagated — the hook itself
+    /// already ran.
     pub async fn fire(
         &self,
         event: HookEvent,
         ctx: FireCtx<'_>,
     ) -> (FireOutcome, Vec<HookInvocation>) {
-        fire(&self.config, event, ctx, &self.project_cwd).await
+        let (outcome, invocations) = fire(&self.config, event, ctx, &self.project_cwd).await;
+        if let Err(e) = self.log.append_batch(&invocations, &outcome) {
+            tracing::warn!(error = %e, "failed to append hook invocations to log");
+        }
+        (outcome, invocations)
     }
 
     /// Synchronous firing path for CLI commands. Spins up a small

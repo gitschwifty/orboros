@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use orbs::orb::Orb;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -49,7 +49,7 @@ impl FireOutcome {
 
 /// Per-invocation record. One per hook fired; appended to the audit
 /// log by the caller (audit integration is sub-task 6).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HookInvocation {
     pub hook_name: String,
     pub event: String,

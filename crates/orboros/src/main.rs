@@ -164,6 +164,15 @@ enum HooksAction {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Print recorded hook invocations from the log.
+    Log {
+        /// Filter to invocations targeting this orb id.
+        #[arg(long)]
+        orb: Option<String>,
+        /// Maximum entries to print (newest first). 0 means all.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -529,6 +538,9 @@ fn main() -> anyhow::Result<()> {
             HooksAction::Check => orboros::hooks::cmd::cmd_hooks_check(&state_dir),
             HooksAction::Run { name, orb, dry_run } => {
                 orboros::hooks::cmd::cmd_hooks_run(&state_dir, &name, &orb, dry_run)
+            }
+            HooksAction::Log { orb, limit } => {
+                orboros::hooks::cmd::cmd_hooks_log(&state_dir, orb.as_deref(), limit)
             }
         },
     }

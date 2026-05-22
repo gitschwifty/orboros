@@ -9,12 +9,14 @@
 pub mod cmd;
 pub mod config;
 pub mod event;
+pub mod log;
 pub mod matcher;
 pub mod runner;
 pub mod sink;
 
 pub use config::{default_paths, ConfigLayer, HookEntry, HookMatch, HooksConfig};
 pub use event::{HookEvent, HookEventParseError};
+pub use log::{HookLog, HookLogEntry};
 pub use matcher::{matches, MatcherCtx};
 pub use runner::{fire, preview, FireCtx, FireOutcome, HookInvocation, HookPreview};
 pub use sink::HookSink;

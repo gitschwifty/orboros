@@ -16,6 +16,7 @@ use orbs::id::OrbId;
 use orbs::orb_store::OrbStore;
 
 use crate::hooks::config::{default_paths, ConfigLayer, HookEntry, HooksConfig};
+use crate::hooks::log::HookLog;
 use crate::hooks::runner::FireCtx;
 use crate::hooks::sink::HookSink;
 
@@ -244,6 +245,57 @@ fn print_outcome(
             println!("    stderr: {}", inv.stderr_truncated.trim());
         }
     }
+}
+
+/// `orboros hooks log [--orb id] [--limit N]`. Prints the hook
+/// invocation log, optionally filtered by orb id. Default limit is
+/// 50; pass `--limit 0` to show everything.
+///
+/// # Errors
+///
+/// Returns an error if the log file cannot be read.
+pub fn cmd_hooks_log(
+    state_dir: &Path,
+    orb_filter: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<()> {
+    let log = HookLog::new(state_dir);
+    let entries = match orb_filter {
+        Some(id) => log.read_for_orb(id)?,
+        None => log.read_all()?,
+    };
+    if entries.is_empty() {
+        println!("(no hook invocations recorded)");
+        println!("  log path: {}", log.path().display());
+        return Ok(());
+    }
+    let total = entries.len();
+    let shown: Box<dyn Iterator<Item = &crate::hooks::log::HookLogEntry>> = if limit == 0 {
+        Box::new(entries.iter())
+    } else {
+        // Show the most recent N.
+        Box::new(entries.iter().skip(total.saturating_sub(limit)))
+    };
+    for entry in shown {
+        let inv = &entry.invocation;
+        let exit = inv.exit_code.map_or("-".to_string(), |c| c.to_string());
+        let orb = inv.orb_id.as_deref().unwrap_or("-");
+        println!(
+            "{ts}  [{outcome:<9}] {hook:<30} event={event} orb={orb} exit={exit} ms={ms}",
+            ts = inv.started_at.format("%Y-%m-%d %H:%M:%S"),
+            outcome = entry.outcome_label,
+            hook = inv.hook_name,
+            event = inv.event,
+            ms = inv.duration_ms,
+        );
+        if let Some(e) = &inv.error {
+            println!("    error: {e}");
+        }
+    }
+    if limit != 0 && total > limit {
+        println!("\n(showing latest {limit} of {total}; --limit 0 for all)");
+    }
+    Ok(())
 }
 
 fn exist_label(p: &Path) -> &'static str {
