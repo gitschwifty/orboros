@@ -139,6 +139,31 @@ enum Commands {
         #[command(subcommand)]
         action: Option<SessionsAction>,
     },
+    /// Inspect and manually fire lifecycle hooks.
+    Hooks {
+        #[command(subcommand)]
+        action: HooksAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum HooksAction {
+    /// Print every loaded hook with its event, source layer, and match summary.
+    List,
+    /// Validate global + project hooks.toml without firing anything.
+    Check,
+    /// Manually fire a named hook against an existing orb id.
+    Run {
+        /// Hook name as listed by `orboros hooks list`.
+        name: String,
+        /// Orb id to fire against (e.g. orb-abc1234).
+        #[arg(long)]
+        orb: String,
+        /// Don't actually spawn the hook command; just record what would
+        /// happen and pass `ORBOROS_DRY_RUN=1` in the env.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -499,6 +524,13 @@ fn main() -> anyhow::Result<()> {
             cli.skip_prereq_check,
         ),
         Commands::Sessions { action } => cmd_sessions(&state_dir, action),
+        Commands::Hooks { action } => match action {
+            HooksAction::List => orboros::hooks::cmd::cmd_hooks_list(&state_dir),
+            HooksAction::Check => orboros::hooks::cmd::cmd_hooks_check(&state_dir),
+            HooksAction::Run { name, orb, dry_run } => {
+                orboros::hooks::cmd::cmd_hooks_run(&state_dir, &name, &orb, dry_run)
+            }
+        },
     }
 }
 

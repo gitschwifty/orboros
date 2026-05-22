@@ -6,6 +6,7 @@
 //! loader. Matcher evaluation and the execution engine follow in
 //! their own commits.
 
+pub mod cmd;
 pub mod config;
 pub mod event;
 pub mod matcher;
