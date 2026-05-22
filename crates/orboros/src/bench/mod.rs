@@ -11,6 +11,7 @@
 //! Result store: JSONL under `.orbs/bench/`. CLI: `orboros bench
 //! list / run / show / compare / calibration`.
 
+pub mod calibration;
 pub mod case;
 pub mod cmd;
 pub mod runner;

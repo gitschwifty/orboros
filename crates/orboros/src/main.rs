@@ -179,6 +179,14 @@ enum BenchAction {
     Compare { run_a: String, run_b: String },
     /// List every recorded run.
     ListRuns,
+    /// Calibration report: bucket confidence vs pass rate + correlation.
+    Calibration {
+        /// Run id to analyze.
+        run_id: String,
+        /// Number of histogram buckets across [0.0, 1.0].
+        #[arg(long, default_value_t = 10)]
+        buckets: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -663,6 +671,9 @@ fn cmd_bench(state_dir: &std::path::Path, action: BenchAction) -> anyhow::Result
             bench_cmd::cmd_bench_compare(&store, &run_a, &run_b)
         }
         BenchAction::ListRuns => bench_cmd::cmd_bench_list_runs(&store),
+        BenchAction::Calibration { run_id, buckets } => {
+            orboros::bench::calibration::cmd_bench_calibration(&store, &run_id, buckets)
+        }
     }
 }
 
