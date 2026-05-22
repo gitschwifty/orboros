@@ -135,6 +135,94 @@ pub fn finish_refining(orb: &mut Orb) -> bool {
     orb.set_phase(OrbPhase::Review).is_ok()
 }
 
+// ── Worker-dispatch prompt builder (task 60) ─────────────────────
+
+/// Plan parsed from a refinement worker's response.
+///
+/// Refinement is a structured edit: the worker is given the current
+/// description, design, and acceptance criteria, and asked to
+/// produce updated versions of any/all of them. Fields are `Option`
+/// so the worker can leave anything it doesn't want to change as
+/// null/absent.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct RefinementPlan {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub design: Option<String>,
+    #[serde(default)]
+    pub acceptance_criteria: Option<String>,
+    /// Notes from the worker explaining what changed and why. Not
+    /// applied to the orb but useful in audit / hook payloads.
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+/// Returns `(system, user)` prompts for the refinement worker.
+/// Carries forward any pending `review_critique` so the worker has
+/// the reviewer's feedback when revising.
+#[must_use]
+pub fn build_prompt(orb: &Orb) -> (String, String) {
+    let system = "You are refining a task spec. Review the current title, description, \
+design, and acceptance criteria. Make targeted improvements — sharpen ambiguous \
+wording, fill in obvious gaps, fix inconsistencies. DO NOT rewrite for the sake \
+of rewriting. Respond with exactly one JSON object — no surrounding prose, no \
+code fences — in this shape:\n\
+  {\"description\": \"<revised>\" | null,\n\
+   \"design\": \"<revised>\" | null,\n\
+   \"acceptance_criteria\": \"<revised>\" | null,\n\
+   \"notes\": \"<what you changed and why>\"}\n\
+Use null for any field you don't want to change. If nothing needs revision, \
+return all-null and a brief note explaining why."
+        .to_string();
+    let mut user = format!(
+        "Title: {}\n\nDescription:\n{}\n",
+        orb.title, orb.description
+    );
+    if let Some(ref design) = orb.design {
+        user.push_str(&format!("\nDesign:\n{design}\n"));
+    }
+    if let Some(ref ac) = orb.acceptance_criteria {
+        user.push_str(&format!("\nAcceptance criteria:\n{ac}\n"));
+    }
+    if let Some(ref critique) = orb.review_critique {
+        user.push_str(&format!(
+            "\nReviewer feedback to incorporate:\n{critique}\n"
+        ));
+    }
+    (system, user)
+}
+
+/// Parses the worker's response into a `RefinementPlan`. Accepts
+/// strict JSON or a fenced JSON block.
+#[must_use]
+pub fn parse_response(text: &str) -> Option<RefinementPlan> {
+    crate::phases::prompt_util::parse_response_json::<RefinementPlan>(text)
+}
+
+/// Applies a refinement plan to the orb. Only writes fields that the
+/// plan explicitly sets (Some). Updates `updated_at` and the content
+/// hash so refinement-loop termination picks up the change.
+pub fn apply_plan(orb: &mut Orb, plan: &RefinementPlan) {
+    let mut any_change = false;
+    if let Some(ref d) = plan.description {
+        orb.description = d.clone();
+        any_change = true;
+    }
+    if let Some(ref d) = plan.design {
+        orb.design = Some(d.clone());
+        any_change = true;
+    }
+    if let Some(ref ac) = plan.acceptance_criteria {
+        orb.acceptance_criteria = Some(ac.clone());
+        any_change = true;
+    }
+    if any_change {
+        orb.updated_at = chrono::Utc::now();
+        orb.update_content_hash();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use orbs::orb::OrbType;
@@ -334,5 +422,73 @@ mod tests {
         // 3. Transition to Review
         assert!(finish_refining(&mut orb));
         assert_eq!(orb.phase, Some(OrbPhase::Review));
+    }
+
+    // ── build_prompt / parse_response / apply_plan ────────────
+
+    #[test]
+    fn build_prompt_includes_critique_when_present() {
+        let mut orb = feature_orb("X", "Y");
+        orb.review_critique = Some("plan missed step Z".into());
+        let (_system, user) = build_prompt(&orb);
+        assert!(user.contains("Reviewer feedback"));
+        assert!(user.contains("plan missed step Z"));
+    }
+
+    #[test]
+    fn build_prompt_omits_critique_section_when_absent() {
+        let orb = feature_orb("X", "Y");
+        let (_system, user) = build_prompt(&orb);
+        assert!(!user.contains("Reviewer feedback"));
+    }
+
+    #[test]
+    fn parse_response_extracts_all_fields() {
+        let text = r#"{"description": "new desc", "design": "new design", "acceptance_criteria": "new ac", "notes": "changed everything"}"#;
+        let plan = parse_response(text).unwrap();
+        assert_eq!(plan.description.as_deref(), Some("new desc"));
+        assert_eq!(plan.design.as_deref(), Some("new design"));
+        assert_eq!(plan.notes.as_deref(), Some("changed everything"));
+    }
+
+    #[test]
+    fn parse_response_handles_all_null_fields() {
+        let text = r#"{"description": null, "design": null, "acceptance_criteria": null, "notes": "nothing to change"}"#;
+        let plan = parse_response(text).unwrap();
+        assert!(plan.description.is_none());
+        assert!(plan.design.is_none());
+        assert!(plan.acceptance_criteria.is_none());
+    }
+
+    #[test]
+    fn apply_plan_only_writes_set_fields() {
+        let mut orb = feature_orb("X", "original desc");
+        orb.design = Some("original design".into());
+        let plan = RefinementPlan {
+            description: Some("new desc".into()),
+            design: None, // leave alone
+            acceptance_criteria: None,
+            notes: None,
+        };
+        apply_plan(&mut orb, &plan);
+        assert_eq!(orb.description, "new desc");
+        assert_eq!(orb.design.as_deref(), Some("original design"));
+    }
+
+    #[test]
+    fn apply_plan_with_all_none_is_noop_on_content_hash() {
+        let mut orb = feature_orb("X", "Y");
+        orb.update_content_hash();
+        let before = orb.content_hash.clone();
+        apply_plan(
+            &mut orb,
+            &RefinementPlan {
+                description: None,
+                design: None,
+                acceptance_criteria: None,
+                notes: Some("nothing".into()),
+            },
+        );
+        assert_eq!(orb.content_hash, before);
     }
 }

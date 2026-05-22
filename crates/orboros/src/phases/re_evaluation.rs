@@ -154,6 +154,99 @@ pub fn apply_reeval(
     }
 }
 
+// ── Worker-dispatch prompt builder (task 60) ─────────────────────
+
+/// Reviewer-style verdict for re-evaluation. Distinct from the
+/// dep-graph-driven `ReEvalResult`: this is what an LLM worker
+/// produces when asked "should this orb continue / pivot / abort?"
+/// after its children completed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReEvalVerdict {
+    /// Continue with the current plan. Children's results are
+    /// acceptable; proceed to aggregation.
+    Continue,
+    /// Children's results suggest the plan was wrong; pivot to a
+    /// new approach. Orb returns to Refining with the worker's
+    /// `reasoning` attached as the critique.
+    Pivot,
+    /// Orb should abort. The orb transitions to Failed with the
+    /// reasoning as the result.
+    Abort,
+}
+
+/// Plan parsed from a re-evaluation worker's response.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct ReEvaluationPlan {
+    pub verdict: ReEvalVerdict,
+    pub reasoning: String,
+}
+
+/// Returns `(system, user)` prompts for the re-evaluation worker.
+/// User prompt summarises children's results so the worker can
+/// judge whether the plan still makes sense.
+#[must_use]
+pub fn build_prompt(orb: &Orb, child_summaries: &[String]) -> (String, String) {
+    let system = "You are re-evaluating a parent task after its children completed. \
+Decide whether the parent should: continue (children's results are good — proceed \
+to aggregation), pivot (results suggest the plan was wrong — return to refining), \
+or abort (the work is unsalvageable). Respond with exactly one JSON object — no \
+surrounding prose, no code fences — in this shape:\n\
+  {\"verdict\": \"continue\" | \"pivot\" | \"abort\", \"reasoning\": \"<short explanation>\"}\n\
+Default to `continue` when in doubt. Reserve `pivot` for cases where children's \
+output meaningfully contradicts the plan. Reserve `abort` for unrecoverable cases."
+        .to_string();
+    let mut user = format!(
+        "Parent task: {}\n\nDescription:\n{}\n",
+        orb.title, orb.description
+    );
+    if let Some(ref design) = orb.design {
+        user.push_str(&format!("\nDesign:\n{design}\n"));
+    }
+    user.push_str("\nChildren's results:\n");
+    if child_summaries.is_empty() {
+        user.push_str("(no children — nothing to evaluate)\n");
+    } else {
+        for (i, s) in child_summaries.iter().enumerate() {
+            user.push_str(&format!("{}. {s}\n", i + 1));
+        }
+    }
+    (system, user)
+}
+
+/// Parses the worker's response into a `ReEvaluationPlan`. Accepts
+/// strict JSON or a fenced JSON block.
+#[must_use]
+pub fn parse_response(text: &str) -> Option<ReEvaluationPlan> {
+    crate::phases::prompt_util::parse_response_json::<ReEvaluationPlan>(text)
+}
+
+/// Applies a re-evaluation plan to the orb. Translates the LLM
+/// verdict into the appropriate phase transition; copies `reasoning`
+/// into `review_critique` on `Pivot` so the refinement worker has
+/// context.
+///
+/// # Errors
+///
+/// Returns `TransitionError` if the target phase is not reachable
+/// from the orb's current phase.
+pub fn apply_plan(
+    orb: &mut Orb,
+    plan: &ReEvaluationPlan,
+) -> Result<(), orbs::orb::TransitionError> {
+    match plan.verdict {
+        ReEvalVerdict::Continue => orb.set_phase(OrbPhase::Executing),
+        ReEvalVerdict::Pivot => {
+            orb.review_critique = Some(plan.reasoning.clone());
+            orb.set_phase(OrbPhase::Refining)
+        }
+        ReEvalVerdict::Abort => {
+            orb.result = Some(plan.reasoning.clone());
+            orb.set_phase(OrbPhase::Failed)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -609,5 +702,86 @@ mod tests {
 
         apply_reeval(&mut orb, &result).unwrap();
         assert_eq!(orb.phase, Some(OrbPhase::Review));
+    }
+
+    // ── build_prompt / parse_response / apply_plan (LLM verdict) ──
+
+    #[test]
+    fn llm_build_prompt_includes_child_summaries() {
+        let orb = feature_orb("Parent");
+        let (system, user) = build_prompt(
+            &orb,
+            &[
+                "child 1 finished".to_string(),
+                "child 2 finished".to_string(),
+            ],
+        );
+        assert!(system.contains("continue"));
+        assert!(system.contains("pivot"));
+        assert!(system.contains("abort"));
+        assert!(user.contains("child 1 finished"));
+        assert!(user.contains("child 2 finished"));
+    }
+
+    #[test]
+    fn llm_build_prompt_handles_no_children() {
+        let orb = feature_orb("Parent");
+        let (_system, user) = build_prompt(&orb, &[]);
+        assert!(user.contains("no children"));
+    }
+
+    #[test]
+    fn parse_response_extracts_verdict_and_reasoning() {
+        let text = r#"{"verdict": "pivot", "reasoning": "missed a step"}"#;
+        let plan = parse_response(text).unwrap();
+        assert_eq!(plan.verdict, ReEvalVerdict::Pivot);
+        assert_eq!(plan.reasoning, "missed a step");
+    }
+
+    #[test]
+    fn apply_continue_transitions_to_executing() {
+        let mut orb = feature_orb("X");
+        orb.phase = Some(OrbPhase::Reevaluating);
+        apply_plan(
+            &mut orb,
+            &ReEvaluationPlan {
+                verdict: ReEvalVerdict::Continue,
+                reasoning: "good".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(orb.phase, Some(OrbPhase::Executing));
+    }
+
+    #[test]
+    fn apply_pivot_writes_critique_and_returns_to_refining() {
+        let mut orb = feature_orb("X");
+        orb.phase = Some(OrbPhase::Reevaluating);
+        apply_plan(
+            &mut orb,
+            &ReEvaluationPlan {
+                verdict: ReEvalVerdict::Pivot,
+                reasoning: "wrong approach".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(orb.phase, Some(OrbPhase::Refining));
+        assert_eq!(orb.review_critique.as_deref(), Some("wrong approach"));
+    }
+
+    #[test]
+    fn apply_abort_transitions_to_failed_with_reasoning_as_result() {
+        let mut orb = feature_orb("X");
+        orb.phase = Some(OrbPhase::Reevaluating);
+        apply_plan(
+            &mut orb,
+            &ReEvaluationPlan {
+                verdict: ReEvalVerdict::Abort,
+                reasoning: "unsalvageable".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(orb.phase, Some(OrbPhase::Failed));
+        assert_eq!(orb.result.as_deref(), Some("unsalvageable"));
     }
 }
