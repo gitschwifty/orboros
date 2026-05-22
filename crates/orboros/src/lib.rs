@@ -6,6 +6,7 @@ pub mod config;
 pub mod convo;
 pub mod coordinator;
 pub mod daemon;
+pub mod hooks;
 pub mod ipc;
 pub mod notify;
 pub mod orb_cmd;
