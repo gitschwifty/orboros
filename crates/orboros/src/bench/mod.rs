@@ -12,6 +12,7 @@
 //! list / run / show / compare / calibration`.
 
 pub mod case;
+pub mod cmd;
 pub mod runner;
 pub mod runner_t2t3;
 pub mod store;
