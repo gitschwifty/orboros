@@ -160,6 +160,65 @@ pub fn finish_decomposing(orb: &mut Orb) -> bool {
     orb.set_phase(OrbPhase::Refining).is_ok()
 }
 
+// ── Worker-dispatch prompt builder (task 60) ─────────────────────
+
+/// A single subtask the worker proposes during decomposition.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct DecomposedSubtask {
+    pub title: String,
+    pub description: String,
+    /// Execution order group. Subtasks with the same order may run
+    /// in parallel; smaller numbers run first.
+    #[serde(default = "default_order")]
+    pub order: u32,
+}
+
+fn default_order() -> u32 {
+    1
+}
+
+/// Plan parsed from a decompose worker's response.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct DecompositionPlan {
+    pub subtasks: Vec<DecomposedSubtask>,
+}
+
+/// Returns `(system, user)` prompts for the decomposition worker.
+/// System prompt locks the output to strict JSON with a `subtasks`
+/// array of objects.
+#[must_use]
+pub fn build_prompt(orb: &Orb) -> (String, String) {
+    let system = "You are a task decomposer. Break the work below into a small set of \
+ordered subtasks. Respond with exactly one JSON object — no surrounding prose, \
+no code fences — in this shape:\n\
+  {\"subtasks\": [\n\
+    {\"title\": \"<short subtask title>\", \"description\": \"<what to do>\", \"order\": 1},\n\
+    ...\n\
+  ]}\n\
+Use the `order` field to express sequencing: subtasks with the same order may \
+run in parallel; lower numbers run first. Aim for 2-6 subtasks. Avoid trivial \
+one-line subtasks; each should be a meaningful unit of work."
+        .to_string();
+    let mut user = format!(
+        "Title: {}\n\nDescription:\n{}\n",
+        orb.title, orb.description
+    );
+    if let Some(ref design) = orb.design {
+        user.push_str(&format!("\nDesign:\n{design}\n"));
+    }
+    if let Some(ref ac) = orb.acceptance_criteria {
+        user.push_str(&format!("\nAcceptance criteria:\n{ac}\n"));
+    }
+    (system, user)
+}
+
+/// Parses the worker's response into a `DecompositionPlan`. Accepts
+/// strict JSON or a fenced JSON block.
+#[must_use]
+pub fn parse_response(text: &str) -> Option<DecompositionPlan> {
+    crate::phases::prompt_util::parse_response_json::<DecompositionPlan>(text)
+}
+
 #[cfg(test)]
 mod tests {
     use orbs::id::OrbId;
@@ -447,5 +506,52 @@ mod tests {
         // 6. Transition to Refining
         assert!(finish_decomposing(&mut orb));
         assert_eq!(orb.phase, Some(OrbPhase::Refining));
+    }
+
+    // ── build_prompt / parse_response ─────────────────────────
+
+    #[test]
+    fn build_prompt_includes_description_and_design() {
+        let mut orb = Orb::new("Build auth", "Make it work").with_type(OrbType::Feature);
+        orb.design = Some("Use PKCE flow".into());
+        let (system, user) = build_prompt(&orb);
+        assert!(system.contains("subtasks"));
+        assert!(system.contains("order"));
+        assert!(user.contains("Build auth"));
+        assert!(user.contains("Make it work"));
+        assert!(user.contains("Use PKCE flow"));
+    }
+
+    #[test]
+    fn build_prompt_omits_design_when_absent() {
+        let orb = Orb::new("X", "Y").with_type(OrbType::Feature);
+        let (_system, user) = build_prompt(&orb);
+        assert!(!user.contains("\nDesign:"));
+    }
+
+    #[test]
+    fn parse_response_extracts_subtasks() {
+        let text = r#"{"subtasks": [
+            {"title": "Step 1", "description": "Do A", "order": 1},
+            {"title": "Step 2", "description": "Do B", "order": 2}
+        ]}"#;
+        let plan = parse_response(text).unwrap();
+        assert_eq!(plan.subtasks.len(), 2);
+        assert_eq!(plan.subtasks[0].title, "Step 1");
+        assert_eq!(plan.subtasks[1].order, 2);
+    }
+
+    #[test]
+    fn parse_response_defaults_missing_order_to_1() {
+        let text = r#"{"subtasks": [{"title": "T", "description": "D"}]}"#;
+        let plan = parse_response(text).unwrap();
+        assert_eq!(plan.subtasks[0].order, 1);
+    }
+
+    #[test]
+    fn parse_response_accepts_fenced_block() {
+        let text = "```json\n{\"subtasks\": [{\"title\":\"a\",\"description\":\"b\"}]}\n```";
+        let plan = parse_response(text).unwrap();
+        assert_eq!(plan.subtasks.len(), 1);
     }
 }

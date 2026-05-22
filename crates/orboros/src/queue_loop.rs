@@ -284,6 +284,172 @@ impl QueueLoop {
         }
         Ok(())
     }
+
+    /// Dispatches every ready orb in parallel, bounded by
+    /// `max_concurrency`. Ready orbs are those whose status/phase
+    /// puts them in a worker-eligible state AND that haven't been
+    /// dispatched yet (i.e. `execution` is None).
+    ///
+    /// Returns the number of orbs that completed dispatch
+    /// successfully (status moved to Done). Failures don't fail the
+    /// whole tick — they're persisted on the orb and counted only
+    /// in `eprintln!`/tracing output.
+    ///
+    /// # Errors
+    ///
+    /// Returns an IO error if the store can't be read at the top.
+    /// Individual worker / per-orb errors are captured per-orb.
+    #[instrument(name = "queue.dispatch_ready", skip(self, base_worker_config), fields(model = %base_worker_config.model))]
+    pub async fn dispatch_ready_orbs(
+        &self,
+        base_worker_config: &crate::worker::process::WorkerConfig,
+        max_concurrency: usize,
+    ) -> std::io::Result<u32> {
+        use tokio::sync::Semaphore;
+        use tokio::task::JoinSet;
+
+        let all_orbs = self.orb_store.load_all()?;
+        let mut targets: Vec<(Orb, DispatchTarget)> = Vec::new();
+        for orb in all_orbs {
+            if let Some(t) = dispatch_target_for(&orb) {
+                targets.push((orb, t));
+            }
+        }
+        if targets.is_empty() {
+            return Ok(0);
+        }
+
+        let semaphore = Arc::new(Semaphore::new(max_concurrency.max(1)));
+        let mut join_set = JoinSet::new();
+
+        for (orb, target) in targets {
+            let permit = match semaphore.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let store = self.orb_store.clone();
+            let base_wc = base_worker_config.clone();
+            let hooks = self.hooks.as_ref().map(Arc::clone);
+            join_set.spawn(async move {
+                let _permit = permit;
+                dispatch_one_owned(store, orb, target, &base_wc, hooks).await
+            });
+        }
+
+        let mut completed = 0u32;
+        while let Some(joined) = join_set.join_next().await {
+            match joined {
+                Ok(Ok(true)) => completed = completed.saturating_add(1),
+                Ok(Ok(false)) => {} // dispatched but didn't end Done
+                Ok(Err(e)) => tracing::warn!(error = %e, "dispatch_one errored"),
+                Err(e) => tracing::warn!(error = %e, "dispatch task panicked"),
+            }
+        }
+        Ok(completed)
+    }
+}
+
+// ── Dispatch helpers (task 60) ───────────────────────────────────
+
+/// What phase / prompt should drive a worker for this orb.
+#[derive(Debug)]
+enum DispatchTarget {
+    /// Task or phase-orb in `Executing` — send the orb's description
+    /// as the user prompt. Result becomes `orb.result`.
+    Execute,
+    /// Phase-orb in `Speccing`.
+    Speccing,
+    /// Phase-orb in `Decomposing`.
+    Decomposing,
+    /// Phase-orb in `Refining`.
+    Refining,
+    /// Phase-orb in `Reevaluating`.
+    Reevaluating,
+}
+
+/// Returns `Some(target)` when the orb is in a worker-eligible state
+/// AND hasn't been dispatched yet (`execution` is None).
+fn dispatch_target_for(orb: &Orb) -> Option<DispatchTarget> {
+    if orb.execution.is_some() {
+        // Already dispatched — don't redispatch on the same tick.
+        return None;
+    }
+    if orb.orb_type.uses_phase() {
+        match orb.phase {
+            Some(OrbPhase::Speccing) => Some(DispatchTarget::Speccing),
+            Some(OrbPhase::Decomposing) => Some(DispatchTarget::Decomposing),
+            Some(OrbPhase::Refining) => Some(DispatchTarget::Refining),
+            Some(OrbPhase::Reevaluating) => Some(DispatchTarget::Reevaluating),
+            Some(OrbPhase::Executing) => Some(DispatchTarget::Execute),
+            _ => None,
+        }
+    } else if orb.status == Some(OrbStatus::Active) {
+        Some(DispatchTarget::Execute)
+    } else {
+        None
+    }
+}
+
+/// Owned-argument version of dispatch_one, suitable for `tokio::spawn`.
+/// Returns `Ok(true)` when the orb ended at Done, `Ok(false)` otherwise.
+async fn dispatch_one_owned(
+    store: OrbStore,
+    mut orb: Orb,
+    target: DispatchTarget,
+    base_wc: &crate::worker::process::WorkerConfig,
+    hooks: Option<Arc<crate::hooks::HookSink>>,
+) -> std::io::Result<bool> {
+    use crate::worker::dispatcher::{apply_dispatch_outcome, dispatch_orb, worker_config_for};
+
+    let (system, user) = match target {
+        DispatchTarget::Speccing => crate::phases::speccing::build_prompt(&orb),
+        DispatchTarget::Decomposing => crate::phases::decompose::build_prompt(&orb),
+        DispatchTarget::Refining => crate::phases::refinement::build_prompt(&orb),
+        DispatchTarget::Reevaluating => crate::phases::re_evaluation::build_prompt(&orb, &[]),
+        DispatchTarget::Execute => (
+            "You are a task worker. Complete the task in the user message.".to_string(),
+            orb.description.clone(),
+        ),
+    };
+    let wc = worker_config_for(&orb, base_wc, &system);
+
+    let outcome = dispatch_orb(&orb, &user, &wc, hooks.as_deref())
+        .await
+        .map_err(std::io::Error::other)?;
+
+    apply_dispatch_outcome(&mut orb, &outcome).map_err(std::io::Error::other)?;
+
+    // For structured phases, also parse the response into a plan and
+    // apply it so the orb's design / decomposition / refinement /
+    // re-eval fields get populated alongside `result`.
+    if outcome.status == crate::worker::dispatcher::DispatchStatus::Done {
+        if let Some(ref response) = outcome.response {
+            match target {
+                DispatchTarget::Speccing => {
+                    if let Some(plan) = crate::phases::speccing::parse_response(response) {
+                        crate::phases::speccing::apply_plan(&mut orb, &plan);
+                    }
+                }
+                DispatchTarget::Refining => {
+                    if let Some(plan) = crate::phases::refinement::parse_response(response) {
+                        crate::phases::refinement::apply_plan(&mut orb, &plan);
+                    }
+                }
+                DispatchTarget::Reevaluating => {
+                    if let Some(plan) = crate::phases::re_evaluation::parse_response(response) {
+                        let _ = crate::phases::re_evaluation::apply_plan(&mut orb, &plan);
+                    }
+                }
+                // Decompose response holds subtasks — applying them
+                // creates child orbs, which needs OrbStore + DepStore
+                // and is out of scope for this commit.
+                DispatchTarget::Decomposing | DispatchTarget::Execute => {}
+            }
+        }
+    }
+
+    store.update(&orb)?;
+    Ok(outcome.status == crate::worker::dispatcher::DispatchStatus::Done)
 }
 
 #[cfg(test)]

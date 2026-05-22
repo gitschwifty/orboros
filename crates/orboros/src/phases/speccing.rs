@@ -104,6 +104,48 @@ pub fn finish_speccing(orb: &mut Orb) -> bool {
     orb.set_phase(OrbPhase::Decomposing).is_ok()
 }
 
+// ── Worker-dispatch prompt builder (task 60) ─────────────────────
+
+/// Plan parsed from a speccing worker's response.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct SpeccingPlan {
+    pub design: String,
+    pub acceptance_criteria: String,
+}
+
+/// Returns `(system, user)` prompts for the speccing worker.
+/// System prompt locks the output to strict JSON with `design` +
+/// `acceptance_criteria` string fields.
+#[must_use]
+pub fn build_prompt(orb: &Orb) -> (String, String) {
+    let system = "You are a software architect generating a design spec for a task. \
+Respond with exactly one JSON object — no surrounding prose, no code fences — \
+in this shape:\n\
+  {\"design\": \"<concise design narrative>\", \"acceptance_criteria\": \"<markdown checklist>\"}\n\
+Keep design focused and concrete (3-6 sentences). Acceptance criteria should be a \
+markdown checklist with one `- [ ]` item per acceptance condition."
+        .to_string();
+    let user = format!("Title: {}\n\nDescription:\n{}", orb.title, orb.description);
+    (system, user)
+}
+
+/// Parses the worker's response into a `SpeccingPlan`. Accepts strict
+/// JSON or a fenced JSON block.
+#[must_use]
+pub fn parse_response(text: &str) -> Option<SpeccingPlan> {
+    crate::phases::prompt_util::parse_response_json::<SpeccingPlan>(text)
+}
+
+/// Applies a parsed plan to the orb's `design` + `acceptance_criteria`
+/// fields. Touches `updated_at` and the content hash so downstream
+/// content-hash termination in refinement picks up the change.
+pub fn apply_plan(orb: &mut Orb, plan: &SpeccingPlan) {
+    orb.design = Some(plan.design.clone());
+    orb.acceptance_criteria = Some(plan.acceptance_criteria.clone());
+    orb.updated_at = chrono::Utc::now();
+    orb.update_content_hash();
+}
+
 #[cfg(test)]
 mod tests {
     use orbs::orb::OrbType;
@@ -332,5 +374,55 @@ mod tests {
             task_id: None,
             worker_id: None,
         }
+    }
+
+    // ── build_prompt / parse_response / apply_plan ────────────
+
+    #[test]
+    fn build_prompt_includes_title_and_description() {
+        let orb = feature_orb("Auth flow", "Implement OAuth with PKCE");
+        let (system, user) = build_prompt(&orb);
+        assert!(system.contains("JSON"));
+        assert!(system.contains("design"));
+        assert!(system.contains("acceptance_criteria"));
+        assert!(user.contains("Auth flow"));
+        assert!(user.contains("Implement OAuth with PKCE"));
+    }
+
+    #[test]
+    fn parse_response_strict_json() {
+        let text = r#"{"design": "use PKCE", "acceptance_criteria": "- works"}"#;
+        let plan = parse_response(text).unwrap();
+        assert_eq!(plan.design, "use PKCE");
+        assert_eq!(plan.acceptance_criteria, "- works");
+    }
+
+    #[test]
+    fn parse_response_fenced_json() {
+        let text =
+            "Here's the spec:\n```json\n{\"design\":\"X\",\"acceptance_criteria\":\"Y\"}\n```";
+        let plan = parse_response(text).unwrap();
+        assert_eq!(plan.design, "X");
+    }
+
+    #[test]
+    fn parse_response_returns_none_on_garbage() {
+        assert!(parse_response("no json here").is_none());
+    }
+
+    #[test]
+    fn apply_plan_writes_design_and_acceptance() {
+        let mut orb = feature_orb("X", "Y");
+        let before = orb.content_hash.clone();
+        apply_plan(
+            &mut orb,
+            &SpeccingPlan {
+                design: "the design".into(),
+                acceptance_criteria: "- [ ] item".into(),
+            },
+        );
+        assert_eq!(orb.design.as_deref(), Some("the design"));
+        assert_eq!(orb.acceptance_criteria.as_deref(), Some("- [ ] item"));
+        assert_ne!(orb.content_hash, before, "content_hash should advance");
     }
 }
