@@ -17,6 +17,8 @@ pub struct DaemonConfig {
     pub log_max_size: u64,
     /// Tick interval in milliseconds (default: 1000).
     pub tick_interval_ms: u64,
+    /// Max concurrent worker dispatches per tick (default: 4).
+    pub max_concurrency: usize,
 }
 
 impl Default for DaemonConfig {
@@ -30,6 +32,7 @@ impl Default for DaemonConfig {
             log_file: None,
             log_max_size: 10 * 1024 * 1024, // 10 MB
             tick_interval_ms: 1000,
+            max_concurrency: 4,
         }
     }
 }
@@ -183,17 +186,38 @@ pub fn rotate_log(config: &DaemonConfig) -> Result<()> {
 // Daemon runner
 // ---------------------------------------------------------------------------
 
+/// Per-tick dispatch settings. When present, the daemon calls
+/// `queue.dispatch_ready_orbs` after each `tick()` to actually
+/// run workers against orbs that landed in worker-eligible states.
+/// When `None`, the daemon stays pure-state-machine (the prior
+/// behavior).
+#[derive(Debug, Clone)]
+pub struct DispatchSettings {
+    pub base_worker_config: crate::worker::process::WorkerConfig,
+    pub max_concurrency: usize,
+}
+
 /// Runs the daemon: writes PID file, sets up signal handlers, runs the queue
 /// loop, and cleans up on shutdown.
 ///
+/// When `dispatch` is `Some`, the daemon also calls
+/// `queue.dispatch_ready_orbs` after each tick to spawn workers
+/// for any orbs that became worker-eligible. The `on-queue-tick`
+/// hook fires after each non-paused tick regardless.
+///
 /// # Errors
 /// Returns an error if PID file operations or the queue loop fail.
-pub async fn run_daemon(config: DaemonConfig, queue: crate::queue_loop::QueueLoop) -> Result<()> {
+pub async fn run_daemon(
+    config: DaemonConfig,
+    queue: crate::queue_loop::QueueLoop,
+    dispatch: Option<DispatchSettings>,
+) -> Result<()> {
     // Write PID file
     write_pid_file(&config).context("failed to write PID file")?;
     tracing::info!(
         pid = std::process::id(),
         pid_file = %config.pid_file.display(),
+        dispatch_enabled = dispatch.is_some(),
         "daemon started"
     );
 
@@ -219,8 +243,10 @@ pub async fn run_daemon(config: DaemonConfig, queue: crate::queue_loop::QueueLoo
                     tracing::warn!("log rotation failed: {e}");
                 }
 
-                // Run a tick
-                match queue.tick() {
+                // Run a tick (state transitions only). Uses the
+                // async path so `pre-/post-phase-transition` hooks
+                // fire around each phase change.
+                match queue.tick_async().await {
                     Ok(result) => {
                         if !result.is_idle() {
                             tracing::debug!(
@@ -236,6 +262,27 @@ pub async fn run_daemon(config: DaemonConfig, queue: crate::queue_loop::QueueLoo
                         tracing::error!("tick failed: {e}");
                     }
                 }
+
+                // Dispatch workers for any newly-eligible orbs.
+                if let Some(ref settings) = dispatch {
+                    match queue
+                        .dispatch_ready_orbs(&settings.base_worker_config, settings.max_concurrency)
+                        .await
+                    {
+                        Ok(0) => {} // idle
+                        Ok(n) => {
+                            tracing::debug!(dispatched = n, "workers completed this tick");
+                        }
+                        Err(e) => {
+                            tracing::error!("dispatch_ready_orbs failed: {e}");
+                        }
+                    }
+                }
+
+                // Fire on-queue-tick hook (closes one of the task 56
+                // follow-ups: the daemon now matches QueueLoop::run's
+                // hook firing behavior).
+                queue.fire_on_queue_tick().await;
             }
         }
 
@@ -268,6 +315,7 @@ mod tests {
             log_file: None,
             log_max_size: 10 * 1024 * 1024,
             tick_interval_ms: 1000,
+            max_concurrency: 4,
         }
     }
 

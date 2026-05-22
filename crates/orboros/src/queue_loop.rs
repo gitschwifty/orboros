@@ -126,6 +126,181 @@ impl QueueLoop {
         Ok(result)
     }
 
+    /// Async counterpart to `tick()` that fires `pre-phase-transition`
+    /// and `post-phase-transition` hooks around each phase change.
+    /// Pre-hook exit 2 short-circuits the individual transition; the
+    /// rest of the tick continues.
+    ///
+    /// Status-only transitions (e.g. task Pending→Active) don't fire
+    /// phase hooks — no event variant exists for them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an IO error if store operations fail.
+    pub async fn tick_async(&self) -> std::io::Result<TickResult> {
+        if self.paused.load(Ordering::SeqCst) {
+            return Ok(TickResult::default());
+        }
+
+        let mut result = TickResult::default();
+        let all_orbs = self.orb_store.load_all()?;
+
+        result.pipelines_started = self.start_pipelines_with_hooks(&all_orbs).await?;
+        result.orbs_executed = self.execute_ready_with_hooks(&all_orbs).await?;
+        result.roots_completed = self.complete_roots_with_hooks(&all_orbs).await?;
+        result.orbs_reevaluated = self.reevaluate_waiting_with_hooks(&all_orbs).await?;
+
+        Ok(result)
+    }
+
+    /// Applies a phase transition with `pre-phase-transition` (gating)
+    /// and `post-phase-transition` (informational) hooks fired around
+    /// it. Returns `Ok(true)` when the transition completed, `Ok(false)`
+    /// when a pre-hook aborted it.
+    async fn try_phase_transition(&self, orb: &Orb, target: OrbPhase) -> std::io::Result<bool> {
+        use crate::hooks::{FireCtx, FireOutcome, HookEvent};
+
+        if let Some(sink) = &self.hooks {
+            let (outcome, _) = sink
+                .fire(HookEvent::PrePhaseTransition(target), FireCtx::for_orb(orb))
+                .await;
+            if let FireOutcome::Aborted {
+                hook_name,
+                exit_code,
+            } = outcome
+            {
+                tracing::warn!(
+                    orb = %orb.id,
+                    hook = %hook_name,
+                    exit_code,
+                    target = ?target,
+                    "pre-phase-transition hook aborted",
+                );
+                return Ok(false);
+            }
+        }
+        let mut updated = orb.clone();
+        updated.set_phase(target).map_err(std::io::Error::other)?;
+        self.orb_store.update(&updated)?;
+        if let Some(sink) = &self.hooks {
+            let _ = sink
+                .fire(
+                    HookEvent::PostPhaseTransition(target),
+                    FireCtx::for_orb(&updated),
+                )
+                .await;
+        }
+        Ok(true)
+    }
+
+    /// Hook-aware version of `start_pipelines`. Same control flow but
+    /// fires pre/post-phase-transition for each Pending→Speccing move.
+    async fn start_pipelines_with_hooks(&self, orbs: &[Orb]) -> std::io::Result<u32> {
+        let mut count = 0;
+        for orb in orbs {
+            if !orb.orb_type.uses_phase() || orb.phase != Some(OrbPhase::Pending) {
+                continue;
+            }
+            create_pipeline(&self.base_dir, orb)?;
+            if self.try_phase_transition(orb, OrbPhase::Speccing).await? {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Hook-aware version of `execute_ready`. Fires phase hooks only
+    /// for the phase-orb branch (Waiting → Executing); the task-orb
+    /// status transition uses the un-hooked path.
+    async fn execute_ready_with_hooks(&self, orbs: &[Orb]) -> std::io::Result<u32> {
+        let ready_ids = self
+            .dep_store
+            .ready(orbs)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let mut count = 0;
+        for orb in orbs {
+            if !ready_ids.contains(&orb.id) {
+                continue;
+            }
+            if orb.orb_type.uses_phase() {
+                if orb.phase == Some(OrbPhase::Waiting)
+                    && self.try_phase_transition(orb, OrbPhase::Executing).await?
+                {
+                    count += 1;
+                }
+            } else if orb.status == Some(OrbStatus::Pending) {
+                let mut updated = orb.clone();
+                updated
+                    .set_status(OrbStatus::Active)
+                    .map_err(std::io::Error::other)?;
+                self.orb_store.update(&updated)?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Hook-aware version of `complete_roots`. Fires phase hooks for
+    /// phase-orb root completions; task roots use the un-hooked
+    /// status-transition path.
+    async fn complete_roots_with_hooks(&self, orbs: &[Orb]) -> std::io::Result<u32> {
+        let mut count = 0;
+        for orb in orbs {
+            if orb.effective_status() == TaskStatus::Done
+                || orb.effective_status() == TaskStatus::Failed
+                || orb.effective_status() == TaskStatus::Cancelled
+            {
+                continue;
+            }
+            let children = self.orb_store.load_children(&orb.id)?;
+            if children.is_empty() {
+                continue;
+            }
+            let all_children_done = children
+                .iter()
+                .all(|c| c.effective_status() == TaskStatus::Done);
+            if !all_children_done {
+                continue;
+            }
+            if orb.orb_type.uses_phase() {
+                if self.try_phase_transition(orb, OrbPhase::Done).await? {
+                    count += 1;
+                }
+            } else {
+                let mut updated = orb.clone();
+                updated
+                    .set_status(OrbStatus::Done)
+                    .map_err(std::io::Error::other)?;
+                self.orb_store.update(&updated)?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Hook-aware version of `reevaluate_waiting`.
+    async fn reevaluate_waiting_with_hooks(&self, orbs: &[Orb]) -> std::io::Result<u32> {
+        let waiting_ids = self
+            .dep_store
+            .waiting(orbs)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let mut count = 0;
+        for orb in orbs {
+            if !waiting_ids.contains(&orb.id) {
+                continue;
+            }
+            if orb.orb_type.uses_phase()
+                && orb.phase == Some(OrbPhase::Waiting)
+                && self
+                    .try_phase_transition(orb, OrbPhase::Reevaluating)
+                    .await?
+            {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     /// Detects Pending pipeline-phase orbs and creates pipeline directories.
     fn start_pipelines(&self, orbs: &[Orb]) -> std::io::Result<u32> {
         let mut count = 0;
@@ -283,6 +458,20 @@ impl QueueLoop {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         Ok(())
+    }
+
+    /// Fires the `on-queue-tick` hook with no orb context.
+    /// Best-effort — never returns an error. The matcher rejects
+    /// orb-bound rules when no orb is in context, so the daemon
+    /// can call this unconditionally after every tick.
+    pub async fn fire_on_queue_tick(&self) {
+        if self.is_paused() {
+            return;
+        }
+        if let Some(sink) = &self.hooks {
+            let ctx = crate::hooks::FireCtx::default();
+            let (_outcome, _invs) = sink.fire(crate::hooks::HookEvent::OnQueueTick, ctx).await;
+        }
     }
 
     /// Dispatches every ready orb in parallel, bounded by
