@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 use crate::id::{self, OrbId};
 use crate::task::TaskStatus;
 
+/// Maximum number of times an orb can be revised before its lifecycle
+/// terminates at `Done`. Bumped each time the orb re-enters the
+/// pipeline via a reviewer `Revise` verdict or a re-evaluation
+/// `Pivot`. See [`Orb::revision_count`] and `Orb::try_begin_revision`.
+pub const MAX_REVISIONS: u8 = 3;
+
 /// Type classification for an Orb.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -223,6 +229,13 @@ pub struct Orb {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_critique: Option<String>,
 
+    /// Number of revisions this orb has gone through (task 60).
+    /// Bumped each time `Done` re-enters the pipeline via a
+    /// reviewer `Revise` verdict or a re-evaluation `Pivot`.
+    /// Capped at [`MAX_REVISIONS`] to prevent infinite loops.
+    #[serde(default)]
+    pub revision_count: u8,
+
     // ── HITL ─────────────────────────────────────────────────
     #[serde(default)]
     pub requires_approval: bool,
@@ -295,6 +308,7 @@ impl Orb {
             confidence: None,
             review_report: None,
             review_critique: None,
+            revision_count: 0,
             requires_approval: false,
             external_ref: None,
             preferred_model: None,
@@ -565,8 +579,11 @@ fn status_transition_allowed(from: Option<OrbStatus>, to: OrbStatus) -> bool {
             | (Deferred, Pending)
             | (Active, Review | Done | Failed | Cancelled)
             | (Review, Done | Active | Failed | Cancelled)
+            // Re-entry on a reviewer `Revise{Execution}` verdict (task 60).
+            // Cap is enforced by `Orb::try_begin_revision`, not the helper.
+            | (Done, Active)
     )
-    // Terminal states (Done, Failed, Cancelled) have no outgoing except Tombstone (handled above).
+    // Terminal states (Failed, Cancelled) have no outgoing except Tombstone (handled above).
 }
 
 /// Returns true if moving from `from` (None means orb has no phase yet)
@@ -611,6 +628,10 @@ fn phase_transition_allowed(from: Option<OrbPhase>, to: OrbPhase) -> bool {
             | (Reevaluating, Review) // escalate to human review
             | (Executing, Review) // post-completion review entry
             | (Executing, Done)
+            // Re-entry on reviewer `Revise` verdicts (task 60).
+            // Cap is enforced by `Orb::try_begin_revision`.
+            | (Done, Executing) // Revise{Execution} on a phase-orb
+            | (Done, Refining) // Revise{Decomposition} or re-eval Pivot
     )
 }
 
@@ -628,6 +649,64 @@ mod tests {
         assert!(orb.confidence.is_none());
         assert!(orb.parent_id.is_none());
         assert!(orb.id.as_str().starts_with("orb-"));
+    }
+
+    #[test]
+    fn new_orb_has_zero_revision_count() {
+        let orb = Orb::new("t", "d");
+        assert_eq!(orb.revision_count, 0);
+    }
+
+    #[test]
+    fn revision_count_round_trips() {
+        let mut orb = Orb::new("t", "d");
+        orb.revision_count = 2;
+        let json = serde_json::to_string(&orb).unwrap();
+        assert!(json.contains("\"revision_count\":2"));
+        let back: Orb = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.revision_count, 2);
+    }
+
+    #[test]
+    fn revision_count_defaults_when_absent_in_json() {
+        // Older orb JSONL won't have the field; default-0 should
+        // deserialize cleanly.
+        let orb = Orb::new("t", "d");
+        let mut json: serde_json::Value = serde_json::to_value(&orb).unwrap();
+        json.as_object_mut().unwrap().remove("revision_count");
+        let back: Orb = serde_json::from_value(json).unwrap();
+        assert_eq!(back.revision_count, 0);
+    }
+
+    #[test]
+    fn done_to_active_is_now_permitted_for_task() {
+        let mut orb = Orb::new("t", "d");
+        orb.set_status(OrbStatus::Active).unwrap();
+        orb.set_status(OrbStatus::Done).unwrap();
+        // Previously terminal; now allowed for revise-re-entry.
+        // (Cap enforcement is in try_begin_revision — sub-task 60.5.)
+        assert!(orb.set_status(OrbStatus::Active).is_ok());
+    }
+
+    #[test]
+    fn done_phase_to_refining_is_now_permitted_for_epic() {
+        let mut orb = Orb::new("Epic", "d").with_type(OrbType::Epic);
+        orb.phase = Some(OrbPhase::Executing);
+        orb.set_phase(OrbPhase::Done).unwrap();
+        assert!(orb.set_phase(OrbPhase::Refining).is_ok());
+    }
+
+    #[test]
+    fn done_phase_to_executing_is_now_permitted_for_epic() {
+        let mut orb = Orb::new("Epic", "d").with_type(OrbType::Epic);
+        orb.phase = Some(OrbPhase::Executing);
+        orb.set_phase(OrbPhase::Done).unwrap();
+        assert!(orb.set_phase(OrbPhase::Executing).is_ok());
+    }
+
+    #[test]
+    fn max_revisions_constant_is_3() {
+        assert_eq!(MAX_REVISIONS, 3);
     }
 
     #[test]
