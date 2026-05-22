@@ -24,6 +24,7 @@ rustyline = "14"
 is-terminal = "0.4"
 regex = "1"
 shell-words = "1"
+rand = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

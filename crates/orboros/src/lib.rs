@@ -16,6 +16,7 @@ pub mod plan;
 pub mod queue_loop;
 pub mod routing;
 pub mod runner;
+pub mod second_opinion_trigger;
 pub mod slop;
 pub mod startup_check;
 pub mod state;
