@@ -299,6 +299,16 @@ fn split_command(cmd: &str) -> Result<(String, Vec<String>), shell_words::ParseE
     Ok((head, iter.collect()))
 }
 
+#[instrument(
+    name = "hooks.invocation",
+    skip(payload, project_cwd, ctx),
+    fields(
+        hook = %hook.name,
+        sync = true,
+        exit = tracing::field::Empty,
+        ms = tracing::field::Empty,
+    )
+)]
 async fn run_sync(
     hook: &HookEntry,
     payload: &HookPayload<'_>,
@@ -378,6 +388,11 @@ async fn run_sync(
     }
     inv.duration_ms = started.elapsed().as_millis();
     inv.aborted = inv.exit_code == Some(2) || (inv.timed_out && hook.timeout_aborts);
+    if let Some(code) = inv.exit_code {
+        tracing::Span::current().record("exit", code);
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    tracing::Span::current().record("ms", inv.duration_ms as u64);
     if inv.exit_code == Some(0) {
         debug!(hook = %hook.name, "hook OK");
     } else {
@@ -391,6 +406,11 @@ async fn run_sync(
     inv
 }
 
+#[instrument(
+    name = "hooks.invocation",
+    skip(payload, project_cwd, ctx),
+    fields(hook = %hook.name, sync = false)
+)]
 fn spawn_async(
     hook: &HookEntry,
     payload: &HookPayload<'_>,
