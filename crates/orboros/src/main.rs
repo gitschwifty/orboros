@@ -248,6 +248,9 @@ enum OrbAction {
         /// Priority (1=critical, 5=backlog).
         #[arg(short, long, default_value = "3")]
         priority: u8,
+        /// Attach a label to the orb. Repeatable: `--label db --label external`.
+        #[arg(long = "label", value_name = "LABEL")]
+        labels: Vec<String>,
     },
     /// Show details of an orb.
     Show {
@@ -517,6 +520,7 @@ fn main() -> anyhow::Result<()> {
                     description,
                     orb_type,
                     priority,
+                    labels,
                 } => {
                     let parsed_type = orb_cmd::parse_orb_type(&orb_type)?;
                     let desc = description.as_deref().unwrap_or(&title);
@@ -526,6 +530,7 @@ fn main() -> anyhow::Result<()> {
                         desc,
                         parsed_type,
                         priority,
+                        labels,
                         hooks_ref,
                     )?;
                     Ok(())

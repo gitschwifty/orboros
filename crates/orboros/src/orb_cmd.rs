@@ -82,6 +82,21 @@ pub fn parse_review_status_filter(s: &str) -> anyhow::Result<ReviewStatusFilter>
     }
 }
 
+/// Normalizes a list of label inputs: trims whitespace, drops empty
+/// entries, removes duplicates while preserving the first occurrence
+/// of each. Used by both `cmd_orb_create` and `cmd_orb_update` so
+/// the orb's stored label set is always tidy.
+#[must_use]
+pub fn normalize_labels(labels: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    labels
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .filter(|s| seen.insert(s.clone()))
+        .collect()
+}
+
 #[must_use]
 pub fn verdict_label(v: &ReviewVerdict) -> &'static str {
     match v {
@@ -141,11 +156,13 @@ pub fn cmd_orb_create(
     description: &str,
     orb_type: OrbType,
     priority: u8,
+    labels: Vec<String>,
     hooks: Option<&HookSink>,
 ) -> anyhow::Result<Orb> {
-    let orb = Orb::new(title, description)
+    let mut orb = Orb::new(title, description)
         .with_type(orb_type)
         .with_priority(priority);
+    orb.labels = normalize_labels(labels);
     store
         .append(&orb)
         .context("failed to persist new orb to store")?;
@@ -157,6 +174,9 @@ pub fn cmd_orb_create(
     }
     if let Some(phase) = orb.phase {
         println!("  phase:    {phase:?}");
+    }
+    if !orb.labels.is_empty() {
+        println!("  labels:   {}", orb.labels.join(", "));
     }
     if let Some(sink) = hooks {
         let _ = sink.fire_blocking(HookEvent::OnOrbCreate, FireCtx::for_orb(&orb));
@@ -727,9 +747,9 @@ mod tests {
     #[test]
     fn review_queue_lists_only_revise_orbs() {
         let (_dir, store) = temp_orb_store();
-        let a = cmd_orb_create(&store, "A", "x", OrbType::Task, 3, None).unwrap();
-        let b = cmd_orb_create(&store, "B", "x", OrbType::Task, 3, None).unwrap();
-        let c = cmd_orb_create(&store, "C", "x", OrbType::Task, 3, None).unwrap();
+        let a = cmd_orb_create(&store, "A", "x", OrbType::Task, 3, vec![], None).unwrap();
+        let b = cmd_orb_create(&store, "B", "x", OrbType::Task, 3, vec![], None).unwrap();
+        let c = cmd_orb_create(&store, "C", "x", OrbType::Task, 3, vec![], None).unwrap();
 
         let mut a2 = a;
         a2.review_report = Some(make_review_report(ReviewVerdict::Accept, ""));
@@ -764,7 +784,7 @@ mod tests {
     #[test]
     fn review_queue_empty_when_no_revising_orbs() {
         let (_dir, store) = temp_orb_store();
-        cmd_orb_create(&store, "Only one", "x", OrbType::Task, 3, None).unwrap();
+        cmd_orb_create(&store, "Only one", "x", OrbType::Task, 3, vec![], None).unwrap();
         cmd_review_queue(&store).unwrap();
     }
 
@@ -824,8 +844,16 @@ mod tests {
     #[test]
     fn create_orb_persists_and_returns() {
         let (_dir, store) = temp_orb_store();
-        let orb =
-            cmd_orb_create(&store, "My task", "Do the thing", OrbType::Task, 2, None).unwrap();
+        let orb = cmd_orb_create(
+            &store,
+            "My task",
+            "Do the thing",
+            OrbType::Task,
+            2,
+            vec![],
+            None,
+        )
+        .unwrap();
         assert_eq!(orb.title, "My task");
         assert_eq!(orb.description, "Do the thing");
         assert_eq!(orb.orb_type, OrbType::Task);
@@ -838,11 +866,89 @@ mod tests {
         assert_eq!(loaded[0].id, orb.id);
     }
 
+    // ── normalize_labels ──────────────────────────────────────
+
+    #[test]
+    fn normalize_labels_trims_and_drops_empty() {
+        let out = normalize_labels(vec![
+            "  db  ".into(),
+            String::new(),
+            " external-input".into(),
+            "   ".into(),
+        ]);
+        assert_eq!(out, vec!["db".to_string(), "external-input".to_string()]);
+    }
+
+    #[test]
+    fn normalize_labels_dedupes_preserving_first_occurrence() {
+        let out = normalize_labels(vec![
+            "db".into(),
+            "auth".into(),
+            "db".into(),
+            "AUTH".into(), // case-sensitive — different from "auth"
+            "auth".into(),
+        ]);
+        assert_eq!(
+            out,
+            vec!["db".to_string(), "auth".to_string(), "AUTH".to_string()]
+        );
+    }
+
+    #[test]
+    fn normalize_labels_empty_input_returns_empty() {
+        assert!(normalize_labels(vec![]).is_empty());
+    }
+
+    // ── cmd_orb_create with labels ────────────────────────────
+
+    #[test]
+    fn create_attaches_labels_on_orb() {
+        let (_dir, store) = temp_orb_store();
+        let orb = cmd_orb_create(
+            &store,
+            "Labeled",
+            "x",
+            OrbType::Task,
+            3,
+            vec!["db".into(), "external".into()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(orb.labels, vec!["db".to_string(), "external".to_string()]);
+        // Verify persistence.
+        let reloaded = store.load_by_id(&orb.id).unwrap().unwrap();
+        assert_eq!(reloaded.labels, orb.labels);
+    }
+
+    #[test]
+    fn create_normalizes_label_input() {
+        let (_dir, store) = temp_orb_store();
+        let orb = cmd_orb_create(
+            &store,
+            "Labeled",
+            "x",
+            OrbType::Task,
+            3,
+            vec!["  db ".into(), String::new(), "db".into(), "auth".into()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(orb.labels, vec!["db".to_string(), "auth".to_string()]);
+    }
+
     #[test]
     fn create_epic_uses_phase() {
         let (_dir, store) = temp_orb_store();
-        let orb =
-            cmd_orb_create(&store, "Big epic", "Large effort", OrbType::Epic, 1, None).unwrap();
+        let orb = cmd_orb_create(
+            &store,
+            "Big epic",
+            "Large effort",
+            OrbType::Epic,
+            1,
+            vec![],
+            None,
+        )
+        .unwrap();
         assert_eq!(orb.orb_type, OrbType::Epic);
         assert_eq!(orb.phase, Some(OrbPhase::Pending));
         assert_eq!(orb.status, None);
@@ -853,8 +959,16 @@ mod tests {
     #[test]
     fn show_existing_orb() {
         let (_dir, store) = temp_orb_store();
-        let orb =
-            cmd_orb_create(&store, "Show me", "Details here", OrbType::Task, 3, None).unwrap();
+        let orb = cmd_orb_create(
+            &store,
+            "Show me",
+            "Details here",
+            OrbType::Task,
+            3,
+            vec![],
+            None,
+        )
+        .unwrap();
         // Should not error
         cmd_orb_show(&store, orb.id.as_str()).unwrap();
     }
@@ -871,8 +985,8 @@ mod tests {
     #[test]
     fn list_all_orbs() {
         let (_dir, store) = temp_orb_store();
-        cmd_orb_create(&store, "One", "first", OrbType::Task, 3, None).unwrap();
-        cmd_orb_create(&store, "Two", "second", OrbType::Bug, 2, None).unwrap();
+        cmd_orb_create(&store, "One", "first", OrbType::Task, 3, vec![], None).unwrap();
+        cmd_orb_create(&store, "Two", "second", OrbType::Bug, 2, vec![], None).unwrap();
         // Should list both
         cmd_orb_list(&store, None, None, None, None, None).unwrap();
     }
@@ -880,15 +994,15 @@ mod tests {
     #[test]
     fn list_min_confidence_filters_below_threshold() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Low", "x", OrbType::Task, 3, None).unwrap();
+        let orb = cmd_orb_create(&store, "Low", "x", OrbType::Task, 3, vec![], None).unwrap();
         let mut low = orb;
         low.confidence = Some(0.3);
         store.update(&low).unwrap();
-        let orb2 = cmd_orb_create(&store, "High", "y", OrbType::Task, 3, None).unwrap();
+        let orb2 = cmd_orb_create(&store, "High", "y", OrbType::Task, 3, vec![], None).unwrap();
         let mut high = orb2;
         high.confidence = Some(0.9);
         store.update(&high).unwrap();
-        let orb3 = cmd_orb_create(&store, "None", "z", OrbType::Task, 3, None).unwrap();
+        let orb3 = cmd_orb_create(&store, "None", "z", OrbType::Task, 3, vec![], None).unwrap();
 
         // Sanity-check the filter logic the CLI uses.
         let all = store.load_all().unwrap();
@@ -914,11 +1028,11 @@ mod tests {
     #[test]
     fn list_max_confidence_excludes_high_scores() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Doubtful", "x", OrbType::Task, 3, None).unwrap();
+        let orb = cmd_orb_create(&store, "Doubtful", "x", OrbType::Task, 3, vec![], None).unwrap();
         let mut doubtful = orb;
         doubtful.confidence = Some(0.2);
         store.update(&doubtful).unwrap();
-        let orb2 = cmd_orb_create(&store, "Sure", "y", OrbType::Task, 3, None).unwrap();
+        let orb2 = cmd_orb_create(&store, "Sure", "y", OrbType::Task, 3, vec![], None).unwrap();
         let mut sure = orb2;
         sure.confidence = Some(0.95);
         store.update(&sure).unwrap();
@@ -937,8 +1051,8 @@ mod tests {
     #[test]
     fn list_with_type_filter() {
         let (_dir, store) = temp_orb_store();
-        cmd_orb_create(&store, "Task one", "t1", OrbType::Task, 3, None).unwrap();
-        cmd_orb_create(&store, "Bug one", "b1", OrbType::Bug, 2, None).unwrap();
+        cmd_orb_create(&store, "Task one", "t1", OrbType::Task, 3, vec![], None).unwrap();
+        cmd_orb_create(&store, "Bug one", "b1", OrbType::Bug, 2, vec![], None).unwrap();
 
         // Verify internal filtering by checking store directly
         let all = store.load_all().unwrap();
@@ -958,6 +1072,7 @@ mod tests {
             "will be active",
             OrbType::Task,
             3,
+            vec![],
             None,
         )
         .unwrap();
@@ -973,6 +1088,7 @@ mod tests {
             "stays pending",
             OrbType::Task,
             3,
+            vec![],
             None,
         )
         .unwrap();
@@ -998,7 +1114,8 @@ mod tests {
     #[test]
     fn update_title_and_priority() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Original", "desc", OrbType::Task, 3, None).unwrap();
+        let orb =
+            cmd_orb_create(&store, "Original", "desc", OrbType::Task, 3, vec![], None).unwrap();
         let id = orb.id.as_str().to_string();
 
         cmd_orb_update(
@@ -1022,7 +1139,7 @@ mod tests {
     #[test]
     fn update_status() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Orb", "desc", OrbType::Task, 3, None).unwrap();
+        let orb = cmd_orb_create(&store, "Orb", "desc", OrbType::Task, 3, vec![], None).unwrap();
         let id = orb.id.as_str().to_string();
 
         cmd_orb_update(&store, &id, None, None, None, Some("active"), None, None).unwrap();
@@ -1050,7 +1167,7 @@ mod tests {
     #[test]
     fn update_confidence_persists_value() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Orb", "desc", OrbType::Task, 3, None).unwrap();
+        let orb = cmd_orb_create(&store, "Orb", "desc", OrbType::Task, 3, vec![], None).unwrap();
         let id = orb.id.as_str().to_string();
 
         cmd_orb_update(&store, &id, None, None, None, None, Some(0.65), None).unwrap();
@@ -1062,7 +1179,7 @@ mod tests {
     #[test]
     fn update_confidence_rejects_out_of_range() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Orb", "desc", OrbType::Task, 3, None).unwrap();
+        let orb = cmd_orb_create(&store, "Orb", "desc", OrbType::Task, 3, vec![], None).unwrap();
         let id = orb.id.as_str().to_string();
 
         let result = cmd_orb_update(&store, &id, None, None, None, None, Some(1.5), None);
@@ -1081,7 +1198,8 @@ mod tests {
     #[test]
     fn delete_tombstones_orb() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Delete me", "bye", OrbType::Task, 3, None).unwrap();
+        let orb =
+            cmd_orb_create(&store, "Delete me", "bye", OrbType::Task, 3, vec![], None).unwrap();
         let id = orb.id.as_str().to_string();
 
         cmd_orb_delete(&store, &id, Some("duplicate"), None).unwrap();
@@ -1148,7 +1266,8 @@ mod tests {
     #[test]
     fn review_approve() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Review me", "check", OrbType::Task, 3, None).unwrap();
+        let orb =
+            cmd_orb_create(&store, "Review me", "check", OrbType::Task, 3, vec![], None).unwrap();
         let id = orb.id.as_str().to_string();
 
         // Move to review state first
@@ -1166,7 +1285,8 @@ mod tests {
     #[test]
     fn review_reject() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Reject me", "nope", OrbType::Task, 3, None).unwrap();
+        let orb =
+            cmd_orb_create(&store, "Reject me", "nope", OrbType::Task, 3, vec![], None).unwrap();
         let id = orb.id.as_str().to_string();
 
         let mut o = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
@@ -1183,7 +1303,8 @@ mod tests {
     #[test]
     fn review_revise() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Revise me", "again", OrbType::Task, 3, None).unwrap();
+        let orb =
+            cmd_orb_create(&store, "Revise me", "again", OrbType::Task, 3, vec![], None).unwrap();
         let id = orb.id.as_str().to_string();
 
         let mut o = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
@@ -1200,7 +1321,16 @@ mod tests {
     #[test]
     fn review_not_in_review_state_errors() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Not ready", "pending", OrbType::Task, 3, None).unwrap();
+        let orb = cmd_orb_create(
+            &store,
+            "Not ready",
+            "pending",
+            OrbType::Task,
+            3,
+            vec![],
+            None,
+        )
+        .unwrap();
         let id = orb.id.as_str().to_string();
 
         let result = cmd_orb_review(&store, &id, "approve", None);
@@ -1210,7 +1340,8 @@ mod tests {
     #[test]
     fn review_invalid_decision_errors() {
         let (_dir, store) = temp_orb_store();
-        let orb = cmd_orb_create(&store, "Review me", "check", OrbType::Task, 3, None).unwrap();
+        let orb =
+            cmd_orb_create(&store, "Review me", "check", OrbType::Task, 3, vec![], None).unwrap();
         let id = orb.id.as_str().to_string();
 
         let mut o = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
