@@ -132,12 +132,23 @@ pub fn build_prompt(
 /// are recorded but do not cause early return — all subtasks in subsequent
 /// groups still execute.
 #[allow(clippy::too_many_lines)]
+#[tracing::instrument(
+    name = "orchestrate",
+    skip(store, parent, subtask_specs, config),
+    fields(
+        parent_task_id = %parent.id,
+        subtask_count = subtask_specs.len(),
+        pipeline_run_id = %crate::tracing_ctx::PipelineRunId::new(),
+        max_concurrency = config.max_concurrency,
+    )
+)]
 pub async fn orchestrate(
     store: &TaskStore,
     parent: &mut Task,
     subtask_specs: &[Subtask],
     config: &OrchestrateConfig,
 ) -> anyhow::Result<OrchestrateOutcome> {
+    tracing::info!("orchestration starting");
     parent.transition(TaskStatus::Active);
     store.update(parent)?;
 

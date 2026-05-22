@@ -1,3 +1,5 @@
+use tracing::{info, instrument, warn};
+
 use crate::state::store::TaskStore;
 use crate::state::task::{Task, TaskStatus};
 use crate::worker::process::{Worker, WorkerConfig};
@@ -9,6 +11,11 @@ use crate::worker::process::{Worker, WorkerConfig};
 ///
 /// Returns an error if the worker fails to spawn, the send fails,
 /// or the task store cannot be updated.
+#[instrument(
+    name = "execute_task",
+    skip(store, task, config),
+    fields(task_id = %task.id, model = %config.model)
+)]
 pub async fn execute_task(
     store: &TaskStore,
     task: &mut Task,
@@ -59,12 +66,12 @@ pub async fn execute_task(
     }
 
     if let Some(ref usage) = outcome.usage {
-        // Store model info if we have usage data
         task.worker_model = Some(config.model.clone());
-        // Log usage for now — proper tracking later
-        eprintln!(
-            "  tokens: {} prompt + {} completion = {} total",
-            usage.prompt_tokens, usage.completion_tokens, usage.total_tokens
+        info!(
+            prompt_tokens = usage.prompt_tokens,
+            completion_tokens = usage.completion_tokens,
+            total_tokens = usage.total_tokens,
+            "task completed; token usage recorded"
         );
     }
 
@@ -72,7 +79,7 @@ pub async fn execute_task(
 
     // Shutdown worker
     if let Err(e) = worker.shutdown().await {
-        eprintln!("Warning: worker shutdown failed: {e}");
+        warn!(error = %e, "worker shutdown failed (best-effort)");
     }
 
     Ok(())

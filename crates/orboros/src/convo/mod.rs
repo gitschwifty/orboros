@@ -155,6 +155,11 @@ impl ConvoRuntime {
     /// `SessionNotActive` if no worker is attached; `Ipc` on worker IPC
     /// failure; `Store` on persistence failure (transcript size cap,
     /// closed session, etc.).
+    #[tracing::instrument(
+        name = "convo.send_turn",
+        skip(self, message, event_tx),
+        fields(session_id = %session_id, turn_id = tracing::field::Empty)
+    )]
     pub async fn send_turn(
         &mut self,
         session_id: &SessionId,
@@ -343,6 +348,11 @@ impl ConvoRuntime {
     /// reset event fails. If the new worker fails to spawn, the old
     /// worker is already gone — caller should treat the session as
     /// detached and either retry or close it.
+    #[tracing::instrument(
+        name = "convo.restart_worker",
+        skip(self, worker_config),
+        fields(session_id = %session_id, reason = %reason)
+    )]
     pub async fn restart_worker(
         &mut self,
         session_id: &SessionId,
