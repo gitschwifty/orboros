@@ -242,6 +242,10 @@ enum OrbAction {
         /// New status.
         #[arg(short, long)]
         status: Option<String>,
+        /// Set the orb's confidence score (0.0–1.0). Used by the benchmark
+        /// harness and manual reviewer scoring.
+        #[arg(long)]
+        confidence: Option<f32>,
     },
     /// Soft-delete (tombstone) an orb.
     Delete {
@@ -499,6 +503,7 @@ fn main() -> anyhow::Result<()> {
                     description,
                     priority,
                     status,
+                    confidence,
                 } => orb_cmd::cmd_orb_update(
                     &orb_store,
                     &id,
@@ -506,6 +511,7 @@ fn main() -> anyhow::Result<()> {
                     description.as_deref(),
                     priority,
                     status.as_deref(),
+                    confidence,
                     hooks_ref,
                 ),
                 OrbAction::Delete { id, reason } => {

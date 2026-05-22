@@ -244,6 +244,7 @@ pub fn cmd_orb_list(
 ///
 /// Returns an error if the orb is not found, the status string is invalid,
 /// or the store write fails.
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_orb_update(
     store: &OrbStore,
     id: &str,
@@ -251,6 +252,7 @@ pub fn cmd_orb_update(
     description: Option<&str>,
     priority: Option<u8>,
     status: Option<&str>,
+    confidence: Option<f32>,
     hooks: Option<&HookSink>,
 ) -> anyhow::Result<()> {
     let orb_id = OrbId::from_raw(id);
@@ -259,6 +261,7 @@ pub fn cmd_orb_update(
         .context("failed to load orb")?
         .ok_or_else(|| anyhow::anyhow!("orb {id} not found"))?;
     let prior_status = orb.status;
+    let prior_confidence = orb.confidence;
 
     if let Some(t) = title {
         orb.title = t.to_string();
@@ -274,10 +277,28 @@ pub fn cmd_orb_update(
         orb.set_status(new_status)
             .with_context(|| format!("invalid status transition to {new_status:?}"))?;
     }
+    if let Some(c) = confidence {
+        if !c.is_finite() || !(0.0..=1.0).contains(&c) {
+            return Err(anyhow::anyhow!(
+                "confidence must be a finite value in [0.0, 1.0]; got {c}"
+            ));
+        }
+        orb.confidence = Some(c);
+    }
     orb.updated_at = chrono::Utc::now();
     orb.update_content_hash();
 
     store.update(&orb).context("failed to persist orb update")?;
+
+    if let (Some(new_c), prior) = (orb.confidence, prior_confidence) {
+        if prior != Some(new_c) {
+            tracing::info!(
+                orb_id = %orb.id,
+                confidence = new_c,
+                "confidence recorded on orb",
+            );
+        }
+    }
 
     println!("Updated orb {}", orb.id);
 
@@ -737,6 +758,7 @@ mod tests {
             Some(1),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -752,7 +774,7 @@ mod tests {
         let orb = cmd_orb_create(&store, "Orb", "desc", OrbType::Task, 3, None).unwrap();
         let id = orb.id.as_str().to_string();
 
-        cmd_orb_update(&store, &id, None, None, None, Some("active"), None).unwrap();
+        cmd_orb_update(&store, &id, None, None, None, Some("active"), None, None).unwrap();
 
         let loaded = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
         assert_eq!(loaded.status, Some(OrbStatus::Active));
@@ -761,8 +783,46 @@ mod tests {
     #[test]
     fn update_nonexistent_orb_errors() {
         let (_dir, store) = temp_orb_store();
-        let result = cmd_orb_update(&store, "orb-nope", Some("new"), None, None, None, None);
+        let result = cmd_orb_update(
+            &store,
+            "orb-nope",
+            Some("new"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn update_confidence_persists_value() {
+        let (_dir, store) = temp_orb_store();
+        let orb = cmd_orb_create(&store, "Orb", "desc", OrbType::Task, 3, None).unwrap();
+        let id = orb.id.as_str().to_string();
+
+        cmd_orb_update(&store, &id, None, None, None, None, Some(0.65), None).unwrap();
+
+        let loaded = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
+        assert_eq!(loaded.confidence, Some(0.65));
+    }
+
+    #[test]
+    fn update_confidence_rejects_out_of_range() {
+        let (_dir, store) = temp_orb_store();
+        let orb = cmd_orb_create(&store, "Orb", "desc", OrbType::Task, 3, None).unwrap();
+        let id = orb.id.as_str().to_string();
+
+        let result = cmd_orb_update(&store, &id, None, None, None, None, Some(1.5), None);
+        assert!(result.is_err());
+        let result = cmd_orb_update(&store, &id, None, None, None, None, Some(-0.1), None);
+        assert!(result.is_err());
+        let result = cmd_orb_update(&store, &id, None, None, None, None, Some(f32::NAN), None);
+        assert!(result.is_err());
+
+        let loaded = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
+        assert!(loaded.confidence.is_none(), "value never persisted");
     }
 
     // ── cmd_orb_delete ─────────────────────────────────────────

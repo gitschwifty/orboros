@@ -20,6 +20,7 @@ pub enum EventType {
     Deferred,
     Undeferred,
     Tombstoned,
+    ConfidenceRecorded,
 }
 
 /// A single audit event recording a mutation on an orb.
@@ -254,6 +255,27 @@ pub fn log_undeferred(
     store.log_event(&event)
 }
 
+/// Logs a confidence-recorded event. Called when a worker self-reports
+/// a confidence score for the orb's result.
+///
+/// # Errors
+///
+/// Returns an IO error if writing to the audit store fails.
+pub fn log_confidence_recorded(
+    store: &crate::audit_store::AuditStore,
+    orb_id: &OrbId,
+    confidence: f32,
+    actor: &str,
+) -> std::io::Result<()> {
+    let event = AuditEvent::new(
+        orb_id.clone(),
+        EventType::ConfidenceRecorded,
+        actor,
+        Some(format!("{confidence:.2}")),
+    );
+    store.log_event(&event)
+}
+
 /// Logs a tombstoned event.
 ///
 /// # Errors
@@ -320,6 +342,7 @@ mod tests {
             EventType::Deferred,
             EventType::Undeferred,
             EventType::Tombstoned,
+            EventType::ConfidenceRecorded,
         ];
         for variant in variants {
             let json = serde_json::to_string(&variant).unwrap();
@@ -499,6 +522,21 @@ mod tests {
         let events = store.events_for_orb(&orb_id).unwrap();
         assert_eq!(events[0].event_type, EventType::Tombstoned);
         assert_eq!(events[0].details.as_deref(), Some("duplicate"));
+    }
+
+    #[test]
+    fn log_confidence_recorded_writes_event_with_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::audit_store::AuditStore::new(dir.path().join("events.jsonl"));
+        let orb_id = OrbId::from_raw("orb-conf");
+
+        log_confidence_recorded(&store, &orb_id, 0.82, "worker").unwrap();
+
+        let events = store.events_for_orb(&orb_id).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, EventType::ConfidenceRecorded);
+        assert_eq!(events[0].actor, "worker");
+        assert_eq!(events[0].details.as_deref(), Some("0.82"));
     }
 
     #[test]
