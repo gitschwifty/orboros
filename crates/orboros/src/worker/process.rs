@@ -594,6 +594,37 @@ mod tests {
         }
     }
 
+    fn confidence_mock_worker_config() -> WorkerConfig {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        WorkerConfig {
+            command: "bash".into(),
+            args: vec![manifest_dir
+                .join("test-fixtures/mock-worker-confidence.sh")
+                .to_string_lossy()
+                .into()],
+            cwd: None,
+            env: vec![],
+            model: "mock/test".into(),
+            system_prompt: "You are a test assistant.".into(),
+            tools: vec![],
+            max_iterations: None,
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn confidence_from_ipc_field_flows_into_send_outcome() {
+        let config = confidence_mock_worker_config();
+        let mut worker = Worker::spawn(&config).await.unwrap();
+        let outcome = worker.send("req-1", "ping").await.unwrap();
+        assert_eq!(outcome.confidence, Some(0.73));
+        let _ = worker.shutdown().await;
+    }
+
     fn cancel_mock_worker_config() -> WorkerConfig {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         WorkerConfig {

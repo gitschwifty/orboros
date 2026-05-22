@@ -128,6 +128,7 @@ mod tests {
             model_latency_ms: None,
             tool_latency_ms: None,
             total_latency_ms: None,
+            confidence: None,
         }
     }
 
@@ -157,6 +158,7 @@ mod tests {
             model_latency_ms: model_ms,
             tool_latency_ms: tool_ms,
             total_latency_ms: total_ms,
+            confidence: None,
         }
     }
 
