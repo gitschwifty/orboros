@@ -315,6 +315,61 @@ pub fn apply_dispatch_outcome(
     Ok(())
 }
 
+/// Builds a base `WorkerConfig` from the layered project config.
+/// Reads `OrbConfig.worker_binary` and `OrbConfig.default_model`.
+/// Returns an error if the config doesn't specify a worker binary
+/// — there's no sensible fallback.
+///
+/// # Errors
+///
+/// Returns an error if config load fails or `worker_binary` is
+/// unset.
+pub fn default_worker_config(
+    home: Option<&std::path::Path>,
+    project_dir: Option<&std::path::Path>,
+) -> anyhow::Result<WorkerConfig> {
+    let cfg = crate::config::load_config_with_home(home, project_dir)?;
+    let binary = cfg
+        .worker_binary
+        .ok_or_else(|| anyhow::anyhow!("worker_binary is unset in OrbConfig"))?;
+    Ok(WorkerConfig {
+        command: binary,
+        args: vec![],
+        cwd: None,
+        env: vec![],
+        model: cfg.default_model,
+        system_prompt: String::new(),
+        tools: vec![],
+        max_iterations: None,
+        init_timeout: None,
+        send_timeout: None,
+        shutdown_timeout: None,
+        task_id: None,
+        worker_id: None,
+    })
+}
+
+/// Overlays orb-specific fields onto a base `WorkerConfig`:
+///   - `orb.preferred_model` overrides the base model when set.
+///   - `task_id` is set to the orb's id (heddle uses this for tracing).
+///   - `worker_id` is freshly generated for this dispatch.
+///   - `system_prompt` becomes the caller-supplied prompt plus the
+///     [`crate::worker::process::CONFIDENCE_PROMPT_ADDENDUM`].
+#[must_use]
+pub fn worker_config_for(orb: &Orb, base: &WorkerConfig, system_prompt: &str) -> WorkerConfig {
+    let mut wc = base.clone();
+    if let Some(ref model) = orb.preferred_model {
+        wc.model = model.clone();
+    }
+    wc.task_id = Some(orb.id.to_string());
+    wc.worker_id = Some(uuid::Uuid::new_v4().to_string());
+    wc.system_prompt = format!(
+        "{system_prompt}{}",
+        crate::worker::process::CONFIDENCE_PROMPT_ADDENDUM
+    );
+    wc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,5 +493,91 @@ mod tests {
         assert_eq!(o.error.as_deref(), Some("blocked by policy"));
         assert!(o.response.is_none());
         assert!(o.confidence.is_none());
+    }
+
+    // ── worker_config_for + default_worker_config ─────────────
+
+    fn base_wc() -> WorkerConfig {
+        WorkerConfig {
+            command: "heddle".into(),
+            args: vec![],
+            cwd: None,
+            env: vec![],
+            model: "default/m".into(),
+            system_prompt: String::new(),
+            tools: vec![],
+            max_iterations: None,
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
+        }
+    }
+
+    #[test]
+    fn worker_config_for_uses_base_model_when_orb_has_no_preference() {
+        let orb = active_task_orb();
+        let wc = worker_config_for(&orb, &base_wc(), "you are a worker");
+        assert_eq!(wc.model, "default/m");
+        assert_eq!(wc.task_id.as_deref(), Some(orb.id.as_str()));
+        assert!(wc.worker_id.is_some(), "worker_id is freshly generated");
+        assert!(wc.system_prompt.starts_with("you are a worker"));
+    }
+
+    #[test]
+    fn worker_config_for_prefers_orb_model_over_base() {
+        let mut orb = active_task_orb();
+        orb.preferred_model = Some("orb/model".into());
+        let wc = worker_config_for(&orb, &base_wc(), "x");
+        assert_eq!(wc.model, "orb/model");
+    }
+
+    #[test]
+    fn worker_config_for_appends_confidence_addendum() {
+        let orb = active_task_orb();
+        let wc = worker_config_for(&orb, &base_wc(), "you are a worker");
+        assert!(
+            wc.system_prompt.contains("CONFIDENCE:"),
+            "addendum should be appended: {}",
+            wc.system_prompt
+        );
+    }
+
+    #[test]
+    fn worker_config_for_generates_unique_worker_ids_per_call() {
+        let orb = active_task_orb();
+        let a = worker_config_for(&orb, &base_wc(), "x");
+        let b = worker_config_for(&orb, &base_wc(), "x");
+        assert_ne!(a.worker_id, b.worker_id);
+    }
+
+    #[test]
+    fn default_worker_config_errors_when_worker_binary_unset() {
+        let home = tempfile::tempdir().unwrap();
+        // No config file → default OrbConfig → worker_binary is None.
+        let err = default_worker_config(Some(home.path()), None).unwrap_err();
+        assert!(
+            err.to_string().contains("worker_binary"),
+            "expected error to mention worker_binary: {err}"
+        );
+    }
+
+    #[test]
+    fn default_worker_config_reads_binary_and_default_model_from_config() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg_dir = home.path().join(".orboros");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            r#"
+default_model = "anthropic/test"
+worker_binary = "/usr/local/bin/heddle"
+"#,
+        )
+        .unwrap();
+        let wc = default_worker_config(Some(home.path()), None).unwrap();
+        assert_eq!(wc.command, "/usr/local/bin/heddle");
+        assert_eq!(wc.model, "anthropic/test");
     }
 }
