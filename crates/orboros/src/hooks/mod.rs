@@ -8,6 +8,8 @@
 
 pub mod config;
 pub mod event;
+pub mod matcher;
 
 pub use config::{default_paths, ConfigLayer, HookEntry, HookMatch, HooksConfig};
 pub use event::{HookEvent, HookEventParseError};
+pub use matcher::{matches, MatcherCtx};
