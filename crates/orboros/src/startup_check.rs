@@ -185,9 +185,18 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    /// Global lock serializing tests that mutate environment variables.
+    /// Rust runs tests in parallel by default; without this lock, two
+    /// tests racing on `set_var`/`remove_var` produce flaky failures.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Wrapper that resets known env vars around a closure so tests don't
     /// interfere with each other or with the developer's shell.
     fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
+        // Lock for the entire scope so a concurrent test doesn't observe
+        // our half-applied state. Recover from poisoning since panics in
+        // other tests can poison the mutex.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prior: Vec<(String, Option<String>)> = vars
             .iter()
             .map(|(k, _)| ((*k).to_string(), std::env::var(*k).ok()))

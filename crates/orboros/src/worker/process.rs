@@ -9,6 +9,8 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
+use tracing::{debug, info, instrument};
+
 use crate::ipc::error::IpcError;
 use crate::ipc::transport::{read_response, write_request};
 use crate::ipc::types::{
@@ -52,6 +54,9 @@ pub struct Worker {
     stdin: Arc<TokioMutex<ChildStdin>>,
     reader: BufReader<ChildStdout>,
     session_id: String,
+    /// Orboros-side correlation id, distinct from the heddle-side
+    /// `session_id`. Used as a `tracing` span field.
+    worker_id: crate::tracing_ctx::WorkerId,
     send_timeout: Option<Duration>,
     shutdown_timeout: Option<Duration>,
 }
@@ -111,7 +116,21 @@ impl Worker {
     ///
     /// Returns `IpcError` if spawning fails, the init handshake fails,
     /// or there's a protocol version mismatch.
+    #[instrument(
+        name = "worker.spawn",
+        skip(config),
+        fields(
+            command = %config.command,
+            model = %config.model,
+            worker_id = tracing::field::Empty,
+            session_id = tracing::field::Empty,
+        )
+    )]
     pub async fn spawn(config: &WorkerConfig) -> Result<Self, IpcError> {
+        let worker_id = crate::tracing_ctx::WorkerId::new();
+        tracing::Span::current().record("worker_id", tracing::field::display(&worker_id));
+        debug!("spawning worker subprocess");
+
         let mut cmd = Command::new(&config.command);
         cmd.args(&config.args)
             .stdin(Stdio::piped())
@@ -140,6 +159,7 @@ impl Worker {
             stdin,
             reader,
             session_id: String::new(),
+            worker_id,
             send_timeout: config.send_timeout,
             shutdown_timeout: config.shutdown_timeout,
         };
@@ -151,7 +171,15 @@ impl Worker {
         } else {
             worker.init(config).await?;
         }
+        tracing::Span::current().record("session_id", tracing::field::display(&worker.session_id));
+        info!(session_id = %worker.session_id, "worker ready");
         Ok(worker)
+    }
+
+    /// Returns the orboros-side correlation id for this worker.
+    #[must_use]
+    pub fn worker_id(&self) -> crate::tracing_ctx::WorkerId {
+        self.worker_id
     }
 
     /// Sends the init message and validates the response.
@@ -225,6 +253,11 @@ impl Worker {
     ///
     /// Returns `IpcError` if writing the request fails, reading responses fails,
     /// or the worker closes stdout unexpectedly.
+    #[instrument(
+        name = "worker.send",
+        skip(self, message),
+        fields(worker_id = %self.worker_id, session_id = %self.session_id, send_id = %id)
+    )]
     pub async fn send(&mut self, id: &str, message: &str) -> Result<SendOutcome, IpcError> {
         if let Some(dur) = self.send_timeout {
             tokio::time::timeout(dur, self.send_inner(id, message))
@@ -250,6 +283,11 @@ impl Worker {
     ///
     /// Returns `IpcError` if writing the send request fails, reading responses
     /// fails, the worker closes stdout unexpectedly, or `send_timeout` elapses.
+    #[instrument(
+        name = "worker.send_streaming",
+        skip(self, message, event_tx),
+        fields(worker_id = %self.worker_id, session_id = %self.session_id, send_id = %id)
+    )]
     pub async fn send_streaming(
         &mut self,
         id: &str,
@@ -342,6 +380,11 @@ impl Worker {
     /// # Errors
     ///
     /// Returns `IpcError` if the shutdown handshake fails.
+    #[instrument(
+        name = "worker.shutdown",
+        skip(self),
+        fields(worker_id = %self.worker_id, session_id = %self.session_id)
+    )]
     pub async fn shutdown(mut self) -> Result<(), IpcError> {
         if let Some(dur) = self.shutdown_timeout {
             tokio::time::timeout(dur, self.shutdown_inner())

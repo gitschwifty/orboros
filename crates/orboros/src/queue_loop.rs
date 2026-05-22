@@ -7,6 +7,7 @@ use orbs::orb::{Orb, OrbPhase, OrbStatus};
 use orbs::orb_store::OrbStore;
 use orbs::pipeline::create_pipeline;
 use orbs::task::TaskStatus;
+use tracing::{debug, instrument};
 
 /// Result of a single tick of the queue loop.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -89,13 +90,16 @@ impl QueueLoop {
     /// # Errors
     ///
     /// Returns an IO error if store operations fail.
+    #[instrument(name = "queue.tick", skip(self), fields(orb_count = tracing::field::Empty))]
     pub fn tick(&self) -> std::io::Result<TickResult> {
         if self.paused.load(Ordering::SeqCst) {
+            debug!("queue paused; skipping tick");
             return Ok(TickResult::default());
         }
 
         let mut result = TickResult::default();
         let all_orbs = self.orb_store.load_all()?;
+        tracing::Span::current().record("orb_count", all_orbs.len());
 
         // 1. Pipeline-phase orbs: Pending epics/features need pipeline dirs + speccing
         result.pipelines_started = self.start_pipelines(&all_orbs)?;

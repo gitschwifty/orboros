@@ -19,4 +19,5 @@ pub mod slop;
 pub mod startup_check;
 pub mod state;
 pub mod trace;
+pub mod tracing_ctx;
 pub mod worker;
