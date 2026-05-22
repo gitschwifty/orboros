@@ -272,6 +272,7 @@ pub fn cmd_orb_show(store: &OrbStore, id: &str) -> anyhow::Result<()> {
 /// # Errors
 ///
 /// Returns an error if the store read fails or a filter string is invalid.
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_orb_list(
     store: &OrbStore,
     filter_type: Option<&str>,
@@ -279,6 +280,7 @@ pub fn cmd_orb_list(
     min_confidence: Option<f32>,
     max_confidence: Option<f32>,
     review_status: Option<&str>,
+    labels_any: &[String],
 ) -> anyhow::Result<()> {
     let mut orbs = store.load_all().context("failed to load orbs")?;
 
@@ -305,6 +307,16 @@ pub fn cmd_orb_list(
         orbs.retain(|o| matches_review_filter(o, filter));
     }
 
+    if !labels_any.is_empty() {
+        // any-of semantics: orb passes if it has at least one of the
+        // requested labels. Matches the hook matcher's `labels_any`
+        // behavior — `labels_all` is reserved for hooks where the AND
+        // semantic is more useful for gating.
+        let wanted: std::collections::HashSet<&str> =
+            labels_any.iter().map(String::as_str).collect();
+        orbs.retain(|o| o.labels.iter().any(|l| wanted.contains(l.as_str())));
+    }
+
     if orbs.is_empty() {
         println!("No orbs found.");
     } else {
@@ -319,9 +331,14 @@ pub fn cmd_orb_list(
             let conf = orb
                 .confidence
                 .map_or(String::new(), |c| format!(" conf={c:.2}"));
+            let labels = if orb.labels.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", orb.labels.join(", "))
+            };
             println!(
-                "[{lifecycle}] {} — {} ({:?}, p{}){}",
-                orb.id, orb.title, orb.orb_type, orb.priority, conf
+                "[{lifecycle}] {} — {} ({:?}, p{}){}{}",
+                orb.id, orb.title, orb.orb_type, orb.priority, conf, labels
             );
         }
         println!("\n{} orb(s)", orbs.len());
@@ -1030,7 +1047,7 @@ mod tests {
         cmd_orb_create(&store, "One", "first", OrbType::Task, 3, vec![], None).unwrap();
         cmd_orb_create(&store, "Two", "second", OrbType::Bug, 2, vec![], None).unwrap();
         // Should list both
-        cmd_orb_list(&store, None, None, None, None, None).unwrap();
+        cmd_orb_list(&store, None, None, None, None, None, &[]).unwrap();
     }
 
     #[test]
@@ -1056,7 +1073,7 @@ mod tests {
         assert_eq!(above_half[0].title, "High");
 
         // CLI command should not error.
-        cmd_orb_list(&store, None, None, Some(0.7), None, None).unwrap();
+        cmd_orb_list(&store, None, None, Some(0.7), None, None, &[]).unwrap();
 
         // The None-confidence orb is excluded even by lax threshold.
         let any_conf: Vec<_> = all
@@ -1087,7 +1104,114 @@ mod tests {
         assert_eq!(doubtful_only.len(), 1);
         assert_eq!(doubtful_only[0].title, "Doubtful");
 
-        cmd_orb_list(&store, None, None, None, Some(0.5), None).unwrap();
+        cmd_orb_list(&store, None, None, None, Some(0.5), None, &[]).unwrap();
+    }
+
+    // ── orb list --label filter ──────────────────────────────
+
+    #[test]
+    fn list_label_filter_matches_any_of_requested() {
+        let (_dir, store) = temp_orb_store();
+        cmd_orb_create(
+            &store,
+            "DB work",
+            "x",
+            OrbType::Task,
+            3,
+            vec!["db".into()],
+            None,
+        )
+        .unwrap();
+        cmd_orb_create(
+            &store,
+            "External",
+            "x",
+            OrbType::Task,
+            3,
+            vec!["external".into()],
+            None,
+        )
+        .unwrap();
+        cmd_orb_create(&store, "Neither", "x", OrbType::Task, 3, vec![], None).unwrap();
+
+        // Filter for "db" — only one orb matches.
+        let all = store.load_all().unwrap();
+        let db_only: Vec<_> = all
+            .iter()
+            .filter(|o| o.labels.iter().any(|l| l == "db"))
+            .collect();
+        assert_eq!(db_only.len(), 1);
+        assert_eq!(db_only[0].title, "DB work");
+
+        cmd_orb_list(&store, None, None, None, None, None, &["db".to_string()]).unwrap();
+    }
+
+    #[test]
+    fn list_label_filter_any_of_with_multiple_labels() {
+        // Two labels requested → orb passes if it has either.
+        let (_dir, store) = temp_orb_store();
+        cmd_orb_create(&store, "DB", "x", OrbType::Task, 3, vec!["db".into()], None).unwrap();
+        cmd_orb_create(
+            &store,
+            "External",
+            "x",
+            OrbType::Task,
+            3,
+            vec!["external".into()],
+            None,
+        )
+        .unwrap();
+        cmd_orb_create(
+            &store,
+            "Unrelated",
+            "x",
+            OrbType::Task,
+            3,
+            vec!["other".into()],
+            None,
+        )
+        .unwrap();
+
+        let all = store.load_all().unwrap();
+        let wanted: std::collections::HashSet<&str> = ["db", "external"].iter().copied().collect();
+        let matched: Vec<_> = all
+            .iter()
+            .filter(|o| o.labels.iter().any(|l| wanted.contains(l.as_str())))
+            .collect();
+        assert_eq!(matched.len(), 2);
+
+        cmd_orb_list(
+            &store,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &["db".to_string(), "external".to_string()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn list_empty_label_filter_does_not_filter() {
+        // Empty filter list → label filter inactive (other filters still apply).
+        let (_dir, store) = temp_orb_store();
+        cmd_orb_create(
+            &store,
+            "Labeled",
+            "x",
+            OrbType::Task,
+            3,
+            vec!["db".into()],
+            None,
+        )
+        .unwrap();
+        cmd_orb_create(&store, "Unlabeled", "x", OrbType::Task, 3, vec![], None).unwrap();
+
+        let all = store.load_all().unwrap();
+        assert_eq!(all.len(), 2);
+
+        cmd_orb_list(&store, None, None, None, None, None, &[]).unwrap();
     }
 
     #[test]
@@ -1148,7 +1272,7 @@ mod tests {
     #[test]
     fn list_empty_store() {
         let (_dir, store) = temp_orb_store();
-        cmd_orb_list(&store, None, None, None, None, None).unwrap();
+        cmd_orb_list(&store, None, None, None, None, None, &[]).unwrap();
     }
 
     // ── cmd_orb_update ─────────────────────────────────────────

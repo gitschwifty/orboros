@@ -274,6 +274,10 @@ enum OrbAction {
         /// Filter by second-opinion reviewer verdict (accept, reject, revise, any, missing).
         #[arg(long)]
         review_status: Option<String>,
+        /// Show only orbs with at least one of these labels (any-of).
+        /// Repeatable: `--label db --label external`.
+        #[arg(long = "label", value_name = "LABEL")]
+        label: Vec<String>,
     },
     /// Update fields on an existing orb.
     Update {
@@ -552,6 +556,7 @@ fn main() -> anyhow::Result<()> {
                     min_confidence,
                     max_confidence,
                     review_status,
+                    label,
                 } => orb_cmd::cmd_orb_list(
                     &orb_store,
                     orb_type.as_deref(),
@@ -559,6 +564,7 @@ fn main() -> anyhow::Result<()> {
                     min_confidence,
                     max_confidence,
                     review_status.as_deref(),
+                    &label,
                 ),
                 OrbAction::Update {
                     id,
