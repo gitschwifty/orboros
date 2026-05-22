@@ -9,6 +9,7 @@ use orbs::dep_store::DepStore;
 use orbs::id::OrbId;
 use orbs::orb::{Orb, OrbPhase, OrbStatus, OrbType};
 use orbs::orb_store::OrbStore;
+use orbs::review::{ReviewVerdict, ReviseScope};
 
 use crate::hooks::{FireCtx, HookEvent, HookSink};
 
@@ -50,6 +51,60 @@ pub fn parse_orb_status(s: &str) -> anyhow::Result<OrbStatus> {
         other => bail!(
             "unknown orb status: {other}. Use: draft, pending, active, review, done, failed, cancelled, deferred"
         ),
+    }
+}
+
+/// Filter selector for `cmd_orb_list` reviewer-status filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewStatusFilter {
+    Accept,
+    Reject,
+    Revise,
+    Any,
+    Missing,
+}
+
+/// Parses a string into a [`ReviewStatusFilter`].
+///
+/// # Errors
+///
+/// Returns an error if the string does not match a known filter.
+pub fn parse_review_status_filter(s: &str) -> anyhow::Result<ReviewStatusFilter> {
+    match s.to_lowercase().as_str() {
+        "accept" | "accepted" => Ok(ReviewStatusFilter::Accept),
+        "reject" | "rejected" => Ok(ReviewStatusFilter::Reject),
+        "revise" => Ok(ReviewStatusFilter::Revise),
+        "any" | "reviewed" => Ok(ReviewStatusFilter::Any),
+        "none" | "missing" | "unreviewed" => Ok(ReviewStatusFilter::Missing),
+        other => bail!(
+            "unknown review-status filter: {other}. Use: accept, reject, revise, any, missing"
+        ),
+    }
+}
+
+#[must_use]
+pub fn verdict_label(v: &ReviewVerdict) -> &'static str {
+    match v {
+        ReviewVerdict::Accept => "ACCEPT",
+        ReviewVerdict::Reject => "REJECT",
+        ReviewVerdict::Revise {
+            scope: ReviseScope::Execution,
+        } => "REVISE (execution)",
+        ReviewVerdict::Revise {
+            scope: ReviseScope::Decomposition,
+        } => "REVISE (decomposition)",
+    }
+}
+
+fn matches_review_filter(orb: &Orb, filter: ReviewStatusFilter) -> bool {
+    match (filter, orb.review_report.as_ref()) {
+        (ReviewStatusFilter::Missing, None) => true,
+        (ReviewStatusFilter::Missing, Some(_)) => false,
+        (_, None) => false,
+        (ReviewStatusFilter::Any, Some(_)) => true,
+        (ReviewStatusFilter::Accept, Some(r)) => r.verdict.is_accept(),
+        (ReviewStatusFilter::Reject, Some(r)) => r.verdict.is_reject(),
+        (ReviewStatusFilter::Revise, Some(r)) => r.verdict.is_revise(),
     }
 }
 
@@ -165,6 +220,16 @@ pub fn cmd_orb_show(store: &OrbStore, id: &str) -> anyhow::Result<()> {
             if let Some(confidence) = orb.confidence {
                 println!("Confidence:  {confidence:.2}");
             }
+            if let Some(ref report) = orb.review_report {
+                println!("Review:      {}", verdict_label(&report.verdict));
+                println!("  Model:     {}", report.reviewer_model);
+                if !report.critique.is_empty() {
+                    println!("  Critique:  {}", report.critique);
+                }
+                if let Some(ref sc) = report.suggested_changes {
+                    println!("  Suggested: {sc}");
+                }
+            }
             if orb.is_tombstoned() {
                 println!(
                     "DELETED:     {}",
@@ -193,6 +258,7 @@ pub fn cmd_orb_list(
     filter_status: Option<&str>,
     min_confidence: Option<f32>,
     max_confidence: Option<f32>,
+    review_status: Option<&str>,
 ) -> anyhow::Result<()> {
     let mut orbs = store.load_all().context("failed to load orbs")?;
 
@@ -212,6 +278,11 @@ pub fn cmd_orb_list(
 
     if let Some(max) = max_confidence {
         orbs.retain(|o| o.confidence.is_some_and(|c| c <= max));
+    }
+
+    if let Some(rs) = review_status {
+        let filter = parse_review_status_filter(rs)?;
+        orbs.retain(|o| matches_review_filter(o, filter));
     }
 
     if orbs.is_empty() {
@@ -235,6 +306,50 @@ pub fn cmd_orb_list(
         }
         println!("\n{} orb(s)", orbs.len());
     }
+    Ok(())
+}
+
+/// Prints orbs whose second-opinion reviewer verdict is `Revise`,
+/// pending operator action. Includes the verdict scope and critique
+/// preview so the user can prioritize.
+///
+/// # Errors
+///
+/// Returns an error if the store read fails.
+pub fn cmd_review_queue(store: &OrbStore) -> anyhow::Result<()> {
+    let orbs = store.load_all().context("failed to load orbs")?;
+    let mut revising: Vec<&Orb> = orbs
+        .iter()
+        .filter(|o| {
+            o.review_report
+                .as_ref()
+                .is_some_and(|r| r.verdict.is_revise())
+        })
+        .collect();
+    revising.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+
+    if revising.is_empty() {
+        println!("Review queue empty.");
+        return Ok(());
+    }
+    for orb in &revising {
+        let report = orb.review_report.as_ref().unwrap();
+        let preview = report
+            .critique
+            .lines()
+            .next()
+            .unwrap_or("(no critique)")
+            .chars()
+            .take(80)
+            .collect::<String>();
+        println!(
+            "{}  [{}]  {} — {preview}",
+            orb.id,
+            verdict_label(&report.verdict),
+            orb.title,
+        );
+    }
+    println!("\n{} orb(s) pending revise", revising.len());
     Ok(())
 }
 
@@ -517,6 +632,142 @@ mod tests {
         (dir, store)
     }
 
+    fn make_review_report(verdict: ReviewVerdict, critique: &str) -> orbs::review::ReviewReport {
+        orbs::review::ReviewReport {
+            verdict,
+            critique: critique.into(),
+            suggested_changes: None,
+            reviewer_model: "m".into(),
+            reviewed_at: chrono::Utc::now(),
+            reviewer_orb_id: None,
+        }
+    }
+
+    // ── review filter ──────────────────────────────────────────
+
+    #[test]
+    fn review_status_filter_parses_aliases() {
+        assert_eq!(
+            parse_review_status_filter("accepted").unwrap(),
+            ReviewStatusFilter::Accept
+        );
+        assert_eq!(
+            parse_review_status_filter("REVISE").unwrap(),
+            ReviewStatusFilter::Revise
+        );
+        assert_eq!(
+            parse_review_status_filter("unreviewed").unwrap(),
+            ReviewStatusFilter::Missing
+        );
+        assert!(parse_review_status_filter("nope").is_err());
+    }
+
+    #[test]
+    fn matches_review_filter_handles_all_combinations() {
+        let mut accepted = Orb::new("a", "x");
+        accepted.review_report = Some(make_review_report(ReviewVerdict::Accept, ""));
+        let mut revising = Orb::new("r", "x");
+        revising.review_report = Some(make_review_report(
+            ReviewVerdict::Revise {
+                scope: ReviseScope::Execution,
+            },
+            "c",
+        ));
+        let unreviewed = Orb::new("u", "x");
+
+        assert!(matches_review_filter(&accepted, ReviewStatusFilter::Accept));
+        assert!(matches_review_filter(&accepted, ReviewStatusFilter::Any));
+        assert!(!matches_review_filter(
+            &accepted,
+            ReviewStatusFilter::Revise
+        ));
+        assert!(!matches_review_filter(
+            &accepted,
+            ReviewStatusFilter::Missing
+        ));
+
+        assert!(matches_review_filter(&revising, ReviewStatusFilter::Revise));
+        assert!(matches_review_filter(&revising, ReviewStatusFilter::Any));
+        assert!(!matches_review_filter(
+            &revising,
+            ReviewStatusFilter::Accept
+        ));
+
+        assert!(matches_review_filter(
+            &unreviewed,
+            ReviewStatusFilter::Missing
+        ));
+        assert!(!matches_review_filter(&unreviewed, ReviewStatusFilter::Any));
+        assert!(!matches_review_filter(
+            &unreviewed,
+            ReviewStatusFilter::Accept
+        ));
+    }
+
+    #[test]
+    fn verdict_labels_distinguish_revise_scopes() {
+        assert_eq!(verdict_label(&ReviewVerdict::Accept), "ACCEPT");
+        assert_eq!(verdict_label(&ReviewVerdict::Reject), "REJECT");
+        assert_eq!(
+            verdict_label(&ReviewVerdict::Revise {
+                scope: ReviseScope::Execution,
+            }),
+            "REVISE (execution)"
+        );
+        assert_eq!(
+            verdict_label(&ReviewVerdict::Revise {
+                scope: ReviseScope::Decomposition,
+            }),
+            "REVISE (decomposition)"
+        );
+    }
+
+    // ── cmd_review_queue ───────────────────────────────────────
+
+    #[test]
+    fn review_queue_lists_only_revise_orbs() {
+        let (_dir, store) = temp_orb_store();
+        let a = cmd_orb_create(&store, "A", "x", OrbType::Task, 3, None).unwrap();
+        let b = cmd_orb_create(&store, "B", "x", OrbType::Task, 3, None).unwrap();
+        let c = cmd_orb_create(&store, "C", "x", OrbType::Task, 3, None).unwrap();
+
+        let mut a2 = a;
+        a2.review_report = Some(make_review_report(ReviewVerdict::Accept, ""));
+        store.update(&a2).unwrap();
+        let mut b2 = b;
+        b2.review_report = Some(make_review_report(
+            ReviewVerdict::Revise {
+                scope: ReviseScope::Execution,
+            },
+            "needs fix",
+        ));
+        store.update(&b2).unwrap();
+        // c stays unreviewed.
+        let _ = c;
+
+        let queued: Vec<_> = store
+            .load_all()
+            .unwrap()
+            .into_iter()
+            .filter(|o| {
+                o.review_report
+                    .as_ref()
+                    .is_some_and(|r| r.verdict.is_revise())
+            })
+            .collect();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].title, "B");
+
+        cmd_review_queue(&store).unwrap();
+    }
+
+    #[test]
+    fn review_queue_empty_when_no_revising_orbs() {
+        let (_dir, store) = temp_orb_store();
+        cmd_orb_create(&store, "Only one", "x", OrbType::Task, 3, None).unwrap();
+        cmd_review_queue(&store).unwrap();
+    }
+
     fn temp_dep_store() -> (tempfile::TempDir, DepStore) {
         let dir = tempfile::tempdir().unwrap();
         let store = DepStore::new(dir.path().join("deps.jsonl"));
@@ -623,7 +874,7 @@ mod tests {
         cmd_orb_create(&store, "One", "first", OrbType::Task, 3, None).unwrap();
         cmd_orb_create(&store, "Two", "second", OrbType::Bug, 2, None).unwrap();
         // Should list both
-        cmd_orb_list(&store, None, None, None, None).unwrap();
+        cmd_orb_list(&store, None, None, None, None, None).unwrap();
     }
 
     #[test]
@@ -649,7 +900,7 @@ mod tests {
         assert_eq!(above_half[0].title, "High");
 
         // CLI command should not error.
-        cmd_orb_list(&store, None, None, Some(0.7), None).unwrap();
+        cmd_orb_list(&store, None, None, Some(0.7), None, None).unwrap();
 
         // The None-confidence orb is excluded even by lax threshold.
         let any_conf: Vec<_> = all
@@ -680,7 +931,7 @@ mod tests {
         assert_eq!(doubtful_only.len(), 1);
         assert_eq!(doubtful_only[0].title, "Doubtful");
 
-        cmd_orb_list(&store, None, None, None, Some(0.5)).unwrap();
+        cmd_orb_list(&store, None, None, None, Some(0.5), None).unwrap();
     }
 
     #[test]
@@ -739,7 +990,7 @@ mod tests {
     #[test]
     fn list_empty_store() {
         let (_dir, store) = temp_orb_store();
-        cmd_orb_list(&store, None, None, None, None).unwrap();
+        cmd_orb_list(&store, None, None, None, None, None).unwrap();
     }
 
     // ── cmd_orb_update ─────────────────────────────────────────

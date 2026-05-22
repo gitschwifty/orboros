@@ -144,6 +144,9 @@ enum Commands {
         #[command(subcommand)]
         action: HooksAction,
     },
+    /// List orbs whose second-opinion reviewer verdict is `Revise`,
+    /// pending operator action.
+    ReviewQueue,
 }
 
 #[derive(Subcommand)]
@@ -225,6 +228,9 @@ enum OrbAction {
         /// Only show orbs whose confidence is at most this value (0.0–1.0).
         #[arg(long)]
         max_confidence: Option<f32>,
+        /// Filter by second-opinion reviewer verdict (accept, reject, revise, any, missing).
+        #[arg(long)]
+        review_status: Option<String>,
     },
     /// Update fields on an existing orb.
     Update {
@@ -490,12 +496,14 @@ fn main() -> anyhow::Result<()> {
                     status,
                     min_confidence,
                     max_confidence,
+                    review_status,
                 } => orb_cmd::cmd_orb_list(
                     &orb_store,
                     orb_type.as_deref(),
                     status.as_deref(),
                     min_confidence,
                     max_confidence,
+                    review_status.as_deref(),
                 ),
                 OrbAction::Update {
                     id,
@@ -564,6 +572,10 @@ fn main() -> anyhow::Result<()> {
                 orboros::hooks::cmd::cmd_hooks_log(&state_dir, orb.as_deref(), limit)
             }
         },
+        Commands::ReviewQueue => {
+            let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
+            orb_cmd::cmd_review_queue(&orb_store)
+        }
     }
 }
 
