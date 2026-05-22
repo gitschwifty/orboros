@@ -44,15 +44,21 @@ pub fn should_review<R: Rng + ?Sized>(orb: &Orb, cfg: &SecondOpinionConfig, rng:
     }
 }
 
-/// Persists the reviewer's report on the orb without changing its
-/// status. Sets `review_report` and, when the verdict is `Revise`,
-/// copies the critique into `review_critique` so downstream prompt
-/// builders can surface it.
+/// Persists the reviewer's report on the orb and, for `Revise`
+/// verdicts, re-enters the pipeline via `Orb::try_begin_revision`.
+/// The critique is copied into `review_critique` so the next
+/// worker's prompt context surfaces it.
 ///
-/// The actual lifecycle re-entry (Done → Active for re-execution,
-/// or Done → Refining for re-decomposition) is deferred to a
-/// separate follow-up that relaxes the terminal-state invariant
-/// and adds a revision counter to prevent infinite loops.
+/// Re-entry routing:
+/// - `Revise { Execution }` → `Orb::try_begin_revision(Execution)`.
+///   Task orbs return to `Active`; phase orbs return to `Executing`.
+/// - `Revise { Decomposition }` → `try_begin_revision(Decomposition)`.
+///   Task orbs return to `Active` (no Refining phase exists for
+///   them); phase orbs return to `Refining`.
+///
+/// When the orb has already hit `MAX_REVISIONS`, the verdict is
+/// still recorded but the orb stays at `Done` and an `on-escalate`
+/// hook fires so external systems can surface it for human review.
 pub fn apply_review_outcome(
     orb: &mut Orb,
     report: orbs::review::ReviewReport,
@@ -62,9 +68,45 @@ pub fn apply_review_outcome(
     if matches!(report.verdict, ReviewVerdict::Revise { .. }) && !report.critique.is_empty() {
         orb.review_critique = Some(report.critique.clone());
     }
+    let revise_scope = match report.verdict {
+        ReviewVerdict::Revise {
+            scope: orbs::review::ReviseScope::Execution,
+        } => Some(orbs::orb::ReviseScope::Execution),
+        ReviewVerdict::Revise {
+            scope: orbs::review::ReviseScope::Decomposition,
+        } => Some(orbs::orb::ReviseScope::Decomposition),
+        _ => None,
+    };
     orb.review_report = Some(report);
+
+    // Always fire the verdict notification hook first.
     if let Some(sink) = hooks {
         let _ = sink.fire_blocking(HookEvent::OnReviewSecondOpinion, FireCtx::for_orb(orb));
+    }
+
+    // For Revise verdicts, attempt re-entry. Cap-exceeded surfaces
+    // via on-escalate so external systems can flag it for humans.
+    if let Some(scope) = revise_scope {
+        match orb.try_begin_revision(scope) {
+            Ok(()) => {
+                tracing::info!(
+                    orb_id = %orb.id,
+                    scope = ?scope,
+                    revision_count = orb.revision_count,
+                    "reviewer Revise: re-entering pipeline",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    orb_id = %orb.id,
+                    error = %e,
+                    "reviewer Revise: re-entry rejected (revision cap or invalid state)",
+                );
+                if let Some(sink) = hooks {
+                    let _ = sink.fire_blocking(HookEvent::OnEscalate, FireCtx::for_orb(orb));
+                }
+            }
+        }
     }
 }
 
@@ -231,9 +273,16 @@ mod tests {
         assert!(o.review_critique.is_none());
     }
 
+    fn done_task_orb() -> Orb {
+        let mut o = Orb::new("t", "d").with_type(OrbType::Task);
+        o.set_status(orbs::orb::OrbStatus::Active).unwrap();
+        o.set_status(orbs::orb::OrbStatus::Done).unwrap();
+        o
+    }
+
     #[test]
-    fn apply_revise_execution_copies_critique() {
-        let mut o = done_orb_with_confidence(None);
+    fn apply_revise_execution_copies_critique_and_re_enters() {
+        let mut o = done_task_orb();
         apply_review_outcome(
             &mut o,
             make_report(
@@ -249,11 +298,14 @@ mod tests {
             o.review_critique.as_deref(),
             Some("wrong tool call sequence")
         );
+        // Task orb: both scopes flow to Active.
+        assert_eq!(o.status, Some(orbs::orb::OrbStatus::Active));
+        assert_eq!(o.revision_count, 1);
     }
 
     #[test]
-    fn apply_revise_decomposition_copies_critique() {
-        let mut o = done_orb_with_confidence(None);
+    fn apply_revise_decomposition_copies_critique_and_re_enters() {
+        let mut o = done_task_orb();
         apply_review_outcome(
             &mut o,
             make_report(
@@ -265,11 +317,13 @@ mod tests {
             None,
         );
         assert_eq!(o.review_critique.as_deref(), Some("missing migration step"));
+        assert_eq!(o.status, Some(orbs::orb::OrbStatus::Active));
+        assert_eq!(o.revision_count, 1);
     }
 
     #[test]
     fn apply_revise_with_empty_critique_does_not_set_field() {
-        let mut o = done_orb_with_confidence(None);
+        let mut o = done_task_orb();
         apply_review_outcome(
             &mut o,
             make_report(
@@ -285,6 +339,28 @@ mod tests {
             o.review_critique.is_none(),
             "empty critique shouldn't write a misleading hint"
         );
+        // Still re-enters even when critique is empty.
+        assert_eq!(o.status, Some(orbs::orb::OrbStatus::Active));
+    }
+
+    #[test]
+    fn apply_revise_at_cap_stays_done_and_skips_re_entry() {
+        let mut o = done_task_orb();
+        o.revision_count = orbs::orb::MAX_REVISIONS;
+        apply_review_outcome(
+            &mut o,
+            make_report(
+                ReviewVerdict::Revise {
+                    scope: ReviseScope::Execution,
+                },
+                "still bad",
+            ),
+            None,
+        );
+        // Verdict was recorded but no re-entry happened.
+        assert!(o.review_report.is_some());
+        assert_eq!(o.status, Some(orbs::orb::OrbStatus::Done));
+        assert_eq!(o.revision_count, orbs::orb::MAX_REVISIONS);
     }
 
     #[cfg(unix)]
@@ -316,19 +392,28 @@ mod tests {
     }
 
     #[test]
-    fn apply_does_not_change_orb_status() {
-        let mut o = done_orb_with_confidence(None);
-        let prior_status = o.status;
+    fn apply_accept_does_not_re_enter() {
+        let mut o = done_task_orb();
         apply_review_outcome(
             &mut o,
-            make_report(
-                ReviewVerdict::Revise {
-                    scope: ReviseScope::Execution,
-                },
-                "x",
-            ),
+            make_report(ReviewVerdict::Accept, "looks fine"),
             None,
         );
-        assert_eq!(o.status, prior_status, "lifecycle re-entry is deferred");
+        // Accept verdicts leave the orb at Done.
+        assert_eq!(o.status, Some(orbs::orb::OrbStatus::Done));
+        assert_eq!(o.revision_count, 0);
+    }
+
+    #[test]
+    fn apply_reject_does_not_re_enter() {
+        let mut o = done_task_orb();
+        apply_review_outcome(
+            &mut o,
+            make_report(ReviewVerdict::Reject, "unrecoverable"),
+            None,
+        );
+        // Reject is terminal — no re-entry attempted.
+        assert_eq!(o.status, Some(orbs::orb::OrbStatus::Done));
+        assert_eq!(o.revision_count, 0);
     }
 }
