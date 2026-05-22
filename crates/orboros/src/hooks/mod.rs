@@ -9,7 +9,9 @@
 pub mod config;
 pub mod event;
 pub mod matcher;
+pub mod runner;
 
 pub use config::{default_paths, ConfigLayer, HookEntry, HookMatch, HooksConfig};
 pub use event::{HookEvent, HookEventParseError};
 pub use matcher::{matches, MatcherCtx};
+pub use runner::{fire, preview, FireCtx, FireOutcome, HookInvocation, HookPreview};
