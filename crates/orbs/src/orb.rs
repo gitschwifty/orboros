@@ -212,6 +212,17 @@ pub struct Orb {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f32>,
 
+    /// Second-opinion reviewer's report on the result, if a reviewer
+    /// has run. See [`crate::review::ReviewReport`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_report: Option<crate::review::ReviewReport>,
+
+    /// Free-form critique attached to the orb when the reviewer
+    /// returns a `Revise` verdict. The pipeline carries this forward
+    /// into the next worker's prompt context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_critique: Option<String>,
+
     // ── HITL ─────────────────────────────────────────────────
     #[serde(default)]
     pub requires_approval: bool,
@@ -282,6 +293,8 @@ impl Orb {
             execution: None,
             result: None,
             confidence: None,
+            review_report: None,
+            review_critique: None,
             requires_approval: false,
             external_ref: None,
             preferred_model: None,
@@ -625,6 +638,37 @@ mod tests {
         assert!(json.contains("\"confidence\":0.75"));
         let round_tripped: Orb = serde_json::from_str(&json).unwrap();
         assert_eq!(round_tripped.confidence, Some(0.75));
+    }
+
+    #[test]
+    fn review_report_round_trips_on_orb() {
+        use crate::review::{ReviewReport, ReviewVerdict, ReviseScope};
+        let mut orb = Orb::new("Reviewed orb", "do x");
+        orb.review_report = Some(ReviewReport {
+            verdict: ReviewVerdict::Revise {
+                scope: ReviseScope::Execution,
+            },
+            critique: "missed the edge case".into(),
+            suggested_changes: None,
+            reviewer_model: "m".into(),
+            reviewed_at: chrono::Utc::now(),
+            reviewer_orb_id: None,
+        });
+        orb.review_critique = Some("missed the edge case".into());
+        let json = serde_json::to_string(&orb).unwrap();
+        assert!(json.contains("review_report"));
+        assert!(json.contains("review_critique"));
+        let round_tripped: Orb = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.review_report, orb.review_report);
+        assert_eq!(round_tripped.review_critique, orb.review_critique);
+    }
+
+    #[test]
+    fn review_fields_omitted_when_none() {
+        let orb = Orb::new("Plain orb", "do y");
+        let json = serde_json::to_string(&orb).unwrap();
+        assert!(!json.contains("review_report"));
+        assert!(!json.contains("review_critique"));
     }
 
     #[test]

@@ -10,6 +10,7 @@ pub mod id;
 pub mod orb;
 pub mod orb_store;
 pub mod pipeline;
+pub mod review;
 pub mod session;
 pub mod session_store;
 pub mod store;
