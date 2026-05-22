@@ -243,8 +243,10 @@ pub async fn run_daemon(
                     tracing::warn!("log rotation failed: {e}");
                 }
 
-                // Run a tick (state transitions only)
-                match queue.tick() {
+                // Run a tick (state transitions only). Uses the
+                // async path so `pre-/post-phase-transition` hooks
+                // fire around each phase change.
+                match queue.tick_async().await {
                     Ok(result) => {
                         if !result.is_idle() {
                             tracing::debug!(
