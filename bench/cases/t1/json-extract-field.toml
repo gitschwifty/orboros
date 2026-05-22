@@ -1,0 +1,21 @@
+id = "json-extract-field"
+tier = "t1"
+name = "Extracts a field from a small JSON object"
+description = """
+Worker is given a JSON object and asked for the value of a specific
+field. Exact match — leaves no room for chattiness.
+"""
+prompt = """
+Given this JSON, return ONLY the value of the `version` field. No quotes,
+no commentary, no surrounding text.
+
+  {
+    "name": "demo",
+    "version": "1.4.2",
+    "license": "MIT"
+  }
+"""
+
+[expected]
+kind = "exact"
+text = "1.4.2"

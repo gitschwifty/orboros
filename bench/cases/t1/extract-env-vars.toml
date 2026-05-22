@@ -1,0 +1,23 @@
+id = "extract-env-vars"
+tier = "t1"
+name = "Lists env vars referenced in a snippet"
+description = """
+Worker is given a small bash/python-ish snippet and must enumerate every
+environment variable referenced. Exercises basic extraction over a
+short input with no LLM-style chattiness.
+"""
+prompt = """
+List every environment variable referenced in the snippet below, one per
+line, sorted alphabetically. Output only the names — no $, no commentary.
+
+  DATABASE_URL=$DATABASE_URL
+  if [ -z "$API_KEY" ]; then echo "missing API_KEY"; fi
+  export LOG_LEVEL=${LOG_LEVEL:-info}
+  port=${PORT}
+"""
+
+[expected]
+kind = "regex"
+# Must contain all four names; order within the output is enforced by
+# the alphabetical instruction but we keep the matcher permissive.
+pattern = "(?s)API_KEY.*DATABASE_URL.*LOG_LEVEL.*PORT"

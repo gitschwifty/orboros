@@ -177,6 +177,34 @@ async fn run_t1_writes_results_and_summary_to_store() {
         .any(|r| r.case_id == "c2" && r.status == BenchStatus::Fail));
 }
 
+#[test]
+fn shipped_t1_corpus_loads_cleanly() {
+    // Verifies every TOML file under bench/cases/t1/ parses against
+    // the BenchCase schema. Catches typos in shipped corpus files
+    // before they break a real benchmark run.
+    use orboros::bench::case::{load_tier, BenchTier};
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root");
+    let cases_root = repo_root.join("bench").join("cases");
+    let cases = load_tier(&cases_root, BenchTier::T1).unwrap();
+    assert!(
+        cases.len() >= 3,
+        "expected at least 3 shipped T1 cases, got {}",
+        cases.len()
+    );
+    for c in &cases {
+        assert_eq!(c.tier, BenchTier::T1, "case {} has wrong tier", c.id);
+        assert!(
+            !c.prompt.trim().is_empty(),
+            "case {} has empty prompt",
+            c.id
+        );
+    }
+}
+
 #[tokio::test]
 async fn t1_case_uses_default_pass_threshold_2_of_3() {
     // Mock worker always returns "hello" — verify all 3 attempts run
