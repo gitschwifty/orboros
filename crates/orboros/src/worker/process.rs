@@ -78,6 +78,9 @@ pub struct SendOutcome {
     pub tool_latency_ms: Option<u64>,
     /// Total latency reported by the harness (ms).
     pub total_latency_ms: Option<u64>,
+    /// Worker-reported confidence in the result (0.0–1.0), clamped on the
+    /// orchestrator side. None when the worker doesn't report one.
+    pub confidence: Option<f32>,
 }
 
 /// Handle for sending a cancel request to a running worker.
@@ -349,6 +352,7 @@ impl Worker {
                     model_latency_ms,
                     tool_latency_ms,
                     total_latency_ms,
+                    confidence,
                     ..
                 } => {
                     return Ok(SendOutcome {
@@ -363,6 +367,7 @@ impl Worker {
                         model_latency_ms,
                         tool_latency_ms,
                         total_latency_ms,
+                        confidence: clamp_confidence(confidence),
                     });
                 }
                 other => {
@@ -499,6 +504,7 @@ impl Worker {
                     model_latency_ms,
                     tool_latency_ms,
                     total_latency_ms,
+                    confidence,
                     ..
                 } => {
                     return Ok(SendOutcome {
@@ -513,6 +519,7 @@ impl Worker {
                         model_latency_ms,
                         tool_latency_ms,
                         total_latency_ms,
+                        confidence: clamp_confidence(confidence),
                     });
                 }
                 _ => {} // ignore other responses during cancel drain
@@ -521,9 +528,49 @@ impl Worker {
     }
 }
 
+/// Clamps worker-reported confidence into `[0.0, 1.0]`. Returns `None` for
+/// out-of-range or non-finite values with a `warn!` — a buggy model
+/// emitting `1.2` or `NaN` shouldn't fail the whole orb.
+fn clamp_confidence(value: Option<f32>) -> Option<f32> {
+    let v = value?;
+    if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+        tracing::warn!(
+            value = v,
+            "worker-reported confidence out of range [0.0, 1.0]; discarding"
+        );
+        return None;
+    }
+    Some(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamp_confidence_passes_in_range_values() {
+        assert_eq!(clamp_confidence(Some(0.0)), Some(0.0));
+        assert_eq!(clamp_confidence(Some(0.5)), Some(0.5));
+        assert_eq!(clamp_confidence(Some(1.0)), Some(1.0));
+    }
+
+    #[test]
+    fn clamp_confidence_rejects_out_of_range() {
+        assert_eq!(clamp_confidence(Some(-0.1)), None);
+        assert_eq!(clamp_confidence(Some(1.5)), None);
+    }
+
+    #[test]
+    fn clamp_confidence_rejects_non_finite() {
+        assert_eq!(clamp_confidence(Some(f32::NAN)), None);
+        assert_eq!(clamp_confidence(Some(f32::INFINITY)), None);
+        assert_eq!(clamp_confidence(Some(f32::NEG_INFINITY)), None);
+    }
+
+    #[test]
+    fn clamp_confidence_passes_through_none() {
+        assert_eq!(clamp_confidence(None), None);
+    }
 
     fn mock_worker_config() -> WorkerConfig {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

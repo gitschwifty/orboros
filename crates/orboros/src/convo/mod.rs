@@ -531,6 +531,7 @@ mod tests {
             model_latency_ms: None,
             tool_latency_ms: None,
             total_latency_ms: None,
+            confidence: None,
         };
         assert_eq!(turn_status_for(&outcome), TurnStatus::Ok);
         outcome.status = ResultStatus::Cancelled;
