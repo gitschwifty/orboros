@@ -12,4 +12,5 @@
 //! list / run / show / compare / calibration`.
 
 pub mod case;
+pub mod runner;
 pub mod store;
