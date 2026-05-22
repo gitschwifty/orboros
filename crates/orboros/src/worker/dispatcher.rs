@@ -106,11 +106,14 @@ pub async fn dispatch_orb(
     worker_config: &WorkerConfig,
     hooks: Option<&HookSink>,
 ) -> anyhow::Result<DispatchOutcome> {
-    // 1. pre-worker-spawn — synchronous, gating. Exit 2 from any
-    //    matching hook short-circuits before we spawn anything.
+    // 1. pre-worker-spawn — gating. Exit 2 from any matching hook
+    //    short-circuits before we spawn anything. We're already in
+    //    async context, so use `fire` directly (not `fire_blocking`,
+    //    which would try to nest a runtime).
     if let Some(sink) = hooks {
-        let (outcome, _invocations) =
-            sink.fire_blocking(HookEvent::PreWorkerSpawn, FireCtx::for_orb(orb))?;
+        let (outcome, _invocations) = sink
+            .fire(HookEvent::PreWorkerSpawn, FireCtx::for_orb(orb))
+            .await;
         if let FireOutcome::Aborted {
             hook_name,
             exit_code,
@@ -181,15 +184,9 @@ pub async fn dispatch_orb(
         } else {
             HookEvent::PostWorkerFail
         };
-        // Best-effort — don't fail dispatch over a post-hook error.
-        if let Err(e) = sink.fire_blocking(event, FireCtx::for_orb(orb)) {
-            warn!(
-                orb = %orb.id,
-                event = %event,
-                error = %e,
-                "post-worker hook fire failed (non-fatal)",
-            );
-        }
+        // Best-effort — never propagate a post-hook outcome. We're
+        // already in async context.
+        let _ = sink.fire(event, FireCtx::for_orb(orb)).await;
     }
 
     Ok(outcome)

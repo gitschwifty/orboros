@@ -118,3 +118,135 @@ async fn dispatch_with_spawn_failure_returns_failed_status() {
     assert!(outcome.error.is_some());
     assert!(outcome.response.is_none());
 }
+
+// ── Hook firing (60.7) ───────────────────────────────────────────
+
+use orboros::hooks::sink::HookSink;
+
+fn write_hooks_toml(state_dir: &Path, body: &str) {
+    fs::write(state_dir.join("hooks.toml"), body).unwrap();
+}
+
+#[tokio::test]
+async fn dispatch_fires_pre_and_post_complete_hooks_on_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path();
+    let script = write_worker_script(state_dir, "ok.sh", "yay", Some(0.9));
+    let wc = worker_config(&script);
+
+    write_hooks_toml(
+        state_dir,
+        r#"
+        [[hook]]
+        name = "pre-marker"
+        on = "pre-worker-spawn"
+        run = "true"
+        sync = true
+
+        [[hook]]
+        name = "post-complete-marker"
+        on = "post-worker-complete"
+        run = "true"
+        sync = true
+        "#,
+    );
+    let sink = HookSink::from_state_dir(state_dir, state_dir)
+        .unwrap()
+        .expect("hooks loaded");
+    let orb = active_orb();
+
+    let outcome = dispatch_orb(&orb, "x", &wc, Some(&sink)).await.unwrap();
+    assert_eq!(outcome.status, DispatchStatus::Done);
+
+    let log = fs::read_to_string(state_dir.join("hooks.log.jsonl")).unwrap_or_default();
+    assert!(
+        log.contains("pre-marker"),
+        "pre hook should have fired: {log}"
+    );
+    assert!(
+        log.contains("post-complete-marker"),
+        "post-complete hook should have fired: {log}"
+    );
+}
+
+#[tokio::test]
+async fn dispatch_fires_post_fail_hook_on_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path();
+    let bogus = state_dir.join("does-not-exist.sh");
+    let mut wc = worker_config(&bogus);
+    wc.command = bogus.to_string_lossy().into();
+    wc.args = vec![];
+
+    write_hooks_toml(
+        state_dir,
+        r#"
+        [[hook]]
+        name = "fail-marker"
+        on = "post-worker-fail"
+        run = "true"
+        sync = true
+        "#,
+    );
+    let sink = HookSink::from_state_dir(state_dir, state_dir)
+        .unwrap()
+        .unwrap();
+    let orb = active_orb();
+
+    let outcome = dispatch_orb(&orb, "x", &wc, Some(&sink)).await.unwrap();
+    assert_eq!(outcome.status, DispatchStatus::Failed);
+
+    let log = fs::read_to_string(state_dir.join("hooks.log.jsonl")).unwrap_or_default();
+    assert!(
+        log.contains("fail-marker"),
+        "post-fail hook should have fired: {log}"
+    );
+}
+
+#[tokio::test]
+async fn pre_worker_spawn_exit_2_short_circuits_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path();
+    // Worker script that would always succeed, but we'll never reach it.
+    let script = write_worker_script(state_dir, "ok.sh", "should not be reached", None);
+    let wc = worker_config(&script);
+
+    let block = state_dir.join("block.sh");
+    fs::write(&block, "#!/bin/sh\nexit 2\n").unwrap();
+    let mut perms = fs::metadata(&block).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&block, perms).unwrap();
+
+    write_hooks_toml(
+        state_dir,
+        &format!(
+            r#"
+            [[hook]]
+            name = "blocker"
+            on = "pre-worker-spawn"
+            run = "{}"
+            sync = true
+            "#,
+            block.display()
+        ),
+    );
+    let sink = HookSink::from_state_dir(state_dir, state_dir)
+        .unwrap()
+        .unwrap();
+    let orb = active_orb();
+
+    let outcome = dispatch_orb(&orb, "x", &wc, Some(&sink)).await.unwrap();
+    assert_eq!(outcome.status, DispatchStatus::Aborted);
+    assert!(outcome.response.is_none());
+    assert!(
+        outcome.error.as_deref().unwrap().contains("blocker"),
+        "error should name the aborting hook: {:?}",
+        outcome.error,
+    );
+
+    // Apply is a no-op for Aborted; orb state shouldn't have moved.
+    let mut orb = orb;
+    let prior = orb.status;
+    apply_dispatch_outcome(&mut orb, &outcome).unwrap();
+    assert_eq!(orb.status, prior, "Aborted outcome leaves orb untouched");
+}
