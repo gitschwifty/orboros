@@ -204,6 +204,14 @@ pub struct Orb {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
 
+    /// Worker-reported confidence in the result, clamped to [0.0, 1.0].
+    /// Set when the worker self-reports via IPC field or the
+    /// `CONFIDENCE: X.XX` line in its response. Pairs with the
+    /// second-opinion reviewer (task 58) and the benchmark
+    /// calibration analysis (task 59).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
+
     // ── HITL ─────────────────────────────────────────────────
     #[serde(default)]
     pub requires_approval: bool,
@@ -273,6 +281,7 @@ impl Orb {
             delete_reason: None,
             execution: None,
             result: None,
+            confidence: None,
             requires_approval: false,
             external_ref: None,
             preferred_model: None,
@@ -603,8 +612,29 @@ mod tests {
         assert_eq!(orb.orb_type, OrbType::Task);
         assert_eq!(orb.priority, 3);
         assert!(orb.result.is_none());
+        assert!(orb.confidence.is_none());
         assert!(orb.parent_id.is_none());
         assert!(orb.id.as_str().starts_with("orb-"));
+    }
+
+    #[test]
+    fn confidence_round_trips_through_serde() {
+        let mut orb = Orb::new("Test orb", "Do something");
+        orb.confidence = Some(0.75);
+        let json = serde_json::to_string(&orb).unwrap();
+        assert!(json.contains("\"confidence\":0.75"));
+        let round_tripped: Orb = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.confidence, Some(0.75));
+    }
+
+    #[test]
+    fn confidence_none_omitted_in_serde() {
+        let orb = Orb::new("Test orb", "Do something");
+        let json = serde_json::to_string(&orb).unwrap();
+        assert!(
+            !json.contains("confidence"),
+            "None confidence should be omitted: {json}"
+        );
     }
 
     #[test]

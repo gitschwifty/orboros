@@ -133,6 +133,8 @@ pub struct SubtaskOutcome {
     pub tool_latency_ms: Option<u64>,
     /// Total latency reported by the harness (ms).
     pub total_latency_ms: Option<u64>,
+    /// Worker-reported confidence (0.0–1.0), already clamped.
+    pub confidence: Option<f32>,
 }
 
 /// Extracts tool names from `PermissionDenied` events.
@@ -189,6 +191,7 @@ async fn run_worker_once(
         model_latency_ms: None,
         tool_latency_ms: None,
         total_latency_ms: None,
+        confidence: None,
     };
 
     let mut fsm = WorkerFsm::new(config.clone());
@@ -245,6 +248,7 @@ async fn run_worker_once(
         model_latency_ms: outcome.model_latency_ms,
         tool_latency_ms: outcome.tool_latency_ms,
         total_latency_ms: outcome.total_latency_ms,
+        confidence: outcome.confidence,
     }
 }
 
@@ -435,6 +439,7 @@ mod tests {
             model_latency_ms: None,
             tool_latency_ms: None,
             total_latency_ms: None,
+            confidence: None,
         };
         assert!(outcome.permission_denials.is_empty());
     }

@@ -105,6 +105,12 @@ pub enum IpcResponse {
         tool_latency_ms: Option<u64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         total_latency_ms: Option<u64>,
+        /// Worker-reported confidence in the result (0.0–1.0).
+        /// Optional and forward-compatible — older heddle workers
+        /// won't send it. A fallback parser in the orchestrator
+        /// also extracts `CONFIDENCE: X.XX` from the response body.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confidence: Option<f32>,
     },
     StatusOk {
         id: String,
@@ -300,6 +306,7 @@ mod tests {
             model_latency_ms: None,
             tool_latency_ms: None,
             total_latency_ms: None,
+            confidence: Some(0.85),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
@@ -327,6 +334,7 @@ mod tests {
             model_latency_ms: None,
             tool_latency_ms: None,
             total_latency_ms: None,
+            confidence: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: IpcResponse = serde_json::from_str(&json).unwrap();

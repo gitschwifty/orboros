@@ -78,6 +78,9 @@ pub struct SendOutcome {
     pub tool_latency_ms: Option<u64>,
     /// Total latency reported by the harness (ms).
     pub total_latency_ms: Option<u64>,
+    /// Worker-reported confidence in the result (0.0–1.0), clamped on the
+    /// orchestrator side. None when the worker doesn't report one.
+    pub confidence: Option<f32>,
 }
 
 /// Handle for sending a cancel request to a running worker.
@@ -341,7 +344,7 @@ impl Worker {
                 IpcResponse::Result {
                     id: result_id,
                     status,
-                    response,
+                    mut response,
                     tool_calls_made,
                     usage,
                     iterations,
@@ -349,8 +352,10 @@ impl Worker {
                     model_latency_ms,
                     tool_latency_ms,
                     total_latency_ms,
+                    confidence,
                     ..
                 } => {
+                    let confidence = resolve_confidence(confidence, &mut response);
                     return Ok(SendOutcome {
                         id: result_id,
                         status,
@@ -363,6 +368,7 @@ impl Worker {
                         model_latency_ms,
                         tool_latency_ms,
                         total_latency_ms,
+                        confidence,
                     });
                 }
                 other => {
@@ -491,7 +497,7 @@ impl Worker {
                 IpcResponse::Result {
                     id,
                     status,
-                    response,
+                    mut response,
                     tool_calls_made,
                     usage,
                     iterations,
@@ -499,8 +505,10 @@ impl Worker {
                     model_latency_ms,
                     tool_latency_ms,
                     total_latency_ms,
+                    confidence,
                     ..
                 } => {
+                    let confidence = resolve_confidence(confidence, &mut response);
                     return Ok(SendOutcome {
                         id,
                         status,
@@ -513,6 +521,7 @@ impl Worker {
                         model_latency_ms,
                         tool_latency_ms,
                         total_latency_ms,
+                        confidence,
                     });
                 }
                 _ => {} // ignore other responses during cancel drain
@@ -521,9 +530,172 @@ impl Worker {
     }
 }
 
+/// Clamps worker-reported confidence into `[0.0, 1.0]`. Returns `None` for
+/// out-of-range or non-finite values with a `warn!` — a buggy model
+/// emitting `1.2` or `NaN` shouldn't fail the whole orb.
+fn clamp_confidence(value: Option<f32>) -> Option<f32> {
+    let v = value?;
+    if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+        tracing::warn!(
+            value = v,
+            "worker-reported confidence out of range [0.0, 1.0]; discarding"
+        );
+        return None;
+    }
+    Some(v)
+}
+
+/// Resolves the final confidence value for a `SendOutcome`.
+///
+/// Prefers the structured IPC field when present. Otherwise scans the
+/// response for a trailing `CONFIDENCE: 0.NN` line (case-insensitive)
+/// and, if found, removes the line from `response`. Mirrors the same
+/// out-of-range handling as [`clamp_confidence`].
+///
+/// Older heddle workers won't include the IPC field, so the line
+/// parser is the forward-compatibility path until the protocol bump
+/// makes it required.
+pub(crate) fn resolve_confidence(
+    ipc_value: Option<f32>,
+    response: &mut Option<String>,
+) -> Option<f32> {
+    if let Some(v) = clamp_confidence(ipc_value) {
+        return Some(v);
+    }
+    let Some(body) = response.as_mut() else {
+        return None;
+    };
+    let Some((value, rewritten)) = extract_confidence_line(body) else {
+        return None;
+    };
+    *body = rewritten;
+    clamp_confidence(Some(value))
+}
+
+/// Finds the last `CONFIDENCE: N.NN` line in `text` (case-insensitive
+/// on the label, lenient on whitespace) and returns the parsed value
+/// plus the text with that line removed. Trailing whitespace is also
+/// trimmed off the result.
+fn extract_confidence_line(text: &str) -> Option<(f32, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let idx = lines.iter().rposition(|line| {
+        let trimmed = line.trim_start();
+        trimmed.len() >= 11 && trimmed.as_bytes()[..11].eq_ignore_ascii_case(b"confidence:")
+    })?;
+    let value_str = lines[idx].trim_start()[11..].trim();
+    let value: f32 = value_str.parse().ok()?;
+    let mut kept: Vec<&str> = Vec::with_capacity(lines.len() - 1);
+    kept.extend_from_slice(&lines[..idx]);
+    kept.extend_from_slice(&lines[idx + 1..]);
+    let mut out = kept.join("\n");
+    let trimmed_end = out.trim_end().len();
+    out.truncate(trimmed_end);
+    Some((value, out))
+}
+
+/// System-prompt addendum asking the worker to self-report confidence
+/// as a trailing `CONFIDENCE: 0.NN` line. Append after any task-specific
+/// instructions so the line ends up at the bottom of the response.
+pub const CONFIDENCE_PROMPT_ADDENDUM: &str = "\n\nAt the end of your response, on its own line, include a single line in this exact format:\n  CONFIDENCE: 0.NN\nwhere 0.NN is your confidence between 0.00 (no confidence) and 1.00 (certain) that the result satisfies the task. Be honest — low confidence routes the result for a second-opinion review.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clamp_confidence_passes_in_range_values() {
+        assert_eq!(clamp_confidence(Some(0.0)), Some(0.0));
+        assert_eq!(clamp_confidence(Some(0.5)), Some(0.5));
+        assert_eq!(clamp_confidence(Some(1.0)), Some(1.0));
+    }
+
+    #[test]
+    fn clamp_confidence_rejects_out_of_range() {
+        assert_eq!(clamp_confidence(Some(-0.1)), None);
+        assert_eq!(clamp_confidence(Some(1.5)), None);
+    }
+
+    #[test]
+    fn clamp_confidence_rejects_non_finite() {
+        assert_eq!(clamp_confidence(Some(f32::NAN)), None);
+        assert_eq!(clamp_confidence(Some(f32::INFINITY)), None);
+        assert_eq!(clamp_confidence(Some(f32::NEG_INFINITY)), None);
+    }
+
+    #[test]
+    fn clamp_confidence_passes_through_none() {
+        assert_eq!(clamp_confidence(None), None);
+    }
+
+    #[test]
+    fn extract_confidence_line_parses_trailing_line() {
+        let text = "Here is the answer.\nIt is 42.\nCONFIDENCE: 0.85";
+        let (value, rest) = extract_confidence_line(text).unwrap();
+        assert!((value - 0.85).abs() < f32::EPSILON);
+        assert_eq!(rest, "Here is the answer.\nIt is 42.");
+    }
+
+    #[test]
+    fn extract_confidence_line_is_case_insensitive_on_label() {
+        let text = "Result.\nconfidence: 0.5";
+        let (value, rest) = extract_confidence_line(text).unwrap();
+        assert!((value - 0.5).abs() < f32::EPSILON);
+        assert_eq!(rest, "Result.");
+    }
+
+    #[test]
+    fn extract_confidence_line_uses_last_match_when_multiple() {
+        let text = "CONFIDENCE: 0.1 (a guess)\nFinal answer.\nCONFIDENCE: 0.9";
+        let (value, rest) = extract_confidence_line(text).unwrap();
+        assert!((value - 0.9).abs() < f32::EPSILON);
+        assert!(rest.contains("CONFIDENCE: 0.1 (a guess)"));
+        assert!(rest.ends_with("Final answer."));
+    }
+
+    #[test]
+    fn extract_confidence_line_returns_none_when_missing() {
+        assert!(extract_confidence_line("no confidence here").is_none());
+    }
+
+    #[test]
+    fn extract_confidence_line_returns_none_for_unparseable_value() {
+        assert!(extract_confidence_line("CONFIDENCE: high").is_none());
+    }
+
+    #[test]
+    fn resolve_confidence_prefers_ipc_value() {
+        let mut response = Some("body\nCONFIDENCE: 0.1".to_string());
+        let resolved = resolve_confidence(Some(0.9), &mut response);
+        assert_eq!(resolved, Some(0.9));
+        // Response is NOT modified when IPC field wins.
+        assert_eq!(response.as_deref(), Some("body\nCONFIDENCE: 0.1"));
+    }
+
+    #[test]
+    fn resolve_confidence_falls_back_to_line_parser() {
+        let mut response = Some("body\nCONFIDENCE: 0.42".to_string());
+        let resolved = resolve_confidence(None, &mut response);
+        assert_eq!(resolved, Some(0.42));
+        assert_eq!(response.as_deref(), Some("body"));
+    }
+
+    #[test]
+    fn resolve_confidence_clamps_line_parsed_value() {
+        let mut response = Some("body\nCONFIDENCE: 1.5".to_string());
+        let resolved = resolve_confidence(None, &mut response);
+        // Out-of-range discarded; line is still stripped (the parser
+        // matched it, value was just bad).
+        assert_eq!(resolved, None);
+        assert_eq!(response.as_deref(), Some("body"));
+    }
+
+    #[test]
+    fn resolve_confidence_returns_none_when_no_signal_anywhere() {
+        let mut response = Some("plain response".to_string());
+        let resolved = resolve_confidence(None, &mut response);
+        assert_eq!(resolved, None);
+        assert_eq!(response.as_deref(), Some("plain response"));
+    }
 
     fn mock_worker_config() -> WorkerConfig {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -545,6 +717,37 @@ mod tests {
             task_id: None,
             worker_id: None,
         }
+    }
+
+    fn confidence_mock_worker_config() -> WorkerConfig {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        WorkerConfig {
+            command: "bash".into(),
+            args: vec![manifest_dir
+                .join("test-fixtures/mock-worker-confidence.sh")
+                .to_string_lossy()
+                .into()],
+            cwd: None,
+            env: vec![],
+            model: "mock/test".into(),
+            system_prompt: "You are a test assistant.".into(),
+            tools: vec![],
+            max_iterations: None,
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn confidence_from_ipc_field_flows_into_send_outcome() {
+        let config = confidence_mock_worker_config();
+        let mut worker = Worker::spawn(&config).await.unwrap();
+        let outcome = worker.send("req-1", "ping").await.unwrap();
+        assert_eq!(outcome.confidence, Some(0.73));
+        let _ = worker.shutdown().await;
     }
 
     fn cancel_mock_worker_config() -> WorkerConfig {

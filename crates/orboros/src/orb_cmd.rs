@@ -162,6 +162,9 @@ pub fn cmd_orb_show(store: &OrbStore, id: &str) -> anyhow::Result<()> {
             if let Some(ref result) = orb.result {
                 println!("Result:      {result}");
             }
+            if let Some(confidence) = orb.confidence {
+                println!("Confidence:  {confidence:.2}");
+            }
             if orb.is_tombstoned() {
                 println!(
                     "DELETED:     {}",
@@ -188,6 +191,8 @@ pub fn cmd_orb_list(
     store: &OrbStore,
     filter_type: Option<&str>,
     filter_status: Option<&str>,
+    min_confidence: Option<f32>,
+    max_confidence: Option<f32>,
 ) -> anyhow::Result<()> {
     let mut orbs = store.load_all().context("failed to load orbs")?;
 
@@ -201,6 +206,14 @@ pub fn cmd_orb_list(
         orbs.retain(|o| o.status == Some(status));
     }
 
+    if let Some(min) = min_confidence {
+        orbs.retain(|o| o.confidence.is_some_and(|c| c >= min));
+    }
+
+    if let Some(max) = max_confidence {
+        orbs.retain(|o| o.confidence.is_some_and(|c| c <= max));
+    }
+
     if orbs.is_empty() {
         println!("No orbs found.");
     } else {
@@ -212,9 +225,12 @@ pub fn cmd_orb_list(
             } else {
                 "Unknown".to_string()
             };
+            let conf = orb
+                .confidence
+                .map_or(String::new(), |c| format!(" conf={c:.2}"));
             println!(
-                "[{lifecycle}] {} — {} ({:?}, p{})",
-                orb.id, orb.title, orb.orb_type, orb.priority
+                "[{lifecycle}] {} — {} ({:?}, p{}){}",
+                orb.id, orb.title, orb.orb_type, orb.priority, conf
             );
         }
         println!("\n{} orb(s)", orbs.len());
@@ -228,6 +244,7 @@ pub fn cmd_orb_list(
 ///
 /// Returns an error if the orb is not found, the status string is invalid,
 /// or the store write fails.
+#[allow(clippy::too_many_arguments)]
 pub fn cmd_orb_update(
     store: &OrbStore,
     id: &str,
@@ -235,6 +252,7 @@ pub fn cmd_orb_update(
     description: Option<&str>,
     priority: Option<u8>,
     status: Option<&str>,
+    confidence: Option<f32>,
     hooks: Option<&HookSink>,
 ) -> anyhow::Result<()> {
     let orb_id = OrbId::from_raw(id);
@@ -243,6 +261,7 @@ pub fn cmd_orb_update(
         .context("failed to load orb")?
         .ok_or_else(|| anyhow::anyhow!("orb {id} not found"))?;
     let prior_status = orb.status;
+    let prior_confidence = orb.confidence;
 
     if let Some(t) = title {
         orb.title = t.to_string();
@@ -258,10 +277,28 @@ pub fn cmd_orb_update(
         orb.set_status(new_status)
             .with_context(|| format!("invalid status transition to {new_status:?}"))?;
     }
+    if let Some(c) = confidence {
+        if !c.is_finite() || !(0.0..=1.0).contains(&c) {
+            return Err(anyhow::anyhow!(
+                "confidence must be a finite value in [0.0, 1.0]; got {c}"
+            ));
+        }
+        orb.confidence = Some(c);
+    }
     orb.updated_at = chrono::Utc::now();
     orb.update_content_hash();
 
     store.update(&orb).context("failed to persist orb update")?;
+
+    if let (Some(new_c), prior) = (orb.confidence, prior_confidence) {
+        if prior != Some(new_c) {
+            tracing::info!(
+                orb_id = %orb.id,
+                confidence = new_c,
+                "confidence recorded on orb",
+            );
+        }
+    }
 
     println!("Updated orb {}", orb.id);
 
@@ -586,7 +623,64 @@ mod tests {
         cmd_orb_create(&store, "One", "first", OrbType::Task, 3, None).unwrap();
         cmd_orb_create(&store, "Two", "second", OrbType::Bug, 2, None).unwrap();
         // Should list both
-        cmd_orb_list(&store, None, None).unwrap();
+        cmd_orb_list(&store, None, None, None, None).unwrap();
+    }
+
+    #[test]
+    fn list_min_confidence_filters_below_threshold() {
+        let (_dir, store) = temp_orb_store();
+        let orb = cmd_orb_create(&store, "Low", "x", OrbType::Task, 3, None).unwrap();
+        let mut low = orb;
+        low.confidence = Some(0.3);
+        store.update(&low).unwrap();
+        let orb2 = cmd_orb_create(&store, "High", "y", OrbType::Task, 3, None).unwrap();
+        let mut high = orb2;
+        high.confidence = Some(0.9);
+        store.update(&high).unwrap();
+        let orb3 = cmd_orb_create(&store, "None", "z", OrbType::Task, 3, None).unwrap();
+
+        // Sanity-check the filter logic the CLI uses.
+        let all = store.load_all().unwrap();
+        let above_half: Vec<_> = all
+            .iter()
+            .filter(|o| o.confidence.is_some_and(|c| c >= 0.7))
+            .collect();
+        assert_eq!(above_half.len(), 1);
+        assert_eq!(above_half[0].title, "High");
+
+        // CLI command should not error.
+        cmd_orb_list(&store, None, None, Some(0.7), None).unwrap();
+
+        // The None-confidence orb is excluded even by lax threshold.
+        let any_conf: Vec<_> = all
+            .iter()
+            .filter(|o| o.confidence.is_some_and(|c| c >= 0.0))
+            .collect();
+        assert_eq!(any_conf.len(), 2);
+        assert!(!any_conf.iter().any(|o| o.id == orb3.id));
+    }
+
+    #[test]
+    fn list_max_confidence_excludes_high_scores() {
+        let (_dir, store) = temp_orb_store();
+        let orb = cmd_orb_create(&store, "Doubtful", "x", OrbType::Task, 3, None).unwrap();
+        let mut doubtful = orb;
+        doubtful.confidence = Some(0.2);
+        store.update(&doubtful).unwrap();
+        let orb2 = cmd_orb_create(&store, "Sure", "y", OrbType::Task, 3, None).unwrap();
+        let mut sure = orb2;
+        sure.confidence = Some(0.95);
+        store.update(&sure).unwrap();
+
+        let all = store.load_all().unwrap();
+        let doubtful_only: Vec<_> = all
+            .iter()
+            .filter(|o| o.confidence.is_some_and(|c| c <= 0.5))
+            .collect();
+        assert_eq!(doubtful_only.len(), 1);
+        assert_eq!(doubtful_only[0].title, "Doubtful");
+
+        cmd_orb_list(&store, None, None, None, Some(0.5)).unwrap();
     }
 
     #[test]
@@ -645,7 +739,7 @@ mod tests {
     #[test]
     fn list_empty_store() {
         let (_dir, store) = temp_orb_store();
-        cmd_orb_list(&store, None, None).unwrap();
+        cmd_orb_list(&store, None, None, None, None).unwrap();
     }
 
     // ── cmd_orb_update ─────────────────────────────────────────
@@ -664,6 +758,7 @@ mod tests {
             Some(1),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -679,7 +774,7 @@ mod tests {
         let orb = cmd_orb_create(&store, "Orb", "desc", OrbType::Task, 3, None).unwrap();
         let id = orb.id.as_str().to_string();
 
-        cmd_orb_update(&store, &id, None, None, None, Some("active"), None).unwrap();
+        cmd_orb_update(&store, &id, None, None, None, Some("active"), None, None).unwrap();
 
         let loaded = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
         assert_eq!(loaded.status, Some(OrbStatus::Active));
@@ -688,8 +783,46 @@ mod tests {
     #[test]
     fn update_nonexistent_orb_errors() {
         let (_dir, store) = temp_orb_store();
-        let result = cmd_orb_update(&store, "orb-nope", Some("new"), None, None, None, None);
+        let result = cmd_orb_update(
+            &store,
+            "orb-nope",
+            Some("new"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn update_confidence_persists_value() {
+        let (_dir, store) = temp_orb_store();
+        let orb = cmd_orb_create(&store, "Orb", "desc", OrbType::Task, 3, None).unwrap();
+        let id = orb.id.as_str().to_string();
+
+        cmd_orb_update(&store, &id, None, None, None, None, Some(0.65), None).unwrap();
+
+        let loaded = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
+        assert_eq!(loaded.confidence, Some(0.65));
+    }
+
+    #[test]
+    fn update_confidence_rejects_out_of_range() {
+        let (_dir, store) = temp_orb_store();
+        let orb = cmd_orb_create(&store, "Orb", "desc", OrbType::Task, 3, None).unwrap();
+        let id = orb.id.as_str().to_string();
+
+        let result = cmd_orb_update(&store, &id, None, None, None, None, Some(1.5), None);
+        assert!(result.is_err());
+        let result = cmd_orb_update(&store, &id, None, None, None, None, Some(-0.1), None);
+        assert!(result.is_err());
+        let result = cmd_orb_update(&store, &id, None, None, None, None, Some(f32::NAN), None);
+        assert!(result.is_err());
+
+        let loaded = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
+        assert!(loaded.confidence.is_none(), "value never persisted");
     }
 
     // ── cmd_orb_delete ─────────────────────────────────────────

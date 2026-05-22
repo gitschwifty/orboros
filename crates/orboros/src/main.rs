@@ -219,6 +219,12 @@ enum OrbAction {
         /// Filter by status (draft, pending, active, review, done, failed, cancelled, deferred).
         #[arg(short, long)]
         status: Option<String>,
+        /// Only show orbs whose confidence is at least this value (0.0–1.0).
+        #[arg(long)]
+        min_confidence: Option<f32>,
+        /// Only show orbs whose confidence is at most this value (0.0–1.0).
+        #[arg(long)]
+        max_confidence: Option<f32>,
     },
     /// Update fields on an existing orb.
     Update {
@@ -236,6 +242,10 @@ enum OrbAction {
         /// New status.
         #[arg(short, long)]
         status: Option<String>,
+        /// Set the orb's confidence score (0.0–1.0). Used by the benchmark
+        /// harness and manual reviewer scoring.
+        #[arg(long)]
+        confidence: Option<f32>,
     },
     /// Soft-delete (tombstone) an orb.
     Delete {
@@ -475,15 +485,25 @@ fn main() -> anyhow::Result<()> {
                     Ok(())
                 }
                 OrbAction::Show { id } => orb_cmd::cmd_orb_show(&orb_store, &id),
-                OrbAction::List { orb_type, status } => {
-                    orb_cmd::cmd_orb_list(&orb_store, orb_type.as_deref(), status.as_deref())
-                }
+                OrbAction::List {
+                    orb_type,
+                    status,
+                    min_confidence,
+                    max_confidence,
+                } => orb_cmd::cmd_orb_list(
+                    &orb_store,
+                    orb_type.as_deref(),
+                    status.as_deref(),
+                    min_confidence,
+                    max_confidence,
+                ),
                 OrbAction::Update {
                     id,
                     title,
                     description,
                     priority,
                     status,
+                    confidence,
                 } => orb_cmd::cmd_orb_update(
                     &orb_store,
                     &id,
@@ -491,6 +511,7 @@ fn main() -> anyhow::Result<()> {
                     description.as_deref(),
                     priority,
                     status.as_deref(),
+                    confidence,
                     hooks_ref,
                 ),
                 OrbAction::Delete { id, reason } => {

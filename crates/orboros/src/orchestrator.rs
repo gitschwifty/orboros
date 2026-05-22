@@ -74,6 +74,8 @@ pub struct SubtaskResult {
     pub tool_latency_ms: Option<u64>,
     /// Total latency reported by the harness (ms).
     pub total_latency_ms: Option<u64>,
+    /// Worker-reported confidence (0.0–1.0), clamped on the IPC boundary.
+    pub confidence: Option<f32>,
 }
 
 /// Outcome of a full orchestration run.
@@ -328,8 +330,9 @@ fn prepare_subtask(
         env: config.worker_env.clone(),
         model: model.to_string(),
         system_prompt: format!(
-            "You are a {} worker. Complete the task described in the user message.",
-            spec.worker_type
+            "You are a {} worker. Complete the task described in the user message.{}",
+            spec.worker_type,
+            crate::worker::process::CONFIDENCE_PROMPT_ADDENDUM,
         ),
         tools: filtered.allowed,
         max_iterations: None,
@@ -390,6 +393,7 @@ async fn execute_order_group(
             model_latency_ms: outcome.model_latency_ms,
             tool_latency_ms: outcome.tool_latency_ms,
             total_latency_ms: outcome.total_latency_ms,
+            confidence: outcome.confidence,
         };
         info!(
             task_id = %task.id,
@@ -469,6 +473,7 @@ async fn execute_subtask_owned(
         model_latency_ms: outcome.model_latency_ms,
         tool_latency_ms: outcome.tool_latency_ms,
         total_latency_ms: outcome.total_latency_ms,
+        confidence: outcome.confidence,
     }
 }
 
@@ -616,6 +621,7 @@ mod tests {
                 model_latency_ms: None,
                 tool_latency_ms: None,
                 total_latency_ms: None,
+                confidence: None,
             },
             SubtaskResult {
                 task_id: Uuid::new_v4(),
@@ -630,6 +636,7 @@ mod tests {
                 model_latency_ms: None,
                 tool_latency_ms: None,
                 total_latency_ms: None,
+                confidence: None,
             },
         ];
 
@@ -656,6 +663,7 @@ mod tests {
             model_latency_ms: None,
             tool_latency_ms: None,
             total_latency_ms: None,
+            confidence: None,
         }];
 
         let prompt = build_prompt("Next step", &prior, CONTEXT_RESULT_MAX_CHARS);
@@ -681,6 +689,7 @@ mod tests {
             model_latency_ms: None,
             tool_latency_ms: None,
             total_latency_ms: None,
+            confidence: None,
         }];
 
         let prompt = build_prompt("Continue anyway", &prior, CONTEXT_RESULT_MAX_CHARS);
@@ -703,6 +712,7 @@ mod tests {
             model_latency_ms: None,
             tool_latency_ms: None,
             total_latency_ms: None,
+            confidence: None,
         }];
 
         let prompt = build_prompt("Next step", &prior, 50);

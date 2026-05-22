@@ -160,6 +160,7 @@ mod tests {
             model_latency_ms: None,
             tool_latency_ms: None,
             total_latency_ms: None,
+            confidence: None,
         }
     }
 
@@ -194,6 +195,7 @@ mod tests {
                 model_latency_ms: None,
                 tool_latency_ms: None,
                 total_latency_ms: None,
+                confidence: None,
             },
         ];
 
@@ -217,6 +219,7 @@ mod tests {
             model_latency_ms: None,
             tool_latency_ms: None,
             total_latency_ms: None,
+            confidence: None,
         }];
 
         let prompt = build_aggregate_prompt("Task", &results);
@@ -268,6 +271,7 @@ mod tests {
                 model_latency_ms: None,
                 tool_latency_ms: None,
                 total_latency_ms: None,
+                confidence: None,
             },
         ];
 
