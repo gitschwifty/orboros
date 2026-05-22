@@ -379,6 +379,44 @@ pub fn cmd_review_queue(store: &OrbStore) -> anyhow::Result<()> {
 ///
 /// Returns an error if the orb is not found, the status string is invalid,
 /// or the store write fails.
+/// Label edit instructions for `cmd_orb_update`. When `set` is Some
+/// it wins outright — the orb's label list becomes the normalized
+/// version of `set` and `add`/`remove` are ignored. Otherwise, the
+/// orb's current labels are unioned with `add` and then `remove`
+/// is subtracted; the result is normalized.
+#[derive(Debug, Default, Clone)]
+pub struct LabelEdits {
+    pub add: Vec<String>,
+    pub remove: Vec<String>,
+    pub set: Option<Vec<String>>,
+}
+
+impl LabelEdits {
+    /// True when no label edits were requested.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.add.is_empty() && self.remove.is_empty() && self.set.is_none()
+    }
+
+    /// Applies the edits to `current` and returns the normalized result.
+    #[must_use]
+    pub fn apply(&self, current: &[String]) -> Vec<String> {
+        if let Some(ref s) = self.set {
+            return normalize_labels(s.clone());
+        }
+        let mut out: Vec<String> = current.to_vec();
+        out.extend(self.add.iter().cloned());
+        let remove: std::collections::HashSet<String> = self
+            .remove
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        out.retain(|l| !remove.contains(l.trim()));
+        normalize_labels(out)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn cmd_orb_update(
     store: &OrbStore,
@@ -388,6 +426,7 @@ pub fn cmd_orb_update(
     priority: Option<u8>,
     status: Option<&str>,
     confidence: Option<f32>,
+    labels: LabelEdits,
     hooks: Option<&HookSink>,
 ) -> anyhow::Result<()> {
     let orb_id = OrbId::from_raw(id);
@@ -419,6 +458,9 @@ pub fn cmd_orb_update(
             ));
         }
         orb.confidence = Some(c);
+    }
+    if !labels.is_empty() {
+        orb.labels = labels.apply(&orb.labels);
     }
     orb.updated_at = chrono::Utc::now();
     orb.update_content_hash();
@@ -1126,6 +1168,7 @@ mod tests {
             Some(1),
             None,
             None,
+            LabelEdits::default(),
             None,
         )
         .unwrap();
@@ -1142,7 +1185,18 @@ mod tests {
         let orb = cmd_orb_create(&store, "Orb", "desc", OrbType::Task, 3, vec![], None).unwrap();
         let id = orb.id.as_str().to_string();
 
-        cmd_orb_update(&store, &id, None, None, None, Some("active"), None, None).unwrap();
+        cmd_orb_update(
+            &store,
+            &id,
+            None,
+            None,
+            None,
+            Some("active"),
+            None,
+            LabelEdits::default(),
+            None,
+        )
+        .unwrap();
 
         let loaded = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
         assert_eq!(loaded.status, Some(OrbStatus::Active));
@@ -1159,6 +1213,7 @@ mod tests {
             None,
             None,
             None,
+            LabelEdits::default(),
             None,
         );
         assert!(result.is_err());
@@ -1170,7 +1225,18 @@ mod tests {
         let orb = cmd_orb_create(&store, "Orb", "desc", OrbType::Task, 3, vec![], None).unwrap();
         let id = orb.id.as_str().to_string();
 
-        cmd_orb_update(&store, &id, None, None, None, None, Some(0.65), None).unwrap();
+        cmd_orb_update(
+            &store,
+            &id,
+            None,
+            None,
+            None,
+            None,
+            Some(0.65),
+            LabelEdits::default(),
+            None,
+        )
+        .unwrap();
 
         let loaded = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
         assert_eq!(loaded.confidence, Some(0.65));
@@ -1182,15 +1248,207 @@ mod tests {
         let orb = cmd_orb_create(&store, "Orb", "desc", OrbType::Task, 3, vec![], None).unwrap();
         let id = orb.id.as_str().to_string();
 
-        let result = cmd_orb_update(&store, &id, None, None, None, None, Some(1.5), None);
+        let result = cmd_orb_update(
+            &store,
+            &id,
+            None,
+            None,
+            None,
+            None,
+            Some(1.5),
+            LabelEdits::default(),
+            None,
+        );
         assert!(result.is_err());
-        let result = cmd_orb_update(&store, &id, None, None, None, None, Some(-0.1), None);
+        let result = cmd_orb_update(
+            &store,
+            &id,
+            None,
+            None,
+            None,
+            None,
+            Some(-0.1),
+            LabelEdits::default(),
+            None,
+        );
         assert!(result.is_err());
-        let result = cmd_orb_update(&store, &id, None, None, None, None, Some(f32::NAN), None);
+        let result = cmd_orb_update(
+            &store,
+            &id,
+            None,
+            None,
+            None,
+            None,
+            Some(f32::NAN),
+            LabelEdits::default(),
+            None,
+        );
         assert!(result.is_err());
 
         let loaded = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
         assert!(loaded.confidence.is_none(), "value never persisted");
+    }
+
+    // ── LabelEdits::apply ─────────────────────────────────────
+
+    #[test]
+    fn label_edits_set_replaces_entirely() {
+        let edits = LabelEdits {
+            add: vec!["ignored".into()],
+            remove: vec!["also-ignored".into()],
+            set: Some(vec!["a".into(), "b".into()]),
+        };
+        let out = edits.apply(&["old1".to_string(), "old2".to_string()]);
+        assert_eq!(out, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn label_edits_add_unions_with_existing() {
+        let edits = LabelEdits {
+            add: vec!["c".into(), "a".into()], // a already present
+            ..Default::default()
+        };
+        let out = edits.apply(&["a".to_string(), "b".to_string()]);
+        assert_eq!(out, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn label_edits_remove_subtracts() {
+        let edits = LabelEdits {
+            remove: vec!["b".into()],
+            ..Default::default()
+        };
+        let out = edits.apply(&["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(out, vec!["a".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn label_edits_add_then_remove_in_same_call() {
+        let edits = LabelEdits {
+            add: vec!["new".into(), "junk".into()],
+            remove: vec!["junk".into(), "old".into()],
+            set: None,
+        };
+        let out = edits.apply(&["old".to_string(), "keep".to_string()]);
+        assert_eq!(out, vec!["keep".to_string(), "new".to_string()]);
+    }
+
+    #[test]
+    fn label_edits_empty_is_noop() {
+        let edits = LabelEdits::default();
+        assert!(edits.is_empty());
+        let out = edits.apply(&["a".to_string()]);
+        assert_eq!(out, vec!["a".to_string()]);
+    }
+
+    // ── cmd_orb_update with labels ────────────────────────────
+
+    #[test]
+    fn update_add_label_appends_to_existing() {
+        let (_dir, store) = temp_orb_store();
+        let orb = cmd_orb_create(
+            &store,
+            "X",
+            "y",
+            OrbType::Task,
+            3,
+            vec!["existing".into()],
+            None,
+        )
+        .unwrap();
+        let id = orb.id.as_str().to_string();
+
+        cmd_orb_update(
+            &store,
+            &id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            LabelEdits {
+                add: vec!["new".into()],
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let loaded = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
+        assert_eq!(
+            loaded.labels,
+            vec!["existing".to_string(), "new".to_string()]
+        );
+    }
+
+    #[test]
+    fn update_set_labels_replaces_entire_list() {
+        let (_dir, store) = temp_orb_store();
+        let orb = cmd_orb_create(
+            &store,
+            "X",
+            "y",
+            OrbType::Task,
+            3,
+            vec!["a".into(), "b".into(), "c".into()],
+            None,
+        )
+        .unwrap();
+        let id = orb.id.as_str().to_string();
+
+        cmd_orb_update(
+            &store,
+            &id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            LabelEdits {
+                set: Some(vec!["only".into(), "these".into()]),
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let loaded = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
+        assert_eq!(loaded.labels, vec!["only".to_string(), "these".to_string()]);
+    }
+
+    #[test]
+    fn update_remove_label_drops_match() {
+        let (_dir, store) = temp_orb_store();
+        let orb = cmd_orb_create(
+            &store,
+            "X",
+            "y",
+            OrbType::Task,
+            3,
+            vec!["a".into(), "b".into()],
+            None,
+        )
+        .unwrap();
+        let id = orb.id.as_str().to_string();
+
+        cmd_orb_update(
+            &store,
+            &id,
+            None,
+            None,
+            None,
+            None,
+            None,
+            LabelEdits {
+                remove: vec!["a".into()],
+                ..Default::default()
+            },
+            None,
+        )
+        .unwrap();
+
+        let loaded = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
+        assert_eq!(loaded.labels, vec!["b".to_string()]);
     }
 
     // ── cmd_orb_delete ─────────────────────────────────────────
