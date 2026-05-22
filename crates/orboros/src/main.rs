@@ -147,6 +147,46 @@ enum Commands {
     /// List orbs whose second-opinion reviewer verdict is `Revise`,
     /// pending operator action.
     ReviewQueue,
+    /// Benchmark corpus + harness (task 59).
+    Bench {
+        #[command(subcommand)]
+        action: BenchAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum BenchAction {
+    /// List every case in the corpus, grouped by tier.
+    List,
+    /// Run benchmark cases.
+    Run {
+        /// Tier to run. Omit to run every tier.
+        #[arg(long)]
+        tier: Option<String>,
+        /// Single case id to run (overrides --tier filtering).
+        #[arg(long)]
+        case: Option<String>,
+        /// Skip the per-case cost ceiling (`max_cost_cents`).
+        #[arg(long)]
+        no_budget: bool,
+    },
+    /// Print every result row in a saved run.
+    Show {
+        /// Run id, as printed by `bench run` or `bench list-runs`.
+        run_id: String,
+    },
+    /// Diff two saved runs by case outcome.
+    Compare { run_a: String, run_b: String },
+    /// List every recorded run.
+    ListRuns,
+    /// Calibration report: bucket confidence vs pass rate + correlation.
+    Calibration {
+        /// Run id to analyze.
+        run_id: String,
+        /// Number of histogram buckets across [0.0, 1.0].
+        #[arg(long, default_value_t = 10)]
+        buckets: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -575,6 +615,64 @@ fn main() -> anyhow::Result<()> {
         Commands::ReviewQueue => {
             let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
             orb_cmd::cmd_review_queue(&orb_store)
+        }
+        Commands::Bench { action } => cmd_bench(&state_dir, action),
+    }
+}
+
+fn cmd_bench(state_dir: &std::path::Path, action: BenchAction) -> anyhow::Result<()> {
+    use orboros::bench::cmd as bench_cmd;
+    use orboros::bench::store::BenchStore;
+    let cases_root = std::path::PathBuf::from("bench/cases");
+    let bench_dir = state_dir.join("bench");
+    let store = BenchStore::new(&bench_dir);
+
+    match action {
+        BenchAction::List => bench_cmd::cmd_bench_list(&cases_root),
+        BenchAction::Run {
+            tier,
+            case,
+            no_budget,
+        } => {
+            let tier = match tier.as_deref() {
+                None => None,
+                Some(s) => Some(
+                    s.parse::<orboros::bench::case::BenchTier>()
+                        .map_err(anyhow::Error::msg)?,
+                ),
+            };
+            let worker_config = orboros::worker::process::WorkerConfig {
+                command: "echo".into(),
+                args: vec![],
+                cwd: None,
+                env: vec![],
+                model: "mock/bench".into(),
+                system_prompt: String::new(),
+                tools: vec![],
+                max_iterations: Some(1),
+                init_timeout: None,
+                send_timeout: None,
+                shutdown_timeout: None,
+                task_id: None,
+                worker_id: None,
+            };
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(bench_cmd::cmd_bench_run(
+                &cases_root,
+                &store,
+                tier,
+                case.as_deref(),
+                &worker_config,
+                no_budget,
+            ))
+        }
+        BenchAction::Show { run_id } => bench_cmd::cmd_bench_show(&store, &run_id),
+        BenchAction::Compare { run_a, run_b } => {
+            bench_cmd::cmd_bench_compare(&store, &run_a, &run_b)
+        }
+        BenchAction::ListRuns => bench_cmd::cmd_bench_list_runs(&store),
+        BenchAction::Calibration { run_id, buckets } => {
+            orboros::bench::calibration::cmd_bench_calibration(&store, &run_id, buckets)
         }
     }
 }

@@ -1,0 +1,9 @@
+id = "echo-hello"
+tier = "t1"
+name = "Echoes 'hello'"
+description = "Sanity check: worker should produce the exact string 'hello' when asked to."
+prompt = "Reply with exactly one word: hello"
+
+[expected]
+kind = "exact"
+text = "hello"
