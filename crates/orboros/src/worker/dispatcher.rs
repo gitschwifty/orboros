@@ -285,7 +285,8 @@ pub fn apply_dispatch_outcome(
             orb.result = outcome.response.clone();
             orb.confidence = outcome.confidence;
             if orb.orb_type.uses_phase() {
-                orb.set_phase(OrbPhase::Done)?;
+                let next = next_phase_on_dispatch_success(orb.phase);
+                orb.set_phase(next)?;
             } else {
                 orb.set_status(OrbStatus::Done)?;
             }
@@ -310,6 +311,26 @@ pub fn apply_dispatch_outcome(
     }
     orb.updated_at = Utc::now();
     Ok(())
+}
+
+/// Returns the next phase a phase-orb should transition to when its
+/// dispatch worker completes successfully. Phase orbs advance
+/// through the pipeline (Speccing → Decomposing → ...) rather than
+/// jumping straight to Done — only the `Executing` worker actually
+/// finishes the orb.
+fn next_phase_on_dispatch_success(current: Option<OrbPhase>) -> OrbPhase {
+    match current {
+        Some(OrbPhase::Speccing) => OrbPhase::Decomposing,
+        Some(OrbPhase::Decomposing) => OrbPhase::Refining,
+        Some(OrbPhase::Refining) => OrbPhase::Review,
+        Some(OrbPhase::Reevaluating) => OrbPhase::Executing,
+        // Executing → Done (the only worker whose finish ends the orb).
+        Some(OrbPhase::Executing) => OrbPhase::Done,
+        // Unexpected phases fall through to Done; the transition
+        // table will reject if the move isn't valid, which surfaces
+        // a bug rather than silently mis-advancing.
+        _ => OrbPhase::Done,
+    }
 }
 
 /// Builds a base `WorkerConfig` from the layered project config.
