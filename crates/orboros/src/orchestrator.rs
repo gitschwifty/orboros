@@ -330,8 +330,9 @@ fn prepare_subtask(
         env: config.worker_env.clone(),
         model: model.to_string(),
         system_prompt: format!(
-            "You are a {} worker. Complete the task described in the user message.",
-            spec.worker_type
+            "You are a {} worker. Complete the task described in the user message.{}",
+            spec.worker_type,
+            crate::worker::process::CONFIDENCE_PROMPT_ADDENDUM,
         ),
         tools: filtered.allowed,
         max_iterations: None,
