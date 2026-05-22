@@ -285,6 +285,20 @@ impl QueueLoop {
         Ok(())
     }
 
+    /// Fires the `on-queue-tick` hook with no orb context.
+    /// Best-effort — never returns an error. The matcher rejects
+    /// orb-bound rules when no orb is in context, so the daemon
+    /// can call this unconditionally after every tick.
+    pub async fn fire_on_queue_tick(&self) {
+        if self.is_paused() {
+            return;
+        }
+        if let Some(sink) = &self.hooks {
+            let ctx = crate::hooks::FireCtx::default();
+            let (_outcome, _invs) = sink.fire(crate::hooks::HookEvent::OnQueueTick, ctx).await;
+        }
+    }
+
     /// Dispatches every ready orb in parallel, bounded by
     /// `max_concurrency`. Ready orbs are those whose status/phase
     /// puts them in a worker-eligible state AND that haven't been

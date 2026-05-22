@@ -1040,10 +1040,39 @@ fn cmd_daemon_start(
 
     let orb_store = orbs::orb_store::OrbStore::new(state_dir.join("orbs.jsonl"));
     let dep_store = orbs::dep_store::DepStore::new(state_dir.join("deps.jsonl"));
-    let queue = orboros::queue_loop::QueueLoop::new(orb_store, dep_store, state_dir.to_path_buf());
+    let mut queue =
+        orboros::queue_loop::QueueLoop::new(orb_store, dep_store, state_dir.to_path_buf());
+
+    // Attach HookSink so the daemon fires lifecycle hooks (closes
+    // task 56 follow-up: daemon-side QueueLoop::with_hooks plumbing).
+    if let Some(sink) = orboros::hooks::HookSink::from_state_dir(state_dir, state_dir)? {
+        queue = queue.with_hooks(sink);
+    }
+
+    // Build a base WorkerConfig if the project config has a
+    // worker_binary. When absent, the daemon stays pure
+    // state-machine — workers never spawn. Lets users opt in
+    // to autonomous dispatch without making it mandatory.
+    let dispatch = match orboros::worker::dispatcher::default_worker_config(
+        dirs::home_dir().as_deref(),
+        Some(state_dir),
+    ) {
+        Ok(base_worker_config) => Some(orboros::daemon::DispatchSettings {
+            base_worker_config,
+            max_concurrency: daemon_config.max_concurrency,
+        }),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "daemon starting without dispatch — worker_binary unconfigured"
+            );
+            println!("  note: dispatch disabled (worker_binary unconfigured: {e})");
+            None
+        }
+    };
 
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(orboros::daemon::run_daemon(daemon_config, queue))?;
+    rt.block_on(orboros::daemon::run_daemon(daemon_config, queue, dispatch))?;
 
     Ok(())
 }
