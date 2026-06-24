@@ -15,6 +15,7 @@ use orbs::review::{ReviewReport, ReviewVerdict, ReviseScope};
 use tracing::{info, instrument, warn};
 
 use crate::config::SecondOpinionConfig;
+use crate::phases::prompt_util::extract_fenced_json;
 use crate::worker::process::{Worker, WorkerConfig};
 
 /// Errors from the reviewer worker.
@@ -96,16 +97,6 @@ pub fn parse_verdict(text: &str) -> Result<ReviewVerdict, ReviewerError> {
         }
     }
     Err(ReviewerError::ParseFailed(text.chars().take(200).collect()))
-}
-
-fn extract_fenced_json(text: &str) -> Option<String> {
-    let start = text.find("```")?;
-    let after_fence = &text[start + 3..];
-    // Skip the language tag line if present.
-    let body_start = after_fence.find('\n').map_or(0, |i| i + 1);
-    let body = &after_fence[body_start..];
-    let end = body.find("```")?;
-    Some(body[..end].trim().to_string())
 }
 
 /// Walks the text for the first `{` whose enclosing object contains

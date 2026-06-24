@@ -67,22 +67,45 @@ impl HookSink {
         (outcome, invocations)
     }
 
-    /// Synchronous firing path for CLI commands. Spins up a small
-    /// tokio runtime, fires, returns. Cheap relative to the work the
-    /// hooks themselves do.
+    /// Synchronous firing path for CLI commands. Reuses a
+    /// process-wide tokio runtime so repeated calls don't pay
+    /// construction cost. Must not be called from inside a tokio
+    /// runtime — use `fire().await` instead.
     ///
     /// # Errors
     ///
-    /// Returns an error only if the tokio runtime cannot be created;
-    /// individual hook failures are captured in `HookInvocation` records.
+    /// Returns an error only if the shared tokio runtime cannot be
+    /// created; individual hook failures are captured in
+    /// `HookInvocation` records.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called from inside a tokio runtime, since
+    /// `Runtime::block_on` cannot be nested.
     pub fn fire_blocking(
         &self,
         event: HookEvent,
         ctx: FireCtx<'_>,
     ) -> anyhow::Result<(FireOutcome, Vec<HookInvocation>)> {
-        let rt = tokio::runtime::Runtime::new()?;
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "HookSink::fire_blocking called from inside a tokio runtime; use fire().await",
+        );
+        let rt = shared_runtime()?;
         Ok(rt.block_on(self.fire(event, ctx)))
     }
+}
+
+fn shared_runtime() -> anyhow::Result<&'static tokio::runtime::Runtime> {
+    use std::sync::OnceLock;
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    if let Some(rt) = RT.get() {
+        return Ok(rt);
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    Ok(RT.get_or_init(|| rt))
 }
 
 #[cfg(test)]

@@ -2,7 +2,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
 use orbs::dep_store::DepStore;
+use orbs::id::OrbId;
 use orbs::orb::{Orb, OrbPhase, OrbStatus};
 use orbs::orb_store::OrbStore;
 use orbs::pipeline::create_pipeline;
@@ -244,6 +247,7 @@ impl QueueLoop {
     /// phase-orb root completions; task roots use the un-hooked
     /// status-transition path.
     async fn complete_roots_with_hooks(&self, orbs: &[Orb]) -> std::io::Result<u32> {
+        let children_by_parent = index_children_by_parent(orbs);
         let mut count = 0;
         for orb in orbs {
             if orb.effective_status() == TaskStatus::Done
@@ -252,10 +256,9 @@ impl QueueLoop {
             {
                 continue;
             }
-            let children = self.orb_store.load_children(&orb.id)?;
-            if children.is_empty() {
+            let Some(children) = children_by_parent.get(&orb.id) else {
                 continue;
-            }
+            };
             let all_children_done = children
                 .iter()
                 .all(|c| c.effective_status() == TaskStatus::Done);
@@ -367,11 +370,10 @@ impl QueueLoop {
 
     /// Detects root orbs whose children are all Done and marks them Done.
     fn complete_roots(&self, orbs: &[Orb]) -> std::io::Result<u32> {
+        let children_by_parent = index_children_by_parent(orbs);
         let mut count = 0;
 
-        // Find orbs that have children (potential roots)
         for orb in orbs {
-            // Skip non-terminal, already-done, or non-phase orbs
             if orb.effective_status() == TaskStatus::Done
                 || orb.effective_status() == TaskStatus::Failed
                 || orb.effective_status() == TaskStatus::Cancelled
@@ -379,10 +381,9 @@ impl QueueLoop {
                 continue;
             }
 
-            let children = self.orb_store.load_children(&orb.id)?;
-            if children.is_empty() {
+            let Some(children) = children_by_parent.get(&orb.id) else {
                 continue;
-            }
+            };
 
             let all_children_done = children
                 .iter()
@@ -512,15 +513,14 @@ impl QueueLoop {
         let mut join_set = JoinSet::new();
 
         for (orb, target) in targets {
-            let permit = match semaphore.clone().acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
+            let sem = semaphore.clone();
             let store = self.orb_store.clone();
             let base_wc = base_worker_config.clone();
             let hooks = self.hooks.as_ref().map(Arc::clone);
             join_set.spawn(async move {
-                let _permit = permit;
+                let Ok(_permit) = sem.acquire_owned().await else {
+                    return Ok(false);
+                };
                 dispatch_one_owned(store, orb, target, &base_wc, hooks).await
             });
         }
@@ -536,6 +536,20 @@ impl QueueLoop {
         }
         Ok(completed)
     }
+}
+
+/// Indexes the slice by `parent_id`, returning a map from each
+/// parent's `OrbId` to its child orbs. Lets the tick loop look up
+/// children in O(1) instead of paying a full `OrbStore::load_all`
+/// replay per orb.
+fn index_children_by_parent(orbs: &[Orb]) -> HashMap<&OrbId, Vec<&Orb>> {
+    let mut by_parent: HashMap<&OrbId, Vec<&Orb>> = HashMap::new();
+    for orb in orbs {
+        if let Some(parent_id) = orb.parent_id.as_ref() {
+            by_parent.entry(parent_id).or_default().push(orb);
+        }
+    }
+    by_parent
 }
 
 // ── Dispatch helpers (task 60) ───────────────────────────────────
