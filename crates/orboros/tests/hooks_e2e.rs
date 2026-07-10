@@ -9,7 +9,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use assert_cmd::Command;
+use assert_cmd::{cargo::cargo_bin_cmd, Command};
 
 fn make_executable(path: &Path) {
     let mut perms = fs::metadata(path).unwrap().permissions();
@@ -29,7 +29,7 @@ fn write_config(dir: &Path, body: &str) {
 }
 
 fn orboros(state: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("orboros").unwrap();
+    let mut cmd = cargo_bin_cmd!("orboros");
     cmd.env("HOME", state); // isolate from the user's real ~/.orboros
     cmd.args(["--state-dir", state.to_str().unwrap()]);
     cmd

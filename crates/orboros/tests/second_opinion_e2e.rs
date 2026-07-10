@@ -210,7 +210,7 @@ fn sampling_mode_with_seeded_rng_is_reproducible() {
 // ── CLI surface via the binary ────────────────────────────────────
 
 fn orboros(state: &Path) -> Command {
-    let mut cmd = Command::cargo_bin("orboros").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("orboros");
     cmd.env("HOME", state);
     cmd.args(["--state-dir", state.to_str().unwrap()]);
     cmd

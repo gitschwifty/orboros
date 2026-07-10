@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -13,6 +14,7 @@ pub struct OrbConfig {
     pub default_model: String,
     pub max_concurrency: usize,
     pub worker_binary: Option<String>,
+    pub prompts: PromptConfig,
     pub review: ReviewConfig,
     pub second_opinion: SecondOpinionConfig,
     pub notification: NotificationConfig,
@@ -24,11 +26,27 @@ impl Default for OrbConfig {
             default_model: "openrouter/free".to_string(),
             max_concurrency: 4,
             worker_binary: None,
+            prompts: PromptConfig::default(),
             review: ReviewConfig::default(),
             second_opinion: SecondOpinionConfig::default(),
             notification: NotificationConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PromptConfig {
+    pub default: PromptOverride,
+    pub workers: BTreeMap<String, PromptOverride>,
+    pub phases: BTreeMap<String, PromptOverride>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PromptOverride {
+    pub system: Option<String>,
+    pub system_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -551,6 +569,54 @@ review_on_completion = true
     }
 
     #[test]
+    fn load_config_merges_prompt_sections() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+
+        let global_dir = home.path().join(".orboros");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        std::fs::write(
+            global_dir.join("config.toml"),
+            r#"
+[prompts.default]
+system = "global default"
+
+[prompts.workers.edit]
+system = "global edit"
+
+[prompts.phases.speccing]
+system = "global speccing"
+"#,
+        )
+        .unwrap();
+
+        let orbs_dir = project.path().join(".orbs");
+        std::fs::create_dir_all(&orbs_dir).unwrap();
+        std::fs::write(
+            orbs_dir.join("config.toml"),
+            r#"
+[prompts.phases.speccing]
+system = "project speccing"
+"#,
+        )
+        .unwrap();
+
+        let cfg = load_config_with_home(Some(home.path()), Some(project.path())).unwrap();
+        assert_eq!(
+            cfg.prompts.default.system.as_deref(),
+            Some("global default")
+        );
+        assert_eq!(
+            cfg.prompts.workers["edit"].system.as_deref(),
+            Some("global edit")
+        );
+        assert_eq!(
+            cfg.prompts.phases["speccing"].system.as_deref(),
+            Some("project speccing")
+        );
+    }
+
+    #[test]
     fn load_config_errors_on_invalid_toml() {
         let home = tempdir().unwrap();
         let global_dir = home.path().join(".orboros");
@@ -567,6 +633,17 @@ review_on_completion = true
             default_model: "test-model".to_string(),
             max_concurrency: 16,
             worker_binary: Some("/usr/bin/heddle".to_string()),
+            prompts: PromptConfig {
+                workers: [(
+                    "edit".into(),
+                    PromptOverride {
+                        system: Some("edit prompt".into()),
+                        system_file: None,
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            },
             review: ReviewConfig {
                 requires_approval_by_default: true,
                 review_on_completion: false,
