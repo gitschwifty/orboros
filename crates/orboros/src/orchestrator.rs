@@ -332,15 +332,12 @@ fn prepare_subtask(
             "Profile denied tools for worker"
         );
     }
-    let built_in_system = format!(
-        "You are a {} worker. Complete the task described in the user message.",
-        spec.worker_type,
-    );
+    let built_in_system = crate::prompt::built_in_worker_system_prompt(&spec.worker_type);
     let resolved_system = config
         .prompt_resolver
         .resolve_system_prompt(
             crate::prompt::PromptKind::Worker(&spec.worker_type),
-            &built_in_system,
+            built_in_system,
         )?
         .system_prompt;
     let worker_config = WorkerConfig {

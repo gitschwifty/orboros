@@ -176,10 +176,11 @@ system = "You are refining an Orboros plan. Return only the requested JSON shape
 
 Projects are registered in `~/.orboros/projects.toml` automatically on `orboros init`.
 
-Prompt overrides fall back to built-in prompts when omitted. Worker keys include
-subtask roles like `research`, `edit`, `review`, `test`, plus coordinator roles
-like `decompose`, `aggregate`, and the orb execution worker `execute`. Phase keys
-include `speccing`, `decomposing`, `refining`, and `reevaluating`.
+Prompt overrides fall back to role-specific built-in prompts when omitted.
+Worker keys include subtask roles like `research`, `edit`, `review`, `test`,
+and `plan`, plus coordinator roles like `decompose`, `aggregate`, and the orb
+execution worker `execute`. Phase keys include `speccing`, `decomposing`,
+`refining`, and `reevaluating`.
 
 ## Model Routing
 

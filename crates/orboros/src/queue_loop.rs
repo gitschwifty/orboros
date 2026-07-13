@@ -630,7 +630,7 @@ async fn dispatch_one_owned(
         DispatchTarget::Refining => crate::phases::refinement::build_prompt(&orb),
         DispatchTarget::Reevaluating => crate::phases::re_evaluation::build_prompt(&orb, &[]),
         DispatchTarget::Execute => (
-            "You are a task worker. Complete the task in the user message.".to_string(),
+            crate::prompt::built_in_worker_system_prompt("execute").to_string(),
             orb.description.clone(),
         ),
     };
