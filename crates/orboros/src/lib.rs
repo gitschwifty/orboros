@@ -14,6 +14,7 @@ pub mod orb_cmd;
 pub mod orchestrator;
 pub mod phases;
 pub mod plan;
+pub mod prompt;
 pub mod queue_loop;
 pub mod routing;
 pub mod runner;

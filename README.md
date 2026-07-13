@@ -157,12 +157,30 @@ max_concurrency = 4
 requires_approval_by_default = false
 review_on_completion = true
 
-[notifications]
+[notification]
 enabled = true
-desktop = true
+desktop_enabled = true
+
+[prompts.workers.edit]
+system = "You are an implementation worker. Make focused, tested code changes."
+
+[prompts.workers.review]
+system_file = "prompts/review.md" # resolves from .orbs/prompts/review.md
+
+[prompts.phases.speccing]
+system_file = "prompts/speccing.md"
+
+[prompts.phases.refining]
+system = "You are refining an Orboros plan. Return only the requested JSON shape."
 ```
 
 Projects are registered in `~/.orboros/projects.toml` automatically on `orboros init`.
+
+Prompt overrides fall back to role-specific built-in prompts when omitted.
+Worker keys include subtask roles like `research`, `edit`, `review`, `test`,
+and `plan`, plus coordinator roles like `decompose`, `aggregate`, and the orb
+execution worker `execute`. Phase keys include `speccing`, `decomposing`,
+`refining`, and `reevaluating`.
 
 ## Model Routing
 

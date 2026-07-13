@@ -509,6 +509,12 @@ impl QueueLoop {
             return Ok(0);
         }
 
+        let prompt_config = crate::config::load_config(Some(&self.base_dir))
+            .map_err(std::io::Error::other)?
+            .prompts;
+        let prompt_resolver =
+            crate::prompt::PromptResolver::from_config(prompt_config, Some(&self.base_dir));
+
         let semaphore = Arc::new(Semaphore::new(max_concurrency.max(1)));
         let mut join_set = JoinSet::new();
 
@@ -516,12 +522,13 @@ impl QueueLoop {
             let sem = semaphore.clone();
             let store = self.orb_store.clone();
             let base_wc = base_worker_config.clone();
+            let prompt_resolver = prompt_resolver.clone();
             let hooks = self.hooks.as_ref().map(Arc::clone);
             join_set.spawn(async move {
                 let Ok(_permit) = sem.acquire_owned().await else {
                     return Ok(false);
                 };
-                dispatch_one_owned(store, orb, target, &base_wc, hooks).await
+                dispatch_one_owned(store, orb, target, &base_wc, &prompt_resolver, hooks).await
             });
         }
 
@@ -555,7 +562,7 @@ fn index_children_by_parent(orbs: &[Orb]) -> HashMap<&OrbId, Vec<&Orb>> {
 // ── Dispatch helpers (task 60) ───────────────────────────────────
 
 /// What phase / prompt should drive a worker for this orb.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum DispatchTarget {
     /// Task or phase-orb in `Executing` — send the orb's description
     /// as the user prompt. Result becomes `orb.result`.
@@ -568,6 +575,18 @@ enum DispatchTarget {
     Refining,
     /// Phase-orb in `Reevaluating`.
     Reevaluating,
+}
+
+impl DispatchTarget {
+    fn prompt_kind(self) -> crate::prompt::PromptKind<'static> {
+        match self {
+            Self::Execute => crate::prompt::PromptKind::Worker("execute"),
+            Self::Speccing => crate::prompt::PromptKind::Phase("speccing"),
+            Self::Decomposing => crate::prompt::PromptKind::Phase("decomposing"),
+            Self::Refining => crate::prompt::PromptKind::Phase("refining"),
+            Self::Reevaluating => crate::prompt::PromptKind::Phase("reevaluating"),
+        }
+    }
 }
 
 /// Returns `Some(target)` when the orb is in a worker-eligible state
@@ -593,27 +612,32 @@ fn dispatch_target_for(orb: &Orb) -> Option<DispatchTarget> {
     }
 }
 
-/// Owned-argument version of dispatch_one, suitable for `tokio::spawn`.
+/// Owned-argument version of `dispatch_one`, suitable for `tokio::spawn`.
 /// Returns `Ok(true)` when the orb ended at Done, `Ok(false)` otherwise.
 async fn dispatch_one_owned(
     store: OrbStore,
     mut orb: Orb,
     target: DispatchTarget,
     base_wc: &crate::worker::process::WorkerConfig,
+    prompt_resolver: &crate::prompt::PromptResolver,
     hooks: Option<Arc<crate::hooks::HookSink>>,
 ) -> std::io::Result<bool> {
     use crate::worker::dispatcher::{apply_dispatch_outcome, dispatch_orb, worker_config_for};
 
-    let (system, user) = match target {
+    let (built_in_system, user) = match target {
         DispatchTarget::Speccing => crate::phases::speccing::build_prompt(&orb),
         DispatchTarget::Decomposing => crate::phases::decompose::build_prompt(&orb),
         DispatchTarget::Refining => crate::phases::refinement::build_prompt(&orb),
         DispatchTarget::Reevaluating => crate::phases::re_evaluation::build_prompt(&orb, &[]),
         DispatchTarget::Execute => (
-            "You are a task worker. Complete the task in the user message.".to_string(),
+            crate::prompt::built_in_worker_system_prompt("execute").to_string(),
             orb.description.clone(),
         ),
     };
+    let system = prompt_resolver
+        .resolve_system_prompt(target.prompt_kind(), &built_in_system)
+        .map_err(std::io::Error::other)?
+        .system_prompt;
     let wc = worker_config_for(&orb, base_wc, &system);
 
     let outcome = dispatch_orb(&orb, &user, &wc, hooks.as_deref())

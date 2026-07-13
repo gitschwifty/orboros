@@ -56,13 +56,55 @@ pub async fn aggregate(
     subtask_results: &[SubtaskResult],
     worker_config: &WorkerConfig,
 ) -> anyhow::Result<AggregateResult> {
+    aggregate_with_system_prompt(
+        original_task,
+        subtask_results,
+        worker_config,
+        AGGREGATE_SYSTEM_PROMPT,
+    )
+    .await
+}
+
+/// Synthesizes subtask results using a configured prompt resolver.
+///
+/// # Errors
+///
+/// Returns an error if prompt resolution fails or the aggregation
+/// worker fails.
+pub async fn aggregate_with_prompt_resolver(
+    original_task: &str,
+    subtask_results: &[SubtaskResult],
+    worker_config: &WorkerConfig,
+    prompt_resolver: &crate::prompt::PromptResolver,
+) -> anyhow::Result<AggregateResult> {
+    let system_prompt = prompt_resolver
+        .resolve_system_prompt(
+            crate::prompt::PromptKind::Worker("aggregate"),
+            AGGREGATE_SYSTEM_PROMPT,
+        )?
+        .system_prompt;
+    aggregate_with_system_prompt(
+        original_task,
+        subtask_results,
+        worker_config,
+        &system_prompt,
+    )
+    .await
+}
+
+async fn aggregate_with_system_prompt(
+    original_task: &str,
+    subtask_results: &[SubtaskResult],
+    worker_config: &WorkerConfig,
+    system_prompt: &str,
+) -> anyhow::Result<AggregateResult> {
     let aggregator_config = WorkerConfig {
         command: worker_config.command.clone(),
         args: worker_config.args.clone(),
         cwd: worker_config.cwd.clone(),
         env: worker_config.env.clone(),
         model: worker_config.model.clone(),
-        system_prompt: AGGREGATE_SYSTEM_PROMPT.into(),
+        system_prompt: system_prompt.into(),
         tools: vec![],
         max_iterations: Some(1),
         init_timeout: worker_config.init_timeout,

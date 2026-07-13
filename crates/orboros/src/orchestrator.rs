@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 pub use orbs::trace::TerminationReason;
 
-use crate::coordinator::aggregate::{aggregate, fallback_concatenate};
+use crate::coordinator::aggregate::{aggregate_with_prompt_resolver, fallback_concatenate};
 use crate::coordinator::decompose::Subtask;
 use crate::routing::profile::filter_tools;
 use crate::routing::rules::RoutingConfig;
@@ -37,6 +37,8 @@ pub struct OrchestrateConfig {
     pub worker_env: Vec<(String, String)>,
     /// Routing config for model selection per worker type.
     pub routing: RoutingConfig,
+    /// Prompt resolver for worker-type system prompt overrides.
+    pub prompt_resolver: crate::prompt::PromptResolver,
     /// Maximum concurrent workers (used in later steps).
     pub max_concurrency: usize,
     /// Maximum characters of a subtask result to include in context for later subtasks.
@@ -259,7 +261,14 @@ pub async fn orchestrate(
             worker_id: None,
         };
 
-        match aggregate(&parent.description, &all_results, &agg_config).await {
+        match aggregate_with_prompt_resolver(
+            &parent.description,
+            &all_results,
+            &agg_config,
+            &config.prompt_resolver,
+        )
+        .await
+        {
             Ok(agg) => {
                 parent.result = Some(agg.summary.clone());
                 Some(agg.summary)
@@ -323,17 +332,21 @@ fn prepare_subtask(
             "Profile denied tools for worker"
         );
     }
+    let built_in_system = crate::prompt::built_in_worker_system_prompt(&spec.worker_type);
+    let resolved_system = config
+        .prompt_resolver
+        .resolve_system_prompt(
+            crate::prompt::PromptKind::Worker(&spec.worker_type),
+            built_in_system,
+        )?
+        .system_prompt;
     let worker_config = WorkerConfig {
         command: config.worker_binary.clone(),
         args: config.worker_args.clone(),
         cwd: config.worker_cwd.clone(),
         env: config.worker_env.clone(),
         model: model.to_string(),
-        system_prompt: format!(
-            "You are a {} worker. Complete the task described in the user message.{}",
-            spec.worker_type,
-            crate::worker::process::CONFIDENCE_PROMPT_ADDENDUM,
-        ),
+        system_prompt: crate::prompt::with_confidence_addendum(&resolved_system),
         tools: filtered.allowed,
         max_iterations: None,
         init_timeout: None,
@@ -546,6 +559,7 @@ mod tests {
             worker_cwd: None,
             worker_env: vec![],
             routing: RoutingConfig::default(),
+            prompt_resolver: crate::prompt::PromptResolver::default(),
             max_concurrency: 1,
             context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
             task_timeout: None,
@@ -564,6 +578,7 @@ mod tests {
             worker_cwd: None,
             worker_env: vec![],
             routing: RoutingConfig::default(),
+            prompt_resolver: crate::prompt::PromptResolver::default(),
             max_concurrency: 1,
             context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
             task_timeout: None,
@@ -721,6 +736,44 @@ mod tests {
         assert!(prompt.contains("..."));
         // Should NOT contain the full 200-char response
         assert!(!prompt.contains(&"x".repeat(200)));
+    }
+
+    #[test]
+    fn prepare_subtask_uses_worker_type_prompt_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TaskStore::new(dir.path().join("tasks.jsonl"));
+        let parent = Task::new("Parent", "Parent description");
+        let mut config = test_orchestrate_config();
+        config.prompt_resolver = crate::prompt::PromptResolver::new(
+            crate::config::PromptConfig {
+                workers: [(
+                    "edit".into(),
+                    crate::config::PromptOverride {
+                        system: Some("custom edit system".into()),
+                        system_file: None,
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            },
+            None,
+            None,
+        );
+        let spec = Subtask {
+            title: "Edit".into(),
+            description: "Change code".into(),
+            worker_type: "edit".into(),
+            tools_needed: vec![],
+            order: 0,
+        };
+
+        let (_task, _prompt, worker_config) =
+            prepare_subtask(&spec, &[], &parent, &config, &store).unwrap();
+
+        assert!(worker_config
+            .system_prompt
+            .starts_with("custom edit system"));
+        assert!(worker_config.system_prompt.contains("CONFIDENCE:"));
     }
 
     // --- group_by_order tests ---
@@ -912,6 +965,7 @@ mod tests {
             worker_cwd: None,
             worker_env: vec![],
             routing: RoutingConfig::default(),
+            prompt_resolver: crate::prompt::PromptResolver::default(),
             max_concurrency: 1,
             context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
             task_timeout: None,
@@ -1207,6 +1261,7 @@ mod tests {
             worker_cwd: None,
             worker_env: vec![],
             routing: RoutingConfig::default(),
+            prompt_resolver: crate::prompt::PromptResolver::default(),
             max_concurrency: 1,
             context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
             task_timeout: None,
@@ -1256,6 +1311,7 @@ mod tests {
                 ("MOCK_SEND_DELAY".into(), "10".into()),
             ],
             routing: RoutingConfig::default(),
+            prompt_resolver: crate::prompt::PromptResolver::default(),
             max_concurrency: 1,
             context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
             task_timeout: Some(Duration::from_millis(200)),
@@ -1393,6 +1449,7 @@ mod tests {
             worker_cwd: None,
             worker_env: vec![],
             routing: RoutingConfig::default(),
+            prompt_resolver: crate::prompt::PromptResolver::default(),
             max_concurrency: 1,
             context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
             task_timeout: None,

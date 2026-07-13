@@ -10,7 +10,7 @@ use orbs::dep_store::DepStore;
 use orbs::orb_store::OrbStore;
 
 use orboros::config;
-use orboros::coordinator::decompose::decompose;
+use orboros::coordinator::decompose::decompose_with_prompt_resolver;
 use orboros::daemon::DaemonConfig;
 use orboros::orb_cmd;
 use orboros::orchestrator::{orchestrate, OrchestrateConfig, CONTEXT_RESULT_MAX_CHARS};
@@ -842,9 +842,15 @@ fn cmd_decompose(
 ) -> anyhow::Result<()> {
     let binary = prereq_check(worker_binary, model, skip_prereq_check)?;
     let config = make_worker_config(binary, model, ""); // system prompt set by decompose()
+    let prompt_config = config::load_config(None)?.prompts;
+    let prompt_resolver = orboros::prompt::PromptResolver::from_config(prompt_config, None);
 
     let rt = tokio::runtime::Runtime::new()?;
-    let result = rt.block_on(decompose(description, &config))?;
+    let result = rt.block_on(decompose_with_prompt_resolver(
+        description,
+        &config,
+        &prompt_resolver,
+    ))?;
 
     println!("Decomposed into {} subtask(s):\n", result.subtasks.len());
     for (i, sub) in result.subtasks.iter().enumerate() {
@@ -875,6 +881,10 @@ fn cmd_orchestrate(
 ) -> anyhow::Result<()> {
     let binary = prereq_check(worker_binary, model, skip_prereq_check)?;
     let config = make_worker_config(binary, model, ""); // system prompt set per step
+    let project_dir = store.path().parent();
+    let prompt_config = config::load_config(project_dir)?.prompts;
+    let prompt_resolver =
+        orboros::prompt::PromptResolver::from_config(prompt_config.clone(), project_dir);
 
     // Create parent task
     let mut parent = Task::new(description, description).with_priority(priority);
@@ -886,7 +896,11 @@ fn cmd_orchestrate(
 
     // Decompose
     println!("Decomposing task...");
-    let decomposition = rt.block_on(decompose(description, &config))?;
+    let decomposition = rt.block_on(decompose_with_prompt_resolver(
+        description,
+        &config,
+        &prompt_resolver,
+    ))?;
     println!("  → {} subtask(s)\n", decomposition.subtasks.len());
 
     // Print subtask plan
@@ -902,13 +916,14 @@ fn cmd_orchestrate(
     println!();
 
     // Load routing config and build orchestrate config
-    let routing = load_routing_config(store.path().parent());
+    let routing = load_routing_config(project_dir);
     let orch_config = OrchestrateConfig {
         worker_binary: binary.to_string(),
         worker_args: vec![],
         worker_cwd: None,
         worker_env: vec![],
         routing,
+        prompt_resolver,
         max_concurrency: 4,
         context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
         task_timeout: None,

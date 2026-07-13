@@ -62,6 +62,34 @@ pub async fn decompose(
     task_description: &str,
     worker_config: &WorkerConfig,
 ) -> anyhow::Result<DecomposeResult> {
+    decompose_with_system_prompt(task_description, worker_config, DECOMPOSE_SYSTEM_PROMPT).await
+}
+
+/// Decomposes a high-level task using a configured prompt resolver.
+///
+/// # Errors
+///
+/// Returns an error if prompt resolution fails, the coordinator worker
+/// fails, or the worker returns unparseable output.
+pub async fn decompose_with_prompt_resolver(
+    task_description: &str,
+    worker_config: &WorkerConfig,
+    prompt_resolver: &crate::prompt::PromptResolver,
+) -> anyhow::Result<DecomposeResult> {
+    let system_prompt = prompt_resolver
+        .resolve_system_prompt(
+            crate::prompt::PromptKind::Worker("decompose"),
+            DECOMPOSE_SYSTEM_PROMPT,
+        )?
+        .system_prompt;
+    decompose_with_system_prompt(task_description, worker_config, &system_prompt).await
+}
+
+async fn decompose_with_system_prompt(
+    task_description: &str,
+    worker_config: &WorkerConfig,
+    system_prompt: &str,
+) -> anyhow::Result<DecomposeResult> {
     // Build coordinator config — same binary, but with the decomposition system prompt
     let coordinator_config = WorkerConfig {
         command: worker_config.command.clone(),
@@ -69,7 +97,7 @@ pub async fn decompose(
         cwd: worker_config.cwd.clone(),
         env: worker_config.env.clone(),
         model: worker_config.model.clone(),
-        system_prompt: DECOMPOSE_SYSTEM_PROMPT.into(),
+        system_prompt: system_prompt.into(),
         tools: vec![],           // coordinator doesn't need tools
         max_iterations: Some(1), // single-turn, no tool loop
         init_timeout: worker_config.init_timeout,
