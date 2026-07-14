@@ -15,6 +15,7 @@
 //! Both runners return [`BenchResult`] rows in the same shape T1
 //! produces so the store + CLI surface stays uniform.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -61,12 +62,10 @@ pub fn copy_seed_repo(
             seed_name.display().to_string(),
         ));
     }
-    let dest_root = dest.join(
-        seed_name
-            .file_name()
-            .map(std::ffi::OsStr::to_os_string)
-            .unwrap_or_else(|| std::ffi::OsString::from("seed")),
-    );
+    let dest_root = dest.join(seed_name.file_name().map_or_else(
+        || std::ffi::OsString::from("seed"),
+        std::ffi::OsStr::to_os_string,
+    ));
     std::fs::create_dir_all(&dest_root)?;
     // Recursive copy. cp -a preserves modes; we use -R for portability
     // (BSD cp doesn't honor -a on macOS the same way).
@@ -111,7 +110,7 @@ End with a single line `OVERALL: PASS` or `OVERALL: FAIL` — pass iff every \
 criterion passes.\n\nRubric:\n",
     );
     for (i, c) in criteria.iter().enumerate() {
-        prompt.push_str(&format!("{}. {c}\n", i + 1));
+        let _ = writeln!(prompt, "{}. {c}", i + 1);
     }
     prompt.push_str("\nCandidate artifact:\n");
     prompt.push_str(artifact);

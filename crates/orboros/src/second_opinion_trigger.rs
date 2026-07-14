@@ -221,6 +221,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss)]
     fn sampling_mode_approximates_target_rate_over_many_draws() {
         let o = done_orb_with_confidence(None);
         let mut c = cfg(SecondOpinionMode::Sampling);

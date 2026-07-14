@@ -540,8 +540,16 @@ impl QueueLoop {
                     orbs: &context_orbs,
                     edges: &context_edges,
                 };
-                dispatch_one_owned(store, orb, target, &base_wc, &prompt_resolver, context, hooks)
-                    .await
+                dispatch_one_owned(
+                    store,
+                    orb,
+                    target,
+                    &base_wc,
+                    &prompt_resolver,
+                    context,
+                    hooks,
+                )
+                .await
             });
         }
 
@@ -717,7 +725,7 @@ mod tests {
     use orbs::dep::{DepEdge, EdgeType};
     use orbs::orb::OrbType;
 
-    /// Helper: sets up a temp dir with orb_store, dep_store, and base_dir.
+    /// Helper: sets up a temp dir with `orb_store`, `dep_store`, and `base_dir`.
     fn setup() -> (tempfile::TempDir, OrbStore, DepStore, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let base = tmp.path().to_path_buf();
@@ -843,8 +851,8 @@ mod tests {
 
         // Re-load to get updated state
         let all_orbs = orb_store.load_all().unwrap();
-        let blocked = all_orbs.iter().find(|o| o.id == task.id).unwrap();
-        assert_eq!(blocked.status, Some(OrbStatus::Pending));
+        let blocked_task = all_orbs.iter().find(|o| o.id == task.id).unwrap();
+        assert_eq!(blocked_task.status, Some(OrbStatus::Pending));
     }
 
     #[test]

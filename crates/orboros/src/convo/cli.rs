@@ -36,7 +36,7 @@ const AWAIT_POLL_INTERVAL: Duration = Duration::from_millis(750);
 
 /// Default upper bound on `/await` wall time. The user can re-issue
 /// `/await` if the orb is taking longer.
-const AWAIT_TIMEOUT: Duration = Duration::from_secs(600);
+const AWAIT_TIMEOUT: Duration = Duration::from_mins(10);
 
 /// Slash command parsed from a user line.
 #[derive(Debug, Clone, PartialEq, Eq)]

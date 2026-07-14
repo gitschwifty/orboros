@@ -321,7 +321,7 @@ mod tests {
             let config = mock_worker_config();
 
             handles.push(tokio::spawn(async move {
-                let mut task = Task::new(&format!("Task {i}"), &format!("Do thing {i}"));
+                let mut task = Task::new(format!("Task {i}"), format!("Do thing {i}"));
                 store.append(&task).unwrap();
 
                 // Check active count during execution via a separate task

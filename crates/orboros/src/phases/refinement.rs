@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use orbs::orb::{Orb, OrbPhase};
@@ -180,15 +181,13 @@ return all-null and a brief note explaining why."
         orb.title, orb.description
     );
     if let Some(ref design) = orb.design {
-        user.push_str(&format!("\nDesign:\n{design}\n"));
+        let _ = write!(user, "\nDesign:\n{design}\n");
     }
     if let Some(ref ac) = orb.acceptance_criteria {
-        user.push_str(&format!("\nAcceptance criteria:\n{ac}\n"));
+        let _ = write!(user, "\nAcceptance criteria:\n{ac}\n");
     }
     if let Some(ref critique) = orb.review_critique {
-        user.push_str(&format!(
-            "\nReviewer feedback to incorporate:\n{critique}\n"
-        ));
+        let _ = write!(user, "\nReviewer feedback to incorporate:\n{critique}\n");
     }
     (system, user)
 }
@@ -206,7 +205,7 @@ pub fn parse_response(text: &str) -> Option<RefinementPlan> {
 pub fn apply_plan(orb: &mut Orb, plan: &RefinementPlan) {
     let mut any_change = false;
     if let Some(ref d) = plan.description {
-        orb.description = d.clone();
+        orb.description.clone_from(d);
         any_change = true;
     }
     if let Some(ref d) = plan.design {

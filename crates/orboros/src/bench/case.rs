@@ -169,9 +169,8 @@ pub fn load_tier(root: &Path, tier: BenchTier) -> Result<Vec<BenchCase>, CorpusE
     if !dir.exists() {
         return Ok(Vec::new());
     }
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(Vec::new()),
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(Vec::new());
     };
     let mut out = Vec::new();
     for entry in entries.flatten() {
@@ -307,7 +306,7 @@ command = "cargo test"
         assert_eq!(case.timeout_s, 300);
         assert_eq!(case.max_cost_cents, 200);
         assert_eq!(
-            case.seed_repo.as_deref().map(Path::to_str).flatten(),
+            case.seed_repo.as_deref().and_then(Path::to_str),
             Some("small-cli")
         );
     }

@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn detect_spec_empty_strings_treated_as_missing() {
         let mut orb = feature_orb("Auth flow", "Implement OAuth");
-        orb.design = Some("".into());
+        orb.design = Some(String::new());
         orb.acceptance_criteria = Some("  ".into());
 
         let result = detect_spec(&orb);

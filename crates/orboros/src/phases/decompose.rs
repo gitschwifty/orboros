@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use orbs::dep::{DepEdge, EdgeType};
@@ -204,10 +205,10 @@ one-line subtasks; each should be a meaningful unit of work."
         orb.title, orb.description
     );
     if let Some(ref design) = orb.design {
-        user.push_str(&format!("\nDesign:\n{design}\n"));
+        let _ = write!(user, "\nDesign:\n{design}\n");
     }
     if let Some(ref ac) = orb.acceptance_criteria {
-        user.push_str(&format!("\nAcceptance criteria:\n{ac}\n"));
+        let _ = write!(user, "\nAcceptance criteria:\n{ac}\n");
     }
     (system, user)
 }

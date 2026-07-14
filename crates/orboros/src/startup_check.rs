@@ -120,10 +120,7 @@ pub fn check_credentials_for_model(model: &str) -> anyhow::Result<()> {
     let provider = model.split('/').next().unwrap_or_default();
     match classify_provider(provider) {
         ProviderCheck::Known { env_var } => {
-            if std::env::var(env_var)
-                .map(|s| s.trim().is_empty())
-                .unwrap_or(true)
-            {
+            if std::env::var(env_var).map_or(true, |s| s.trim().is_empty()) {
                 anyhow::bail!(
                     "missing credentials for {provider}: set {env_var} \
                      (looked at .env and process env)"
@@ -196,7 +193,9 @@ mod tests {
         // Lock for the entire scope so a concurrent test doesn't observe
         // our half-applied state. Recover from poisoning since panics in
         // other tests can poison the mutex.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prior: Vec<(String, Option<String>)> = vars
             .iter()
             .map(|(k, _)| ((*k).to_string(), std::env::var(*k).ok()))

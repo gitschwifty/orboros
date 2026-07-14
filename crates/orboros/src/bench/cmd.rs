@@ -104,32 +104,12 @@ pub async fn cmd_bench_run(
                 &cases_root.join("..").join("fixtures"),
                 &opts,
             )
-            .map(Ok)
-            .unwrap_or_else(|e| {
-                Ok::<_, anyhow::Error>(crate::bench::store::BenchResult {
-                    case_id: case.id.clone(),
-                    run_id: run_id.clone(),
-                    tier: BenchTier::T2,
-                    status: BenchStatus::Error,
-                    score: 0.0,
-                    latency_ms: 0,
-                    cost_cents: 0,
-                    iterations: 0,
-                    worker_model: String::new(),
-                    prompt_hash: crate::bench::runner::prompt_hash(&case.prompt),
-                    system_prompt_hash: None,
-                    system_prompt_source: None,
-                    confidence: None,
-                    error: Some(e.to_string()),
-                })
-            })?,
-            BenchTier::T3 => crate::bench::runner_t2t3::run_t3_case_stub(case, &run_id, &opts)
-                .map(Ok)
-                .unwrap_or_else(|e| {
+            .map_or_else(
+                |e| {
                     Ok::<_, anyhow::Error>(crate::bench::store::BenchResult {
                         case_id: case.id.clone(),
                         run_id: run_id.clone(),
-                        tier: BenchTier::T3,
+                        tier: BenchTier::T2,
                         status: BenchStatus::Error,
                         score: 0.0,
                         latency_ms: 0,
@@ -142,7 +122,31 @@ pub async fn cmd_bench_run(
                         confidence: None,
                         error: Some(e.to_string()),
                     })
-                })?,
+                },
+                Ok,
+            )?,
+            BenchTier::T3 => crate::bench::runner_t2t3::run_t3_case_stub(case, &run_id, &opts)
+                .map_or_else(
+                    |e| {
+                        Ok::<_, anyhow::Error>(crate::bench::store::BenchResult {
+                            case_id: case.id.clone(),
+                            run_id: run_id.clone(),
+                            tier: BenchTier::T3,
+                            status: BenchStatus::Error,
+                            score: 0.0,
+                            latency_ms: 0,
+                            cost_cents: 0,
+                            iterations: 0,
+                            worker_model: String::new(),
+                            prompt_hash: crate::bench::runner::prompt_hash(&case.prompt),
+                            system_prompt_hash: None,
+                            system_prompt_source: None,
+                            confidence: None,
+                            error: Some(e.to_string()),
+                        })
+                    },
+                    Ok,
+                )?,
             BenchTier::T1 => unreachable!("T1 partitioned out above"),
         };
         if summary_run_id.is_none() {
@@ -223,11 +227,11 @@ pub fn cmd_bench_compare(store: &BenchStore, run_a: &str, run_b: &str) -> anyhow
                     }
                     _ => "changed",
                 };
-                let prompt_note = if r.prompt_hash != rb.prompt_hash {
+                let prompt_note = if r.prompt_hash == rb.prompt_hash {
+                    ""
+                } else {
                     prompt_changed += 1;
                     "  ⚠ prompt changed"
-                } else {
-                    ""
                 };
                 println!(
                     "{case:<24} {a:<10?} {b:<10?} {change}{prompt_note}",
@@ -272,7 +276,7 @@ pub fn cmd_bench_compare(store: &BenchStore, run_a: &str, run_b: &str) -> anyhow
 /// Returns an error if the store can't be read.
 pub fn cmd_bench_list_runs(store: &BenchStore) -> anyhow::Result<()> {
     let mut runs = store.read_runs()?;
-    runs.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    runs.sort_by_key(|run| std::cmp::Reverse(run.started_at));
     if runs.is_empty() {
         println!("No runs recorded.");
         return Ok(());

@@ -49,6 +49,7 @@ pub struct WorkerConfig {
 }
 
 /// A running worker process communicating over JSON-line IPC.
+#[allow(clippy::struct_field_names)]
 pub struct Worker {
     child: Child,
     stdin: Arc<TokioMutex<ChildStdin>>,
@@ -562,12 +563,8 @@ pub(crate) fn resolve_confidence(
     if let Some(v) = clamp_confidence(ipc_value) {
         return Some(v);
     }
-    let Some(body) = response.as_mut() else {
-        return None;
-    };
-    let Some((value, rewritten)) = extract_confidence_line(body) else {
-        return None;
-    };
+    let body = response.as_mut()?;
+    let (value, rewritten) = extract_confidence_line(body)?;
     *body = rewritten;
     clamp_confidence(Some(value))
 }
@@ -837,12 +834,11 @@ mod tests {
     }
 
     /// Integration test against real heddle-headless binary.
-    /// Only runs when HEDDLE_BINARY is set (skipped in normal test runs).
+    /// Only runs when `HEDDLE_BINARY` is set (skipped in normal test runs).
     #[tokio::test]
     async fn heddle_headless_init_handshake() {
-        let binary = match std::env::var("HEDDLE_BINARY") {
-            Ok(path) => path,
-            Err(_) => return,
+        let Ok(binary) = std::env::var("HEDDLE_BINARY") else {
+            return;
         };
 
         let config = WorkerConfig {
@@ -866,12 +862,11 @@ mod tests {
     }
 
     /// Full send/receive cycle against real heddle-headless.
-    /// Only runs when HEDDLE_BINARY is set (skipped in normal test runs).
+    /// Only runs when `HEDDLE_BINARY` is set (skipped in normal test runs).
     #[tokio::test]
     async fn heddle_headless_send_receive() {
-        let binary = match std::env::var("HEDDLE_BINARY") {
-            Ok(path) => path,
-            Err(_) => return,
+        let Ok(binary) = std::env::var("HEDDLE_BINARY") else {
+            return;
         };
 
         let config = WorkerConfig {

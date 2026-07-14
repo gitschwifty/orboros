@@ -401,22 +401,28 @@ mod tests {
 
     #[test]
     fn second_opinion_validate_rejects_threshold_above_one() {
-        let mut cfg = SecondOpinionConfig::default();
-        cfg.confidence_threshold = 1.2;
+        let cfg = SecondOpinionConfig {
+            confidence_threshold: 1.2,
+            ..Default::default()
+        };
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn second_opinion_validate_rejects_threshold_below_zero() {
-        let mut cfg = SecondOpinionConfig::default();
-        cfg.confidence_threshold = -0.1;
+        let cfg = SecondOpinionConfig {
+            confidence_threshold: -0.1,
+            ..Default::default()
+        };
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn second_opinion_validate_rejects_sampling_rate_out_of_range() {
-        let mut cfg = SecondOpinionConfig::default();
-        cfg.sampling_rate = 1.5;
+        let mut cfg = SecondOpinionConfig {
+            sampling_rate: 1.5,
+            ..Default::default()
+        };
         assert!(cfg.validate().is_err());
         cfg.sampling_rate = -0.5;
         assert!(cfg.validate().is_err());
@@ -424,8 +430,10 @@ mod tests {
 
     #[test]
     fn second_opinion_validate_rejects_non_finite() {
-        let mut cfg = SecondOpinionConfig::default();
-        cfg.confidence_threshold = f32::NAN;
+        let mut cfg = SecondOpinionConfig {
+            confidence_threshold: f32::NAN,
+            ..Default::default()
+        };
         assert!(cfg.validate().is_err());
         cfg.confidence_threshold = 0.5;
         cfg.sampling_rate = f32::INFINITY;
@@ -543,11 +551,11 @@ default_model = "project-model"
         std::fs::create_dir_all(&global_dir).unwrap();
         std::fs::write(
             global_dir.join("config.toml"),
-            r#"
+            r"
 [review]
 requires_approval_by_default = true
 review_on_completion = false
-"#,
+",
         )
         .unwrap();
 
@@ -556,10 +564,10 @@ review_on_completion = false
         std::fs::create_dir_all(&orbs_dir).unwrap();
         std::fs::write(
             orbs_dir.join("config.toml"),
-            r#"
+            r"
 [review]
 review_on_completion = true
-"#,
+",
         )
         .unwrap();
 

@@ -456,6 +456,7 @@ fn make_worker_config(binary: &str, model: &str, system_prompt: &str) -> WorkerC
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() -> anyhow::Result<()> {
     // Load .env from current dir or ancestors (silently ignore if missing)
     let _ = dotenvy::dotenv();
@@ -819,6 +820,7 @@ fn cmd_chat(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_run(
     store: &TaskStore,
     worker_binary: Option<&str>,
@@ -918,6 +920,7 @@ fn cmd_decompose(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_orchestrate(
     store: &TaskStore,
     worker_binary: Option<&str>,

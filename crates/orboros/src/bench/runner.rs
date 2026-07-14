@@ -67,18 +67,12 @@ pub const T1_ATTEMPTS: u32 = 3;
 pub const T1_PASS_THRESHOLD: u32 = 2;
 
 /// Options for [`run_t1_case`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RunOptions {
     /// If false, the harness aborts further attempts on a case once
     /// `max_cost_cents` is exceeded. If true, all N attempts run
     /// regardless of accumulated cost.
     pub no_budget: bool,
-}
-
-impl Default for RunOptions {
-    fn default() -> Self {
-        Self { no_budget: false }
-    }
 }
 
 /// SHA-256 of the prompt, hex-encoded. Used for `prompt_hash` on
@@ -96,6 +90,7 @@ pub fn prompt_hash(prompt: &str) -> String {
 ///
 /// Returns an error if the worker can't be spawned at all. Per-attempt
 /// failures are folded into the result rather than propagated.
+#[allow(clippy::too_many_lines)]
 pub async fn run_t1_case(
     case: &BenchCase,
     run_id: &str,
@@ -189,18 +184,20 @@ pub async fn run_t1_case(
     } else {
         BenchStatus::Fail
     };
+    #[allow(clippy::cast_possible_truncation)]
     let score = if attempts_run == 0 {
         0.0
     } else {
         f64::from(passes) as f32 / f64::from(attempts_run) as f32
     };
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     info!(
         case = %case.id,
         status = ?status,
         passes,
         fails,
-        elapsed_ms = started.elapsed().as_millis() as u64,
+        elapsed_ms,
         "T1 case complete",
     );
 
@@ -210,7 +207,7 @@ pub async fn run_t1_case(
         tier: BenchTier::T1,
         status,
         score,
-        latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        latency_ms: elapsed_ms,
         cost_cents: accumulated_cost,
         iterations: total_iters,
         worker_model: base_worker_config.model.clone(),

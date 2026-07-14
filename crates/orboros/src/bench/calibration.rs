@@ -10,6 +10,8 @@
 //! the thing a human actually reads; the correlation coefficient is
 //! a single-number knob useful for `bench compare` over time.
 
+use std::fmt::Write as _;
+
 use crate::bench::store::{BenchResult, BenchStatus};
 
 /// Per-bucket calibration data over the `[0.0, 1.0]` confidence range.
@@ -30,6 +32,7 @@ impl CalibrationBucket {
     /// Empirical pass rate within the bucket. Returns `None` when
     /// the bucket is empty (avoids fake 0/0 = 0.0 readings).
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn pass_rate(&self) -> Option<f32> {
         if self.count == 0 {
             None
@@ -59,6 +62,12 @@ pub struct CalibrationReport {
 /// `bucket_count` must be ≥ 1; the function picks a sensible default
 /// of 10 when given anything smaller.
 #[must_use]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 pub fn calibrate(results: &[BenchResult], bucket_count: usize) -> CalibrationReport {
     let n = bucket_count.max(1);
     let width = 1.0_f32 / n as f32;
@@ -116,28 +125,34 @@ pub fn render_report(report: &CalibrationReport) -> String {
     for b in &report.buckets {
         let rate = b
             .pass_rate()
-            .map_or(String::from("    —"), |r| format!("{:.2}", r));
-        out.push_str(&format!(
-            "[{lo:.2}, {hi:.2})    {count:>4}   {passes:>4}     {rate}\n",
+            .map_or(String::from("    —"), |r| format!("{r:.2}"));
+        let _ = writeln!(
+            out,
+            "[{lo:.2}, {hi:.2})    {count:>4}   {passes:>4}     {rate}",
             lo = b.lo,
             hi = b.hi,
             count = b.count,
             passes = b.passes,
-        ));
+        );
     }
-    out.push_str(&format!(
+    let _ = write!(
+        out,
         "\nresults without confidence: {}\n",
         report.missing_confidence,
-    ));
+    );
     match report.correlation {
-        Some(c) => out.push_str(&format!(
-            "correlation(confidence, pass): {c:+.3}  (1.0 = perfectly calibrated)\n",
-        )),
+        Some(c) => {
+            let _ = writeln!(
+                out,
+                "correlation(confidence, pass): {c:+.3}  (1.0 = perfectly calibrated)"
+            );
+        }
         None => out.push_str("correlation: insufficient samples\n"),
     }
     out
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn pearson_correlation(xs: &[f32], ys: &[f32]) -> Option<f32> {
     let n = xs.len();
     if n < 2 || n != ys.len() {
@@ -259,6 +274,7 @@ mod tests {
     // ── correlation ──────────────────────────────────────────
 
     #[test]
+    #[allow(clippy::cast_precision_loss)]
     fn correlation_is_positive_when_confidence_tracks_pass() {
         let mut res = Vec::new();
         for i in 0..10 {
@@ -279,6 +295,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_precision_loss)]
     fn correlation_is_negative_when_confidence_anti_correlates() {
         let mut res = Vec::new();
         for i in 0..10 {

@@ -232,7 +232,7 @@ fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>, Store
 pub fn new_run_id() -> String {
     let now = Utc::now();
     let suffix: u32 = rand::random();
-    format!("bench-{}-{:08x}", now.format("%Y%m%d%H%M%S"), suffix,)
+    format!("bench-{}-{:08x}", now.format("%Y%m%d%H%M%S"), suffix)
 }
 
 #[cfg(test)]

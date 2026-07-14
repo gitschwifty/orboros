@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use orbs::dep::EdgeType;
 use orbs::dep_store::DepStore;
 use orbs::id::OrbId;
@@ -201,14 +203,14 @@ output meaningfully contradicts the plan. Reserve `abort` for unrecoverable case
         orb.title, orb.description
     );
     if let Some(ref design) = orb.design {
-        user.push_str(&format!("\nDesign:\n{design}\n"));
+        let _ = write!(user, "\nDesign:\n{design}\n");
     }
     user.push_str("\nChildren's results:\n");
     if child_summaries.is_empty() {
         user.push_str("(no children — nothing to evaluate)\n");
     } else {
         for (i, s) in child_summaries.iter().enumerate() {
-            user.push_str(&format!("{}. {s}\n", i + 1));
+            let _ = writeln!(user, "{}. {s}", i + 1);
         }
     }
     (system, user)

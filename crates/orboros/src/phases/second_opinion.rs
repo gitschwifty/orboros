@@ -9,6 +9,8 @@
 //! review checkpoint — that's a status the orb sits in waiting for a
 //! human decision. This module's reviewer is an automated agent.
 
+use std::fmt::Write as _;
+
 use chrono::Utc;
 use orbs::orb::Orb;
 use orbs::review::{ReviewReport, ReviewVerdict, ReviseScope};
@@ -60,10 +62,10 @@ unless verdict is \"accept\". {addendum}",
 
     let mut user = format!("Task description:\n{}\n\n", orb.description);
     if let Some(ref ac) = orb.acceptance_criteria {
-        user.push_str(&format!("Acceptance criteria:\n{ac}\n\n"));
+        let _ = write!(user, "Acceptance criteria:\n{ac}\n\n");
     }
     if let Some(ref result) = orb.result {
-        user.push_str(&format!("Candidate result:\n{result}\n"));
+        let _ = writeln!(user, "Candidate result:\n{result}");
     }
     (system, user)
 }

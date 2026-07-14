@@ -113,10 +113,8 @@ pub fn verdict_label(v: &ReviewVerdict) -> &'static str {
 
 fn matches_review_filter(orb: &Orb, filter: ReviewStatusFilter) -> bool {
     match (filter, orb.review_report.as_ref()) {
-        (ReviewStatusFilter::Missing, None) => true,
-        (ReviewStatusFilter::Missing, Some(_)) => false,
-        (_, None) => false,
-        (ReviewStatusFilter::Any, Some(_)) => true,
+        (ReviewStatusFilter::Missing, None) | (ReviewStatusFilter::Any, Some(_)) => true,
+        (ReviewStatusFilter::Missing, Some(_)) | (_, None) => false,
         (ReviewStatusFilter::Accept, Some(r)) => r.verdict.is_accept(),
         (ReviewStatusFilter::Reject, Some(r)) => r.verdict.is_reject(),
         (ReviewStatusFilter::Revise, Some(r)) => r.verdict.is_revise(),
@@ -355,22 +353,20 @@ pub fn cmd_orb_list(
 /// Returns an error if the store read fails.
 pub fn cmd_review_queue(store: &OrbStore) -> anyhow::Result<()> {
     let orbs = store.load_all().context("failed to load orbs")?;
-    let mut revising: Vec<&Orb> = orbs
+    let mut revising: Vec<(&Orb, &orbs::review::ReviewReport)> = orbs
         .iter()
-        .filter(|o| {
-            o.review_report
-                .as_ref()
-                .is_some_and(|r| r.verdict.is_revise())
+        .filter_map(|orb| {
+            let report = orb.review_report.as_ref()?;
+            report.verdict.is_revise().then_some((orb, report))
         })
         .collect();
-    revising.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+    revising.sort_by(|(a, _), (b, _)| a.id.as_str().cmp(b.id.as_str()));
 
     if revising.is_empty() {
         println!("Review queue empty.");
         return Ok(());
     }
-    for orb in &revising {
-        let report = orb.review_report.as_ref().unwrap();
+    for (orb, report) in &revising {
         let preview = report
             .critique
             .lines()
@@ -390,12 +386,6 @@ pub fn cmd_review_queue(store: &OrbStore) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Updates specified fields on an existing orb.
-///
-/// # Errors
-///
-/// Returns an error if the orb is not found, the status string is invalid,
-/// or the store write fails.
 /// Label edit instructions for `cmd_orb_update`. When `set` is Some
 /// it wins outright — the orb's label list becomes the normalized
 /// version of `set` and `add`/`remove` are ignored. Otherwise, the
@@ -434,7 +424,13 @@ impl LabelEdits {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Updates specified fields on an existing orb.
+///
+/// # Errors
+///
+/// Returns an error if the orb is not found, the status string is invalid,
+/// or the store write fails.
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
 pub fn cmd_orb_update(
     store: &OrbStore,
     id: &str,
