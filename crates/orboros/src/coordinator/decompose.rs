@@ -78,7 +78,7 @@ pub async fn decompose_with_prompt_resolver(
 ) -> anyhow::Result<DecomposeResult> {
     let system_prompt = prompt_resolver
         .resolve_system_prompt(
-            crate::prompt::PromptKind::Worker("decompose"),
+            crate::prompt::PromptKind::Coordinator("decompose"),
             DECOMPOSE_SYSTEM_PROMPT,
         )?
         .system_prompt;

@@ -153,6 +153,54 @@ CLI flags                       # Per-invocation overrides
 default_model = "anthropic/claude-sonnet-4-20250514"
 max_concurrency = 4
 
+[models.default]
+worker = "balanced"
+coordinator = "planner"
+reviewer = "fast"
+bench = "balanced"
+
+[models.options.balanced]
+model = "openrouter/anthropic/claude-sonnet-4"
+description = "Default strong coding and planning model."
+provider = "anthropic"
+router = "openrouter"
+reasoning = "medium"
+effort = "medium"
+
+[models.options.fast]
+model = "openrouter/openai/gpt-4.1-mini"
+description = "Cheap fast model for review, grading, and simple tasks."
+provider = "openai"
+router = "openrouter"
+reasoning = "low"
+effort = "low"
+
+[models.options.planner]
+model = "openrouter/openai/gpt-5"
+description = "Higher-effort planning and decomposition model."
+provider = "openai"
+router = "openrouter"
+reasoning = "high"
+effort = "high"
+
+[models.workers]
+research = "fast"
+edit = "balanced"
+review = "balanced"
+test = "fast"
+
+[models.coordinators]
+decompose = "planner"
+aggregate = "fast"
+
+[models.phases]
+speccing = "planner"
+refining = "balanced"
+
+[models.bench]
+default = "balanced"
+grader = "fast"
+
 [review]
 requires_approval_by_default = false
 review_on_completion = true
@@ -167,6 +215,12 @@ system = "You are an implementation worker. Make focused, tested code changes."
 [prompts.workers.review]
 system_file = "prompts/review.md" # resolves from .orbs/prompts/review.md
 
+[prompts.coordinators.decompose]
+system_file = "prompts/decompose.md"
+
+[prompts.coordinators.aggregate]
+system = "You synthesize completed subtask results into the final answer."
+
 [prompts.phases.speccing]
 system_file = "prompts/speccing.md"
 
@@ -176,11 +230,17 @@ system = "You are refining an Orboros plan. Return only the requested JSON shape
 
 Projects are registered in `~/.orboros/projects.toml` automatically on `orboros init`.
 
+Model catalog entries are optional; configs with only `default_model` still work.
+Role mappings may reference a named catalog option or a raw `provider/model`
+string. OpenRouter-routed catalog options can use `router = "openrouter"` while
+keeping provider metadata for the underlying model family.
+
 Prompt overrides fall back to role-specific built-in prompts when omitted.
 Worker keys include subtask roles like `research`, `edit`, `review`, `test`,
-and `plan`, plus coordinator roles like `decompose`, `aggregate`, and the orb
-execution worker `execute`. Phase keys include `speccing`, `decomposing`,
-`refining`, and `reevaluating`.
+and `plan`, plus the orb execution worker `execute`. Coordinator keys include
+`decompose` and `aggregate`. Phase keys include `speccing`, `decomposing`,
+`refining`, and `reevaluating`. Legacy `[prompts.workers.decompose]` and
+`[prompts.workers.aggregate]` entries still work as a compatibility fallback.
 
 For one-shot worker-spawning commands, CLI prompt overrides take precedence over
 global/project config:
@@ -261,9 +321,13 @@ crates/
 ## Development
 
 ```bash
-cargo test                # 540 tests
-cargo clippy --workspace  # lint (pedantic)
-cargo fmt --all           # format
+just ci                  # fmt-check + clippy + tests
+just test                # cargo test
+just clippy              # cargo clippy --all-targets -- -D warnings
+just fmt                 # cargo fmt
+just bench-init          # create local gitignored bench/ dirs
+just bench-list          # list local benchmark cases
+just bench-run t1        # run local T1 benchmark cases
 ```
 
 Tests use mock worker scripts (`test-fixtures/mock-worker*.sh`) for fast unit tests. Set `HEDDLE_BINARY` for integration tests against a real heddle instance.

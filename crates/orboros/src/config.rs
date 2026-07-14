@@ -14,6 +14,7 @@ pub struct OrbConfig {
     pub default_model: String,
     pub max_concurrency: usize,
     pub worker_binary: Option<String>,
+    pub models: ModelConfig,
     pub prompts: PromptConfig,
     pub review: ReviewConfig,
     pub second_opinion: SecondOpinionConfig,
@@ -26,6 +27,7 @@ impl Default for OrbConfig {
             default_model: "openrouter/free".to_string(),
             max_concurrency: 4,
             worker_binary: None,
+            models: ModelConfig::default(),
             prompts: PromptConfig::default(),
             review: ReviewConfig::default(),
             second_opinion: SecondOpinionConfig::default(),
@@ -36,9 +38,283 @@ impl Default for OrbConfig {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
+pub struct ModelConfig {
+    pub default: ModelDefaults,
+    pub options: BTreeMap<String, ModelOption>,
+    pub workers: BTreeMap<String, String>,
+    pub coordinators: BTreeMap<String, String>,
+    pub phases: BTreeMap<String, String>,
+    pub bench: BenchModelConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelDefaults {
+    pub worker: Option<String>,
+    pub coordinator: Option<String>,
+    pub phase: Option<String>,
+    pub reviewer: Option<String>,
+    pub bench: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct BenchModelConfig {
+    pub default: Option<String>,
+    pub grader: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelOption {
+    pub model: String,
+    pub description: Option<String>,
+    pub provider: Option<String>,
+    pub router: Option<String>,
+    pub reasoning: Option<String>,
+    pub effort: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelRole<'a> {
+    Worker(&'a str),
+    Coordinator(&'a str),
+    Phase(&'a str),
+    Reviewer,
+    BenchDefault,
+    BenchGrader,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModel {
+    pub key: Option<String>,
+    pub model: String,
+    pub description: Option<String>,
+    pub provider: Option<String>,
+    pub router: Option<String>,
+    pub reasoning: Option<String>,
+    pub effort: Option<String>,
+    pub source: String,
+}
+
+pub struct ModelResolver<'a> {
+    config: &'a OrbConfig,
+}
+
+impl ModelConfig {
+    /// Validates catalog references. Raw `provider/model` selectors remain
+    /// allowed for compatibility with the existing `default_model` surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a named selector points at no catalog option, or
+    /// a catalog option has an empty model string.
+    pub fn validate(&self) -> Result<(), String> {
+        for (key, option) in &self.options {
+            if option.model.trim().is_empty() {
+                return Err(format!("models.options.{key}.model must not be empty"));
+            }
+        }
+
+        for (path, selector) in self.selectors() {
+            self.validate_selector(&path, selector)?;
+        }
+
+        Ok(())
+    }
+
+    fn selectors(&self) -> Vec<(String, &str)> {
+        let mut selectors = Vec::new();
+
+        for (path, selector) in [
+            ("models.default.worker", self.default.worker.as_deref()),
+            (
+                "models.default.coordinator",
+                self.default.coordinator.as_deref(),
+            ),
+            ("models.default.phase", self.default.phase.as_deref()),
+            ("models.default.reviewer", self.default.reviewer.as_deref()),
+            ("models.default.bench", self.default.bench.as_deref()),
+            ("models.bench.default", self.bench.default.as_deref()),
+            ("models.bench.grader", self.bench.grader.as_deref()),
+        ] {
+            if let Some(selector) = selector {
+                selectors.push((path.to_string(), selector));
+            }
+        }
+
+        selectors.extend(
+            self.workers
+                .iter()
+                .map(|(key, selector)| (format!("models.workers.{key}"), selector.as_str())),
+        );
+        selectors.extend(
+            self.coordinators
+                .iter()
+                .map(|(key, selector)| (format!("models.coordinators.{key}"), selector.as_str())),
+        );
+        selectors.extend(
+            self.phases
+                .iter()
+                .map(|(key, selector)| (format!("models.phases.{key}"), selector.as_str())),
+        );
+
+        selectors
+    }
+
+    fn validate_selector(&self, path: &str, selector: &str) -> Result<(), String> {
+        if selector.trim().is_empty() {
+            return Err(format!("{path} must not be empty"));
+        }
+        if !selector.contains('/') && !self.options.contains_key(selector) {
+            return Err(format!(
+                "{path} references unknown model option `{selector}`"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl OrbConfig {
+    #[must_use]
+    pub fn model_resolver(&self) -> ModelResolver<'_> {
+        ModelResolver { config: self }
+    }
+}
+
+impl ModelResolver<'_> {
+    /// Resolves a model role to the configured catalog option or legacy raw
+    /// model string.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a selector names an unknown catalog option.
+    pub fn resolve(&self, role: ModelRole<'_>) -> anyhow::Result<ResolvedModel> {
+        let models = &self.config.models;
+        let (selector, source) = match role {
+            ModelRole::Worker(worker_type) => models
+                .workers
+                .get(worker_type)
+                .map(|selector| (selector.as_str(), format!("models.workers.{worker_type}")))
+                .or_else(|| {
+                    models
+                        .default
+                        .worker
+                        .as_deref()
+                        .map(|selector| (selector, "models.default.worker".to_string()))
+                }),
+            ModelRole::Coordinator(name) => models
+                .coordinators
+                .get(name)
+                .map(|selector| (selector.as_str(), format!("models.coordinators.{name}")))
+                .or_else(|| {
+                    models
+                        .default
+                        .coordinator
+                        .as_deref()
+                        .map(|selector| (selector, "models.default.coordinator".to_string()))
+                }),
+            ModelRole::Phase(name) => models
+                .phases
+                .get(name)
+                .map(|selector| (selector.as_str(), format!("models.phases.{name}")))
+                .or_else(|| {
+                    models
+                        .default
+                        .phase
+                        .as_deref()
+                        .map(|selector| (selector, "models.default.phase".to_string()))
+                }),
+            ModelRole::Reviewer => self
+                .config
+                .second_opinion
+                .reviewer_model
+                .as_deref()
+                .map(|selector| (selector, "second_opinion.reviewer_model".to_string()))
+                .or_else(|| {
+                    models
+                        .default
+                        .reviewer
+                        .as_deref()
+                        .map(|selector| (selector, "models.default.reviewer".to_string()))
+                }),
+            ModelRole::BenchDefault => models
+                .bench
+                .default
+                .as_deref()
+                .map(|selector| (selector, "models.bench.default".to_string()))
+                .or_else(|| {
+                    models
+                        .default
+                        .bench
+                        .as_deref()
+                        .map(|selector| (selector, "models.default.bench".to_string()))
+                }),
+            ModelRole::BenchGrader => models
+                .bench
+                .grader
+                .as_deref()
+                .map(|selector| (selector, "models.bench.grader".to_string()))
+                .or_else(|| {
+                    models
+                        .default
+                        .bench
+                        .as_deref()
+                        .map(|selector| (selector, "models.default.bench".to_string()))
+                }),
+        }
+        .unwrap_or((&self.config.default_model, "default_model".to_string()));
+
+        self.resolve_selector(selector, source)
+    }
+
+    fn resolve_selector(&self, selector: &str, source: String) -> anyhow::Result<ResolvedModel> {
+        if let Some(option) = self.config.models.options.get(selector) {
+            let provider = option
+                .provider
+                .clone()
+                .or_else(|| infer_provider(&option.model));
+            return Ok(ResolvedModel {
+                key: Some(selector.to_string()),
+                model: option.model.clone(),
+                description: option.description.clone(),
+                provider,
+                router: option.router.clone().or(Some("openrouter".to_string())),
+                reasoning: option.reasoning.clone(),
+                effort: option.effort.clone(),
+                source,
+            });
+        }
+
+        if selector.contains('/') {
+            return Ok(ResolvedModel {
+                key: None,
+                model: selector.to_string(),
+                description: None,
+                provider: infer_provider(selector),
+                router: None,
+                reasoning: None,
+                effort: None,
+                source,
+            });
+        }
+
+        anyhow::bail!("unknown model option `{selector}` referenced by {source}");
+    }
+}
+
+fn infer_provider(model: &str) -> Option<String> {
+    model
+        .split_once('/')
+        .and_then(|(provider, _)| (!provider.is_empty()).then(|| provider.to_string()))
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
 pub struct PromptConfig {
     pub default: PromptOverride,
     pub workers: BTreeMap<String, PromptOverride>,
+    pub coordinators: BTreeMap<String, PromptOverride>,
     pub phases: BTreeMap<String, PromptOverride>,
 }
 
@@ -216,6 +492,7 @@ pub(crate) fn load_config_with_home(
         .second_opinion
         .validate()
         .map_err(|e| anyhow::anyhow!(e))?;
+    config.models.validate().map_err(|e| anyhow::anyhow!(e))?;
     Ok(config)
 }
 
@@ -357,6 +634,7 @@ mod tests {
         assert_eq!(cfg.default_model, "openrouter/free");
         assert_eq!(cfg.max_concurrency, 4);
         assert!(cfg.worker_binary.is_none());
+        assert!(cfg.models.options.is_empty());
         assert!(!cfg.review.requires_approval_by_default);
         assert!(cfg.review.review_on_completion);
         assert!(cfg.notification.enabled);
@@ -365,6 +643,222 @@ mod tests {
         assert!((cfg.second_opinion.confidence_threshold - 0.7).abs() < f32::EPSILON);
         assert!((cfg.second_opinion.sampling_rate - 0.1).abs() < f32::EPSILON);
         assert!(cfg.second_opinion.reviewer_model.is_none());
+    }
+
+    #[test]
+    fn model_catalog_parses_from_toml() {
+        let toml_str = r#"
+default_model = "openrouter/free"
+
+[models.default]
+worker = "balanced"
+coordinator = "planner"
+reviewer = "fast"
+bench = "balanced"
+
+[models.options.balanced]
+model = "openrouter/anthropic/claude-sonnet-4"
+description = "Default coding model"
+provider = "anthropic"
+router = "openrouter"
+reasoning = "medium"
+effort = "medium"
+
+[models.options.fast]
+model = "openrouter/openai/gpt-4.1-mini"
+description = "Cheap fast model"
+
+[models.options.planner]
+model = "openrouter/openai/gpt-5"
+description = "Planning model"
+reasoning = "high"
+
+[models.workers]
+research = "fast"
+
+[models.coordinators]
+decompose = "planner"
+
+[models.phases]
+speccing = "planner"
+
+[models.bench]
+grader = "fast"
+"#;
+
+        let parsed: OrbConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.models.default.worker.as_deref(), Some("balanced"));
+        assert_eq!(
+            parsed.models.options["balanced"].description.as_deref(),
+            Some("Default coding model")
+        );
+        assert_eq!(parsed.models.workers["research"], "fast");
+        assert!(parsed.models.validate().is_ok());
+    }
+
+    #[test]
+    fn model_resolver_prefers_role_specific_catalog_option() {
+        let cfg: OrbConfig = toml::from_str(
+            r#"
+default_model = "openrouter/free"
+
+[models.default]
+worker = "balanced"
+
+[models.options.balanced]
+model = "openrouter/anthropic/claude-sonnet-4"
+description = "Balanced default"
+
+[models.options.fast]
+model = "openrouter/openai/gpt-4.1-mini"
+description = "Fast cheap model"
+reasoning = "low"
+effort = "low"
+
+[models.workers]
+research = "fast"
+"#,
+        )
+        .unwrap();
+
+        let resolved = cfg
+            .model_resolver()
+            .resolve(ModelRole::Worker("research"))
+            .unwrap();
+        assert_eq!(resolved.key.as_deref(), Some("fast"));
+        assert_eq!(resolved.model, "openrouter/openai/gpt-4.1-mini");
+        assert_eq!(resolved.description.as_deref(), Some("Fast cheap model"));
+        assert_eq!(resolved.router.as_deref(), Some("openrouter"));
+        assert_eq!(resolved.reasoning.as_deref(), Some("low"));
+        assert_eq!(resolved.effort.as_deref(), Some("low"));
+        assert_eq!(resolved.source, "models.workers.research");
+    }
+
+    #[test]
+    fn model_resolver_falls_back_to_default_model() {
+        let cfg = OrbConfig {
+            default_model: "openrouter/free".into(),
+            ..Default::default()
+        };
+
+        let resolved = cfg
+            .model_resolver()
+            .resolve(ModelRole::Coordinator("decompose"))
+            .unwrap();
+        assert_eq!(resolved.key, None);
+        assert_eq!(resolved.model, "openrouter/free");
+        assert_eq!(resolved.provider.as_deref(), Some("openrouter"));
+        assert_eq!(resolved.source, "default_model");
+    }
+
+    #[test]
+    fn model_resolver_uses_reviewer_legacy_override() {
+        let cfg = OrbConfig {
+            default_model: "openrouter/free".into(),
+            second_opinion: SecondOpinionConfig {
+                reviewer_model: Some("openai/gpt-4.1-mini".into()),
+                ..Default::default()
+            },
+            models: ModelConfig {
+                default: ModelDefaults {
+                    reviewer: Some("reviewer".into()),
+                    ..Default::default()
+                },
+                options: [(
+                    "reviewer".into(),
+                    ModelOption {
+                        model: "openrouter/anthropic/claude-haiku".into(),
+                        ..Default::default()
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let resolved = cfg.model_resolver().resolve(ModelRole::Reviewer).unwrap();
+        assert_eq!(resolved.model, "openai/gpt-4.1-mini");
+        assert_eq!(resolved.source, "second_opinion.reviewer_model");
+    }
+
+    #[test]
+    fn model_resolver_errors_on_unknown_catalog_key() {
+        let cfg = OrbConfig {
+            default_model: "openrouter/free".into(),
+            models: ModelConfig {
+                workers: [("edit".into(), "missing".into())].into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = cfg
+            .model_resolver()
+            .resolve(ModelRole::Worker("edit"))
+            .unwrap_err();
+        assert!(format!("{err}").contains("unknown model option"));
+    }
+
+    #[test]
+    fn load_config_rejects_unknown_model_catalog_key() {
+        let home = tempdir().unwrap();
+        let global_dir = home.path().join(".orboros");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        std::fs::write(
+            global_dir.join("config.toml"),
+            r#"
+[models.workers]
+edit = "missing"
+"#,
+        )
+        .unwrap();
+
+        let err = load_config_with_home(Some(home.path()), None).unwrap_err();
+        assert!(format!("{err}").contains("unknown model option"));
+    }
+
+    #[test]
+    fn load_config_merges_model_catalog_sections() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+
+        let global_dir = home.path().join(".orboros");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        std::fs::write(
+            global_dir.join("config.toml"),
+            r#"
+[models.default]
+worker = "balanced"
+
+[models.options.balanced]
+model = "openrouter/anthropic/claude-sonnet-4"
+
+[models.options.fast]
+model = "openrouter/openai/gpt-4.1-mini"
+
+[models.workers]
+research = "fast"
+edit = "balanced"
+"#,
+        )
+        .unwrap();
+
+        let orbs_dir = project.path().join(".orbs");
+        std::fs::create_dir_all(&orbs_dir).unwrap();
+        std::fs::write(
+            orbs_dir.join("config.toml"),
+            r#"
+[models.workers]
+edit = "fast"
+"#,
+        )
+        .unwrap();
+
+        let cfg = load_config_with_home(Some(home.path()), Some(project.path())).unwrap();
+        assert_eq!(cfg.models.default.worker.as_deref(), Some("balanced"));
+        assert_eq!(cfg.models.workers["research"], "fast");
+        assert_eq!(cfg.models.workers["edit"], "fast");
     }
 
     #[test]
@@ -592,6 +1086,9 @@ system = "global default"
 [prompts.workers.edit]
 system = "global edit"
 
+[prompts.coordinators.decompose]
+system = "global decompose"
+
 [prompts.phases.speccing]
 system = "global speccing"
 "#,
@@ -619,6 +1116,10 @@ system = "project speccing"
             Some("global edit")
         );
         assert_eq!(
+            cfg.prompts.coordinators["decompose"].system.as_deref(),
+            Some("global decompose")
+        );
+        assert_eq!(
             cfg.prompts.phases["speccing"].system.as_deref(),
             Some("project speccing")
         );
@@ -641,6 +1142,23 @@ system = "project speccing"
             default_model: "test-model".to_string(),
             max_concurrency: 16,
             worker_binary: Some("/usr/bin/heddle".to_string()),
+            models: ModelConfig {
+                default: ModelDefaults {
+                    worker: Some("balanced".into()),
+                    ..Default::default()
+                },
+                options: [(
+                    "balanced".into(),
+                    ModelOption {
+                        model: "openrouter/anthropic/claude-sonnet-4".into(),
+                        description: Some("Balanced test model".into()),
+                        ..Default::default()
+                    },
+                )]
+                .into(),
+                workers: [("edit".into(), "balanced".into())].into(),
+                ..Default::default()
+            },
             prompts: PromptConfig {
                 workers: [(
                     "edit".into(),

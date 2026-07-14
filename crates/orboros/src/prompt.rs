@@ -81,6 +81,7 @@ Complete the task described in the user message. Keep the work scoped, verify th
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptKind<'a> {
     Worker(&'a str),
+    Coordinator(&'a str),
     Phase(&'a str),
 }
 
@@ -119,6 +120,7 @@ impl PromptKind<'_> {
     pub fn category(&self) -> String {
         match self {
             Self::Worker(worker_type) => format!("worker.{worker_type}"),
+            Self::Coordinator(coordinator) => format!("coordinator.{coordinator}"),
             Self::Phase(phase) => format!("phase.{phase}"),
         }
     }
@@ -208,11 +210,23 @@ impl PromptResolver {
                 format!("workers.{worker_type}"),
                 self.config.workers.get(worker_type),
             ),
+            PromptKind::Coordinator(coordinator) => (
+                format!("coordinators.{coordinator}"),
+                self.config.coordinators.get(coordinator),
+            ),
             PromptKind::Phase(phase) => (format!("phases.{phase}"), self.config.phases.get(phase)),
         };
 
         if let Some(resolved) = self.resolve_override(&key, specific)? {
             return Ok(resolved);
+        }
+        if let PromptKind::Coordinator(coordinator) = kind {
+            let legacy_key = format!("workers.{coordinator}");
+            if let Some(resolved) =
+                self.resolve_override(&legacy_key, self.config.workers.get(coordinator))?
+            {
+                return Ok(resolved);
+            }
         }
         if let Some(resolved) = self.resolve_override("default", Some(&self.config.default))? {
             return Ok(resolved);
@@ -392,6 +406,10 @@ mod tests {
     #[test]
     fn prompt_kind_category_is_persistable() {
         assert_eq!(PromptKind::Worker("edit").category(), "worker.edit");
+        assert_eq!(
+            PromptKind::Coordinator("aggregate").category(),
+            "coordinator.aggregate"
+        );
         assert_eq!(PromptKind::Phase("speccing").category(), "phase.speccing");
     }
 
@@ -491,6 +509,7 @@ mod tests {
                 },
             )]
             .into(),
+            coordinators: BTreeMap::new(),
             phases: BTreeMap::new(),
         };
         let resolver = PromptResolver::new(config, None, None);
@@ -504,6 +523,70 @@ mod tests {
             answer.source,
             PromptSource::ConfigInline {
                 key: "workers.edit".into()
+            }
+        );
+    }
+
+    #[test]
+    fn coordinator_override_wins_over_legacy_worker_key() {
+        let config = PromptConfig {
+            workers: [(
+                "decompose".into(),
+                PromptOverride {
+                    system: Some("legacy decompose".into()),
+                    system_file: None,
+                },
+            )]
+            .into(),
+            coordinators: [(
+                "decompose".into(),
+                PromptOverride {
+                    system: Some("coordinator decompose".into()),
+                    system_file: None,
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let resolver = PromptResolver::new(config, None, None);
+
+        let answer = resolver
+            .resolve_system_prompt(PromptKind::Coordinator("decompose"), "built in")
+            .unwrap();
+
+        assert_eq!(answer.system_prompt, "coordinator decompose");
+        assert_eq!(
+            answer.source,
+            PromptSource::ConfigInline {
+                key: "coordinators.decompose".into()
+            }
+        );
+    }
+
+    #[test]
+    fn coordinator_prompt_falls_back_to_legacy_worker_key() {
+        let config = PromptConfig {
+            workers: [(
+                "aggregate".into(),
+                PromptOverride {
+                    system: Some("legacy aggregate".into()),
+                    system_file: None,
+                },
+            )]
+            .into(),
+            ..Default::default()
+        };
+        let resolver = PromptResolver::new(config, None, None);
+
+        let answer = resolver
+            .resolve_system_prompt(PromptKind::Coordinator("aggregate"), "built in")
+            .unwrap();
+
+        assert_eq!(answer.system_prompt, "legacy aggregate");
+        assert_eq!(
+            answer.source,
+            PromptSource::ConfigInline {
+                key: "workers.aggregate".into()
             }
         );
     }

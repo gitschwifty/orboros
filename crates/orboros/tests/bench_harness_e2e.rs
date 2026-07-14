@@ -178,10 +178,9 @@ async fn run_t1_writes_results_and_summary_to_store() {
 }
 
 #[test]
-fn shipped_t1_corpus_loads_cleanly() {
-    // Verifies every TOML file under bench/cases/t1/ parses against
-    // the BenchCase schema. Catches typos in shipped corpus files
-    // before they break a real benchmark run.
+fn local_t1_corpus_path_is_optional() {
+    // Benchmark cases live under gitignored bench/cases so private
+    // eval prompts and seed repos do not publish with the repo.
     use orboros::bench::case::{load_tier, BenchTier};
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let repo_root = manifest_dir
@@ -190,11 +189,6 @@ fn shipped_t1_corpus_loads_cleanly() {
         .expect("workspace root");
     let cases_root = repo_root.join("bench").join("cases");
     let cases = load_tier(&cases_root, BenchTier::T1).unwrap();
-    assert!(
-        cases.len() >= 3,
-        "expected at least 3 shipped T1 cases, got {}",
-        cases.len()
-    );
     for c in &cases {
         assert_eq!(c.tier, BenchTier::T1, "case {} has wrong tier", c.id);
         assert!(

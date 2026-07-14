@@ -79,7 +79,7 @@ pub async fn aggregate_with_prompt_resolver(
 ) -> anyhow::Result<AggregateResult> {
     let system_prompt = prompt_resolver
         .resolve_system_prompt(
-            crate::prompt::PromptKind::Worker("aggregate"),
+            crate::prompt::PromptKind::Coordinator("aggregate"),
             AGGREGATE_SYSTEM_PROMPT,
         )?
         .system_prompt;
