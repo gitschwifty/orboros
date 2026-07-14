@@ -51,6 +51,9 @@ pub struct DispatchOutcome {
     pub total_tokens: Option<u32>,
     pub dispatched_at: chrono::DateTime<Utc>,
     pub completed_at: chrono::DateTime<Utc>,
+    pub prompt_category: Option<String>,
+    pub system_prompt_hash: Option<String>,
+    pub system_prompt_source: Option<String>,
     pub error: Option<String>,
 }
 
@@ -75,6 +78,9 @@ impl DispatchOutcome {
             total_tokens: None,
             dispatched_at: now,
             completed_at: now,
+            prompt_category: None,
+            system_prompt_hash: None,
+            system_prompt_source: None,
             error: Some(reason),
         }
     }
@@ -220,6 +226,9 @@ fn build_outcome(
         total_tokens: send.usage.as_ref().map(|u| u.total_tokens),
         dispatched_at,
         completed_at,
+        prompt_category: None,
+        system_prompt_hash: None,
+        system_prompt_source: None,
         error,
     }
 }
@@ -244,8 +253,26 @@ fn build_failure(
         total_tokens: None,
         dispatched_at,
         completed_at,
+        prompt_category: None,
+        system_prompt_hash: None,
+        system_prompt_source: None,
         error: Some(message),
     }
+}
+
+/// Attaches prompt identity to a dispatch outcome before it is
+/// applied to the orb's execution metadata.
+#[must_use]
+pub fn with_prompt_metadata(
+    mut outcome: DispatchOutcome,
+    category: impl Into<String>,
+    system_prompt: &str,
+    source: impl Into<String>,
+) -> DispatchOutcome {
+    outcome.prompt_category = Some(category.into());
+    outcome.system_prompt_hash = Some(crate::prompt::prompt_hash(system_prompt));
+    outcome.system_prompt_source = Some(source.into());
+    outcome
 }
 
 /// Mutates `orb` in place based on the dispatch outcome. Sets
@@ -258,6 +285,11 @@ fn build_failure(
 ///
 /// Returns an error if the lifecycle transition isn't permitted
 /// (caller bug — orb wasn't in Active/Executing).
+///
+/// # Errors
+///
+/// Returns [`orbs::orb::TransitionError`] when the target status or
+/// phase transition is invalid for the orb's current lifecycle state.
 pub fn apply_dispatch_outcome(
     orb: &mut Orb,
     outcome: &DispatchOutcome,
@@ -277,12 +309,15 @@ pub fn apply_dispatch_outcome(
         prompt_tokens: outcome.prompt_tokens,
         completion_tokens: outcome.completion_tokens,
         total_tokens: outcome.total_tokens,
+        prompt_category: outcome.prompt_category.clone(),
+        system_prompt_hash: outcome.system_prompt_hash.clone(),
+        system_prompt_source: outcome.system_prompt_source.clone(),
         retries: 0,
     });
 
     match outcome.status {
         DispatchStatus::Done => {
-            orb.result = outcome.response.clone();
+            orb.result.clone_from(&outcome.response);
             orb.confidence = outcome.confidence;
             if orb.orb_type.uses_phase() {
                 let next = next_phase_on_dispatch_success(orb.phase);
@@ -324,9 +359,7 @@ fn next_phase_on_dispatch_success(current: Option<OrbPhase>) -> OrbPhase {
         Some(OrbPhase::Decomposing) => OrbPhase::Refining,
         Some(OrbPhase::Refining) => OrbPhase::Review,
         Some(OrbPhase::Reevaluating) => OrbPhase::Executing,
-        // Executing → Done (the only worker whose finish ends the orb).
-        Some(OrbPhase::Executing) => OrbPhase::Done,
-        // Unexpected phases fall through to Done; the transition
+        // Executing and unexpected phases fall through to Done. The transition
         // table will reject if the move isn't valid, which surfaces
         // a bug rather than silently mis-advancing.
         _ => OrbPhase::Done,
@@ -377,7 +410,7 @@ pub fn default_worker_config(
 pub fn worker_config_for(orb: &Orb, base: &WorkerConfig, system_prompt: &str) -> WorkerConfig {
     let mut wc = base.clone();
     if let Some(ref model) = orb.preferred_model {
-        wc.model = model.clone();
+        wc.model.clone_from(model);
     }
     wc.task_id = Some(orb.id.to_string());
     wc.worker_id = Some(uuid::Uuid::new_v4().to_string());
@@ -417,6 +450,9 @@ mod tests {
             total_tokens: Some(150),
             dispatched_at: now,
             completed_at: now,
+            prompt_category: Some("worker.execute".into()),
+            system_prompt_hash: Some("abc123".into()),
+            system_prompt_source: Some("built_in".into()),
             error: None,
         }
     }
@@ -445,6 +481,9 @@ mod tests {
             Some("anthropic/claude-sonnet-4-6")
         );
         assert_eq!(exec.total_tokens, Some(150));
+        assert_eq!(exec.prompt_category.as_deref(), Some("worker.execute"));
+        assert_eq!(exec.system_prompt_hash.as_deref(), Some("abc123"));
+        assert_eq!(exec.system_prompt_source.as_deref(), Some("built_in"));
     }
 
     #[test]

@@ -194,6 +194,8 @@ pub fn run_t2_case_stub(
         iterations: 0,
         worker_model: String::new(),
         prompt_hash: prompt_hash(&case.prompt),
+        system_prompt_hash: None,
+        system_prompt_source: None,
         confidence: None,
         error: Some(format!(
             "T2 runner is scaffolded but not yet wired to the orboros pipeline (case {})",
@@ -237,6 +239,8 @@ pub fn run_t3_case_stub(
         iterations: 0,
         worker_model: String::new(),
         prompt_hash: prompt_hash(&case.prompt),
+        system_prompt_hash: None,
+        system_prompt_source: None,
         confidence: None,
         error: Some(format!(
             "T3 runner is scaffolded but not yet wired to a greenfield pipeline + rubric grader (case {})",

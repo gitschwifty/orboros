@@ -11,7 +11,6 @@
 use std::time::Instant;
 
 use chrono::Utc;
-use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use crate::bench::case::{BenchCase, BenchExpected, BenchTier};
@@ -87,14 +86,7 @@ impl Default for RunOptions {
 /// runs.
 #[must_use]
 pub fn prompt_hash(prompt: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(prompt.as_bytes());
-    let digest = h.finalize();
-    digest.iter().fold(String::with_capacity(64), |mut acc, b| {
-        use std::fmt::Write;
-        let _ = write!(acc, "{b:02x}");
-        acc
-    })
+    crate::prompt::prompt_hash(prompt)
 }
 
 /// Runs one T1 case end-to-end: N attempts, in-process grader,
@@ -223,6 +215,8 @@ pub async fn run_t1_case(
         iterations: total_iters,
         worker_model: base_worker_config.model.clone(),
         prompt_hash: prompt_hash(&case.prompt),
+        system_prompt_hash: Some(prompt_hash("Answer concisely.")),
+        system_prompt_source: Some("bench_t1_builtin".into()),
         confidence: last_confidence,
         error: last_error.filter(|_| status == BenchStatus::Error),
     })

@@ -499,10 +499,14 @@ impl QueueLoop {
         use tokio::task::JoinSet;
 
         let all_orbs = self.orb_store.load_all()?;
+        let all_edges = self
+            .dep_store
+            .all_edges()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         let mut targets: Vec<(Orb, DispatchTarget)> = Vec::new();
-        for orb in all_orbs {
-            if let Some(t) = dispatch_target_for(&orb) {
-                targets.push((orb, t));
+        for orb in &all_orbs {
+            if let Some(t) = dispatch_target_for(orb) {
+                targets.push((orb.clone(), t));
             }
         }
         if targets.is_empty() {
@@ -516,6 +520,8 @@ impl QueueLoop {
             crate::prompt::PromptResolver::from_config(prompt_config, Some(&self.base_dir));
 
         let semaphore = Arc::new(Semaphore::new(max_concurrency.max(1)));
+        let context_orbs = Arc::new(all_orbs);
+        let context_edges = Arc::new(all_edges);
         let mut join_set = JoinSet::new();
 
         for (orb, target) in targets {
@@ -523,12 +529,19 @@ impl QueueLoop {
             let store = self.orb_store.clone();
             let base_wc = base_worker_config.clone();
             let prompt_resolver = prompt_resolver.clone();
+            let context_orbs = Arc::clone(&context_orbs);
+            let context_edges = Arc::clone(&context_edges);
             let hooks = self.hooks.as_ref().map(Arc::clone);
             join_set.spawn(async move {
                 let Ok(_permit) = sem.acquire_owned().await else {
                     return Ok(false);
                 };
-                dispatch_one_owned(store, orb, target, &base_wc, &prompt_resolver, hooks).await
+                let context = DispatchContext {
+                    orbs: &context_orbs,
+                    edges: &context_edges,
+                };
+                dispatch_one_owned(store, orb, target, &base_wc, &prompt_resolver, context, hooks)
+                    .await
             });
         }
 
@@ -614,12 +627,18 @@ fn dispatch_target_for(orb: &Orb) -> Option<DispatchTarget> {
 
 /// Owned-argument version of `dispatch_one`, suitable for `tokio::spawn`.
 /// Returns `Ok(true)` when the orb ended at Done, `Ok(false)` otherwise.
+struct DispatchContext<'a> {
+    orbs: &'a [Orb],
+    edges: &'a [orbs::dep::DepEdge],
+}
+
 async fn dispatch_one_owned(
     store: OrbStore,
     mut orb: Orb,
     target: DispatchTarget,
     base_wc: &crate::worker::process::WorkerConfig,
     prompt_resolver: &crate::prompt::PromptResolver,
+    context: DispatchContext<'_>,
     hooks: Option<Arc<crate::hooks::HookSink>>,
 ) -> std::io::Result<bool> {
     use crate::worker::dispatcher::{apply_dispatch_outcome, dispatch_orb, worker_config_for};
@@ -634,15 +653,28 @@ async fn dispatch_one_owned(
             orb.description.clone(),
         ),
     };
-    let system = prompt_resolver
-        .resolve_system_prompt(target.prompt_kind(), &built_in_system)
-        .map_err(std::io::Error::other)?
-        .system_prompt;
+    let task_context =
+        crate::prompt_context::build_orb_task_context(&orb, context.orbs, context.edges);
+    let user = crate::prompt_context::append_task_context(&user, &task_context);
+
+    let prompt_kind = target.prompt_kind();
+    let prompt_category = prompt_kind.category();
+    let resolved = prompt_resolver
+        .resolve_system_prompt(prompt_kind, &built_in_system)
+        .map_err(std::io::Error::other)?;
+    let system = resolved.system_prompt;
+    let prompt_source = resolved.source.label();
     let wc = worker_config_for(&orb, base_wc, &system);
 
     let outcome = dispatch_orb(&orb, &user, &wc, hooks.as_deref())
         .await
         .map_err(std::io::Error::other)?;
+    let outcome = crate::worker::dispatcher::with_prompt_metadata(
+        outcome,
+        prompt_category,
+        &system,
+        prompt_source,
+    );
 
     apply_dispatch_outcome(&mut orb, &outcome).map_err(std::io::Error::other)?;
 

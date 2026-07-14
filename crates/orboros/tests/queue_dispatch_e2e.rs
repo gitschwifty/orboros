@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use orboros::queue_loop::QueueLoop;
 use orboros::worker::process::WorkerConfig;
+use orbs::dep::{DepEdge, EdgeType};
 use orbs::dep_store::DepStore;
 use orbs::id::OrbId;
 use orbs::orb::{Orb, OrbStatus, OrbType};
@@ -41,6 +42,24 @@ done
 "#,
         body_path = body_file.display(),
     );
+    fs::write(&path, body).unwrap();
+    make_executable(&path);
+    path
+}
+
+fn write_echo_prompt_worker_script(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    let body = r#"#!/bin/bash
+while IFS= read -r line; do
+  type=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['type'])" 2>/dev/null)
+  id=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['id'])" 2>/dev/null)
+  case "$type" in
+    init) echo "{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"s\",\"protocol_version\":\"0.2.0\"}" ;;
+    send) python3 -c "import json,sys; req=json.loads(sys.stdin.read()); print(json.dumps({'type':'result','id':req['id'],'status':'ok','response':req['message'],'tool_calls_made':[],'iterations':1,'confidence':0.91}))" <<< "$line" ;;
+    shutdown) echo "{\"type\":\"shutdown_ok\",\"id\":\"$id\"}"; exit 0 ;;
+  esac
+done
+"#;
     fs::write(&path, body).unwrap();
     make_executable(&path);
     path
@@ -90,7 +109,65 @@ async fn dispatch_ready_orbs_populates_result_and_confidence() {
     assert_eq!(reloaded.status, Some(OrbStatus::Done));
     assert_eq!(reloaded.result.as_deref(), Some("the answer"));
     assert_eq!(reloaded.confidence, Some(0.88));
-    assert!(reloaded.execution.is_some());
+    let execution = reloaded.execution.as_ref().unwrap();
+    assert_eq!(execution.prompt_category.as_deref(), Some("worker.execute"));
+    assert_eq!(execution.system_prompt_source.as_deref(), Some("built_in"));
+    assert_eq!(
+        execution.system_prompt_hash.as_deref(),
+        Some(orboros::prompt::prompt_hash(
+            orboros::prompt::built_in_worker_system_prompt("execute")
+        ))
+        .as_deref()
+    );
+}
+
+#[tokio::test]
+async fn dispatch_ready_orbs_injects_orb_context_into_user_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_echo_prompt_worker_script(dir.path(), "echo-prompt.sh");
+    let wc = worker_config(&script);
+
+    let base = dir.path().to_path_buf();
+    let orb_store = OrbStore::new(base.join("orbs.jsonl"));
+    let dep_store = DepStore::new(base.join("deps.jsonl"));
+
+    let parent = Orb::new("Parent feature", "Parent spec").with_type(OrbType::Feature);
+    let mut blocker = active_task_orb("Prepare dependency");
+    blocker.set_status(OrbStatus::Done).unwrap();
+    blocker.result = Some("dependency output".into());
+    let mut orb = active_task_orb("Run with context");
+    orb.parent_id = Some(parent.id.clone());
+    orb.root_id = Some(parent.id.clone());
+    orb.acceptance_criteria = Some("- [ ] include context".into());
+    let mut sibling = Orb::new("Sibling task", "Nearby work").with_type(OrbType::Task);
+    sibling.parent_id = Some(parent.id.clone());
+    sibling.root_id = Some(parent.id.clone());
+
+    orb_store.append(&parent).unwrap();
+    orb_store.append(&blocker).unwrap();
+    orb_store.append(&sibling).unwrap();
+    orb_store.append(&orb).unwrap();
+    dep_store
+        .add_edge(DepEdge::new(
+            blocker.id.clone(),
+            orb.id.clone(),
+            EdgeType::Blocks,
+        ))
+        .unwrap();
+
+    let ql = QueueLoop::new(orb_store.clone(), dep_store, base);
+    let completed = ql.dispatch_ready_orbs(&wc, 2).await.unwrap();
+    assert_eq!(completed, 1);
+
+    let reloaded = orb_store.load_by_id(&orb.id).unwrap().unwrap();
+    let result = reloaded.result.as_deref().unwrap();
+    assert!(result.starts_with("Do the thing"));
+    assert!(result.contains("## Orboros Task Context"));
+    assert!(result.contains("Parent feature"));
+    assert!(result.contains("Sibling task"));
+    assert!(result.contains("Prepare dependency"));
+    assert!(result.contains("dependency output"));
+    assert!(result.contains("acceptance_criteria"));
 }
 
 #[tokio::test]

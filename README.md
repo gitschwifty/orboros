@@ -182,6 +182,19 @@ and `plan`, plus coordinator roles like `decompose`, `aggregate`, and the orb
 execution worker `execute`. Phase keys include `speccing`, `decomposing`,
 `refining`, and `reevaluating`.
 
+For one-shot worker-spawning commands, CLI prompt overrides take precedence over
+global/project config:
+
+```bash
+orboros decompose "Plan the refactor" --system-prompt-file prompts/decompose-v2.md
+orboros orchestrate "Fix auth flow" --system-prompt "You are a strict implementation worker."
+```
+
+Queue dispatch also appends dynamic Orboros task context to worker user prompts:
+the current orb, parent/root summaries, sibling/child awareness, and upstream
+dependency results/status. Heddle remains responsible for project context such
+as `AGENTS.md`.
+
 ## Model Routing
 
 ```toml

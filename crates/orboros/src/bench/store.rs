@@ -58,6 +58,14 @@ pub struct BenchResult {
     /// lets `bench compare` detect when the prompt changed between
     /// runs and warn before comparing.
     pub prompt_hash: String,
+    /// SHA-256 of the resolved system prompt used by the worker.
+    /// This separates benchmark case prompt drift from harness /
+    /// role prompt drift.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_hash: Option<String>,
+    /// Where the resolved system prompt came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_source: Option<String>,
     /// Worker-reported confidence, if any. Populated when the worker
     /// emits a CONFIDENCE: line or IPC field (task 57). Pairs with
     /// the calibration analysis (sub-task 59.7).
@@ -243,6 +251,8 @@ mod tests {
             iterations: 1,
             worker_model: "mock/test".into(),
             prompt_hash: "deadbeef".into(),
+            system_prompt_hash: Some("cafe".into()),
+            system_prompt_source: Some("built_in".into()),
             confidence: Some(0.88),
             error: None,
         }

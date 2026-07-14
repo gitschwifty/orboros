@@ -15,6 +15,7 @@ pub mod orchestrator;
 pub mod phases;
 pub mod plan;
 pub mod prompt;
+pub mod prompt_context;
 pub mod queue_loop;
 pub mod routing;
 pub mod runner;

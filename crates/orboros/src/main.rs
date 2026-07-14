@@ -59,11 +59,23 @@ enum Commands {
         /// Queue only, don't execute immediately.
         #[arg(long)]
         queue: bool,
+        /// Override the system prompt for this worker invocation.
+        #[arg(long)]
+        system_prompt: Option<String>,
+        /// Read the system prompt override from a file.
+        #[arg(long)]
+        system_prompt_file: Option<PathBuf>,
     },
     /// Decompose a task into subtasks without executing.
     Decompose {
         /// The high-level task to decompose.
         task: String,
+        /// Override the decomposition system prompt.
+        #[arg(long)]
+        system_prompt: Option<String>,
+        /// Read the system prompt override from a file.
+        #[arg(long)]
+        system_prompt_file: Option<PathBuf>,
     },
     /// Decompose a task and execute all subtasks.
     Orchestrate {
@@ -72,6 +84,12 @@ enum Commands {
         /// Priority for subtasks (1=highest, 5=lowest).
         #[arg(short, long, default_value = "3")]
         priority: u8,
+        /// Override all system prompts used by this orchestration.
+        #[arg(long)]
+        system_prompt: Option<String>,
+        /// Read the system prompt override from a file.
+        #[arg(long)]
+        system_prompt_file: Option<PathBuf>,
     },
     /// List tasks, optionally filtered by status.
     Tasks {
@@ -460,6 +478,8 @@ fn main() -> anyhow::Result<()> {
             task,
             priority,
             queue,
+            system_prompt,
+            system_prompt_file,
         } => cmd_run(
             &store,
             cli.worker_binary.as_deref(),
@@ -467,20 +487,35 @@ fn main() -> anyhow::Result<()> {
             &task,
             priority,
             queue,
+            system_prompt.as_deref(),
+            system_prompt_file.as_deref(),
             cli.skip_prereq_check,
         ),
-        Commands::Decompose { task } => cmd_decompose(
+        Commands::Decompose {
+            task,
+            system_prompt,
+            system_prompt_file,
+        } => cmd_decompose(
             cli.worker_binary.as_deref(),
             &cli.model,
             &task,
+            system_prompt.as_deref(),
+            system_prompt_file.as_deref(),
             cli.skip_prereq_check,
         ),
-        Commands::Orchestrate { task, priority } => cmd_orchestrate(
+        Commands::Orchestrate {
+            task,
+            priority,
+            system_prompt,
+            system_prompt_file,
+        } => cmd_orchestrate(
             &store,
             cli.worker_binary.as_deref(),
             &cli.model,
             &task,
             priority,
+            system_prompt.as_deref(),
+            system_prompt_file.as_deref(),
             cli.skip_prereq_check,
         ),
         Commands::Tasks { status } => cmd_tasks(&store, status.as_deref()),
@@ -791,6 +826,8 @@ fn cmd_run(
     description: &str,
     priority: u8,
     queue: bool,
+    system_prompt: Option<&str>,
+    system_prompt_file: Option<&std::path::Path>,
     skip_prereq_check: bool,
 ) -> anyhow::Result<()> {
     let mut task = Task::new(description, description).with_priority(priority);
@@ -804,11 +841,16 @@ fn cmd_run(
     }
 
     let binary = prereq_check(worker_binary, model, skip_prereq_check)?;
-    let config = make_worker_config(
-        binary,
-        model,
-        "You are a helpful assistant. Complete the task described in the user message.",
-    );
+    let default_system_prompt =
+        "You are a helpful assistant. Complete the task described in the user message.";
+    let resolved_override =
+        orboros::prompt::resolve_cli_system_prompt(system_prompt, system_prompt_file)?;
+    let resolved_system_prompt = resolved_override
+        .as_ref()
+        .map_or(default_system_prompt, |resolved| {
+            resolved.system_prompt.as_str()
+        });
+    let config = make_worker_config(binary, model, resolved_system_prompt);
 
     println!("  status:   executing...");
     println!();
@@ -838,12 +880,17 @@ fn cmd_decompose(
     worker_binary: Option<&str>,
     model: &str,
     description: &str,
+    system_prompt: Option<&str>,
+    system_prompt_file: Option<&std::path::Path>,
     skip_prereq_check: bool,
 ) -> anyhow::Result<()> {
     let binary = prereq_check(worker_binary, model, skip_prereq_check)?;
     let config = make_worker_config(binary, model, ""); // system prompt set by decompose()
     let prompt_config = config::load_config(None)?.prompts;
-    let prompt_resolver = orboros::prompt::PromptResolver::from_config(prompt_config, None);
+    let cli_override =
+        orboros::prompt::resolve_cli_system_prompt(system_prompt, system_prompt_file)?;
+    let prompt_resolver = orboros::prompt::PromptResolver::from_config(prompt_config, None)
+        .with_cli_override(cli_override);
 
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(decompose_with_prompt_resolver(
@@ -877,14 +924,19 @@ fn cmd_orchestrate(
     model: &str,
     description: &str,
     priority: u8,
+    system_prompt: Option<&str>,
+    system_prompt_file: Option<&std::path::Path>,
     skip_prereq_check: bool,
 ) -> anyhow::Result<()> {
     let binary = prereq_check(worker_binary, model, skip_prereq_check)?;
     let config = make_worker_config(binary, model, ""); // system prompt set per step
     let project_dir = store.path().parent();
     let prompt_config = config::load_config(project_dir)?.prompts;
+    let cli_override =
+        orboros::prompt::resolve_cli_system_prompt(system_prompt, system_prompt_file)?;
     let prompt_resolver =
-        orboros::prompt::PromptResolver::from_config(prompt_config.clone(), project_dir);
+        orboros::prompt::PromptResolver::from_config(prompt_config.clone(), project_dir)
+            .with_cli_override(cli_override);
 
     // Create parent task
     let mut parent = Task::new(description, description).with_priority(priority);

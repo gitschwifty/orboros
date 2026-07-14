@@ -204,6 +204,8 @@ mod tests {
             iterations: 1,
             worker_model: "m".into(),
             prompt_hash: "h".into(),
+            system_prompt_hash: None,
+            system_prompt_source: None,
             confidence,
             error: None,
         }

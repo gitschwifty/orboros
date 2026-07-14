@@ -117,6 +117,8 @@ pub async fn cmd_bench_run(
                     iterations: 0,
                     worker_model: String::new(),
                     prompt_hash: crate::bench::runner::prompt_hash(&case.prompt),
+                    system_prompt_hash: None,
+                    system_prompt_source: None,
                     confidence: None,
                     error: Some(e.to_string()),
                 })
@@ -135,6 +137,8 @@ pub async fn cmd_bench_run(
                         iterations: 0,
                         worker_model: String::new(),
                         prompt_hash: crate::bench::runner::prompt_hash(&case.prompt),
+                        system_prompt_hash: None,
+                        system_prompt_source: None,
                         confidence: None,
                         error: Some(e.to_string()),
                     })
@@ -342,6 +346,8 @@ mod tests {
             iterations: 1,
             worker_model: "m".into(),
             prompt_hash: "h1".into(),
+            system_prompt_hash: None,
+            system_prompt_source: None,
             confidence: None,
             error: None,
         }

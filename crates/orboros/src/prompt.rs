@@ -95,6 +95,50 @@ pub enum PromptSource {
     BuiltIn,
     ConfigInline { key: String },
     ConfigFile { key: String, path: PathBuf },
+    CliInline,
+    CliFile { path: PathBuf },
+}
+
+impl PromptSource {
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::BuiltIn => "built_in".to_string(),
+            Self::ConfigInline { key } => format!("config_inline:{key}"),
+            Self::ConfigFile { key, path } => {
+                format!("config_file:{key}:{}", path.display())
+            }
+            Self::CliInline => "cli_inline".to_string(),
+            Self::CliFile { path } => format!("cli_file:{}", path.display()),
+        }
+    }
+}
+
+impl PromptKind<'_> {
+    #[must_use]
+    pub fn category(&self) -> String {
+        match self {
+            Self::Worker(worker_type) => format!("worker.{worker_type}"),
+            Self::Phase(phase) => format!("phase.{phase}"),
+        }
+    }
+}
+
+/// SHA-256 of prompt text, hex-encoded. Used to attribute worker
+/// results and benchmark rows to the exact prompt content that
+/// produced them.
+#[must_use]
+pub fn prompt_hash(prompt: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut h = Sha256::new();
+    h.update(prompt.as_bytes());
+    let digest = h.finalize();
+    digest.iter().fold(String::with_capacity(64), |mut acc, b| {
+        use std::fmt::Write;
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -102,6 +146,7 @@ pub struct PromptResolver {
     config: PromptConfig,
     home: Option<PathBuf>,
     project_dir: Option<PathBuf>,
+    cli_override: Option<ResolvedPrompt>,
 }
 
 #[must_use]
@@ -124,12 +169,19 @@ impl PromptResolver {
             config,
             home,
             project_dir,
+            cli_override: None,
         }
     }
 
     #[must_use]
     pub fn from_config(config: PromptConfig, project_dir: Option<&Path>) -> Self {
         Self::new(config, dirs::home_dir(), project_dir.map(Path::to_path_buf))
+    }
+
+    #[must_use]
+    pub fn with_cli_override(mut self, cli_override: Option<ResolvedPrompt>) -> Self {
+        self.cli_override = cli_override;
+        self
     }
 
     /// Resolve a system prompt for a phase or worker type.
@@ -147,6 +199,10 @@ impl PromptResolver {
         kind: PromptKind<'_>,
         built_in: &str,
     ) -> anyhow::Result<ResolvedPrompt> {
+        if let Some(cli_override) = &self.cli_override {
+            return Ok(cli_override.clone());
+        }
+
         let (key, specific) = match kind {
             PromptKind::Worker(worker_type) => (
                 format!("workers.{worker_type}"),
@@ -227,6 +283,46 @@ impl PromptResolver {
     }
 }
 
+/// Resolves an explicit CLI system-prompt override.
+///
+/// `system_file` is read exactly as provided, relative to the current
+/// process directory when not absolute. Config-backed prompt files use
+/// [`PromptResolver`]'s project/global lookup rules instead.
+///
+/// # Errors
+///
+/// Returns an error when both override forms are provided or when the
+/// prompt file cannot be read.
+pub fn resolve_cli_system_prompt(
+    system: Option<&str>,
+    system_file: Option<&Path>,
+) -> anyhow::Result<Option<ResolvedPrompt>> {
+    match (system, system_file) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("use either --system-prompt or --system-prompt-file, not both")
+        }
+        (Some(system), None) => Ok(Some(ResolvedPrompt {
+            system_prompt: system.to_string(),
+            source: PromptSource::CliInline,
+        })),
+        (None, Some(path)) => {
+            let system_prompt = std::fs::read_to_string(path).map_err(|e| {
+                anyhow::anyhow!(
+                    "failed to read --system-prompt-file {}: {e}",
+                    path.display()
+                )
+            })?;
+            Ok(Some(ResolvedPrompt {
+                system_prompt,
+                source: PromptSource::CliFile {
+                    path: path.to_path_buf(),
+                },
+            }))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
 #[must_use]
 pub fn with_confidence_addendum(system_prompt: &str) -> String {
     format!(
@@ -280,6 +376,104 @@ mod tests {
         assert!(built_in_worker_system_prompt("edit").contains("implement"));
         assert!(built_in_worker_system_prompt("review").contains("read-only"));
         assert!(built_in_worker_system_prompt("test").contains("tests"));
+    }
+
+    #[test]
+    fn prompt_hash_is_stable_and_content_derived() {
+        let a = prompt_hash("same prompt");
+        let b = prompt_hash("same prompt");
+        let c = prompt_hash("different prompt");
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_eq!(a.len(), 64);
+    }
+
+    #[test]
+    fn prompt_kind_category_is_persistable() {
+        assert_eq!(PromptKind::Worker("edit").category(), "worker.edit");
+        assert_eq!(PromptKind::Phase("speccing").category(), "phase.speccing");
+    }
+
+    #[test]
+    fn prompt_source_label_identifies_origin() {
+        assert_eq!(PromptSource::BuiltIn.label(), "built_in");
+        assert_eq!(PromptSource::CliInline.label(), "cli_inline");
+        assert_eq!(
+            PromptSource::CliFile {
+                path: PathBuf::from("prompt.md")
+            }
+            .label(),
+            "cli_file:prompt.md"
+        );
+        assert_eq!(
+            PromptSource::ConfigInline {
+                key: "workers.edit".into()
+            }
+            .label(),
+            "config_inline:workers.edit"
+        );
+        assert_eq!(
+            PromptSource::ConfigFile {
+                key: "phases.review".into(),
+                path: PathBuf::from("prompts/review.md")
+            }
+            .label(),
+            "config_file:phases.review:prompts/review.md"
+        );
+    }
+
+    #[test]
+    fn cli_override_wins_over_specific_config() {
+        let mut workers = BTreeMap::new();
+        workers.insert(
+            "edit".into(),
+            PromptOverride {
+                system: Some("config edit".into()),
+                system_file: None,
+            },
+        );
+        let resolver = PromptResolver::new(
+            PromptConfig {
+                workers,
+                ..PromptConfig::default()
+            },
+            None,
+            None,
+        )
+        .with_cli_override(Some(ResolvedPrompt {
+            system_prompt: "cli prompt".into(),
+            source: PromptSource::CliInline,
+        }));
+
+        let answer = resolver
+            .resolve_system_prompt(PromptKind::Worker("edit"), "built in")
+            .unwrap();
+
+        assert_eq!(answer.system_prompt, "cli prompt");
+        assert_eq!(answer.source, PromptSource::CliInline);
+    }
+
+    #[test]
+    fn resolves_cli_prompt_file_exactly() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("prompt.md");
+        std::fs::write(&path, "from file").unwrap();
+
+        let answer = resolve_cli_system_prompt(None, Some(&path))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(answer.system_prompt, "from file");
+        assert_eq!(answer.source, PromptSource::CliFile { path });
+    }
+
+    #[test]
+    fn cli_prompt_rejects_inline_and_file_together() {
+        let err = resolve_cli_system_prompt(Some("inline"), Some(Path::new("prompt.md")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("either --system-prompt or --system-prompt-file"));
     }
 
     #[test]

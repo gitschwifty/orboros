@@ -39,6 +39,8 @@ orboros run "Fix the bug" --queue  # queue only, don't execute
 |--------|---------|-------------|
 | `--priority, -p <N>` | 3 | Priority 1-5 |
 | `--queue` | false | Queue without executing |
+| `--system-prompt <TEXT>` | built-in | Override the worker system prompt |
+| `--system-prompt-file <PATH>` | built-in | Read the worker system prompt override from a file |
 
 ---
 
@@ -48,7 +50,13 @@ Break a task into subtasks using the coordinator LLM. Prints the plan without ex
 
 ```bash
 orboros decompose "Add error handling to the REST API"
+orboros decompose "Add error handling" --system-prompt-file prompts/decompose-v2.md
 ```
+
+| Option | Description |
+|--------|-------------|
+| `--system-prompt <TEXT>` | Override the decomposition system prompt |
+| `--system-prompt-file <PATH>` | Read the decomposition system prompt override from a file |
 
 ---
 
@@ -63,6 +71,8 @@ orboros orchestrate "Refactor the authentication module" --priority 2
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--priority, -p <N>` | 3 | Priority for subtasks |
+| `--system-prompt <TEXT>` | configured/built-in | Override all system prompts used by this orchestration |
+| `--system-prompt-file <PATH>` | configured/built-in | Read the orchestration system prompt override from a file |
 
 ---
 
