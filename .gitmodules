@@ -1,3 +1,0 @@
-[submodule "bench"]
-	path = bench
-	url = git@github.com:gitschwifty/orboros-bench.git
