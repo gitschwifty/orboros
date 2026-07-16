@@ -3,6 +3,7 @@
 private
 .env
 .env.*
+bench
 bench/
 
 
