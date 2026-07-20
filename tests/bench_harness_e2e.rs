@@ -189,10 +189,7 @@ fn local_t1_corpus_path_is_optional() {
     // eval prompts and seed repos do not publish with the repo.
     use orboros::bench::case::{load_tier, BenchTier};
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("workspace root");
+    let repo_root = manifest_dir;
     let cases_root = repo_root.join("bench").join("cases");
     let cases = load_tier(&cases_root, BenchTier::T1).unwrap();
     for c in &cases {

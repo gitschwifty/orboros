@@ -292,46 +292,30 @@ allowed_tools = ["read", "write", "glob", "grep"]
 ## Architecture
 
 ```
-crates/
-  orbs/                   # Core library
-    src/
-      id.rs               # Content-hash ID generation (SHA-256 base36)
-      orb.rs              # Orb struct, types, lifecycle enums
-      orb_store.rs        # JSONL persistence with tombstone filtering
-      store.rs            # Legacy TaskStore
-      task.rs             # Legacy Task struct
-      trace.rs            # Trace types, TerminationReason
-      dep.rs              # Dependency edge schema
-      dep_store.rs        # Dep persistence, cycle detection, topological sort
-      audit.rs            # Audit events + comments
-      audit_store.rs      # JSONL audit persistence
-      tree.rs             # Tree reconstruction + query helpers
-      pipeline.rs         # Pipeline directory lifecycle + snapshots
-
-  orboros/                # CLI binary
-    src/
-      main.rs             # CLI entry point (clap)
-      lib.rs              # Module exports
-      config.rs           # Layered config loading + project registry
-      runner.rs           # Single-task execution
-      orchestrator.rs     # Multi-subtask orchestration
-      trace.rs            # Timeline builder (bridges orbs types)
-      queue_loop.rs       # Tick-based daemon loop
-      daemon.rs           # PID management, signal handling, log rotation
-      plan.rs             # Plan pipeline + file parsing
-      notify.rs           # Terminal + desktop notifications
-      slop.rs             # Post-completion quality checks
-      orb_cmd.rs          # Orb CRUD CLI implementations
-      coordinator/        # LLM-powered decomposition + aggregation
-      ipc/                # JSON-line protocol with heddle workers
-      routing/            # Model selection + tool profiles
-      worker/             # Process lifecycle, pool, budget, FSM
-      phases/             # Pipeline phase implementations
-        speccing.rs
-        decompose.rs
-        refinement.rs
-        review.rs
-        re_evaluation.rs
+src/
+  main.rs                 # CLI entry point (clap)
+  lib.rs                  # Module exports
+  config.rs               # Layered config loading + project registry
+  runner.rs               # Single-task execution
+  orchestrator.rs         # Multi-subtask orchestration
+  trace.rs                # Timeline builder
+  queue_loop.rs           # Tick-based daemon loop
+  daemon.rs               # PID management, signal handling, log rotation
+  plan.rs                 # Plan pipeline + file parsing
+  notify.rs               # Terminal + desktop notifications
+  slop.rs                 # Post-completion quality checks
+  orb_cmd.rs              # Orb CRUD CLI implementations
+  bench/                  # Benchmark corpus harness
+  coordinator/            # LLM-powered decomposition + aggregation
+  ipc/                    # JSON-line protocol with heddle workers
+  routing/                # Model selection + tool profiles
+  worker/                 # Process lifecycle, pool, budget, FSM
+  phases/                 # Pipeline phase implementations
+    speccing.rs
+    decompose.rs
+    refinement.rs
+    review.rs
+    re_evaluation.rs
 ```
 
 ## Development
