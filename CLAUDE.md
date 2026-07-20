@@ -134,7 +134,7 @@ Serde is central — it handles IPC messages, config files, and state persistenc
 - Protocol rules live in `compatibility.md` and `PROTOCOL_VERSION`.
 - Always send `protocol_version` in `Init` when supported; always return it in `InitOk`.
 - Golden transcripts are the contract; update fixtures on any schema change.
-- IPC fixtures live in `fixtures/ipc/` (canonical in Orboros) and are synced into Heddle via `scripts/sync-ipc.sh`.
+- IPC fixtures live in `test-fixtures/ipc/` (canonical in Orboros) and are synced into Heddle via `scripts/sync-ipc.sh`.
 - Pre-commit hooks enforce protocol version alignment and IPC sync.
 
 ## Async Patterns
