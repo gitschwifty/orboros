@@ -167,6 +167,9 @@ enum Commands {
     ReviewQueue,
     /// Benchmark corpus + harness (task 59).
     Bench {
+        /// Root containing cases/, fixtures/, prompts/, and results/.
+        #[arg(long, env = "ORBOROS_BENCH_ROOT", default_value = "bench")]
+        bench_root: PathBuf,
         #[command(subcommand)]
         action: BenchAction,
     },
@@ -184,6 +187,12 @@ enum BenchAction {
         /// Single case id to run (overrides --tier filtering).
         #[arg(long)]
         case: Option<String>,
+        /// Model catalog key or raw provider/model string for benchmark workers.
+        #[arg(long)]
+        model: Option<String>,
+        /// Human-readable variant label stored with the run.
+        #[arg(long)]
+        variant: Option<String>,
         /// Skip the per-case cost ceiling (`max_cost_cents`).
         #[arg(long)]
         no_budget: bool,
@@ -685,14 +694,29 @@ fn main() -> anyhow::Result<()> {
             let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
             orb_cmd::cmd_review_queue(&orb_store)
         }
-        Commands::Bench { action } => cmd_bench(&state_dir, action),
+        Commands::Bench { bench_root, action } => cmd_bench(
+            &state_dir,
+            &bench_root,
+            action,
+            cli.worker_binary.as_deref(),
+            cli.skip_prereq_check,
+        ),
     }
 }
 
-fn cmd_bench(state_dir: &std::path::Path, action: BenchAction) -> anyhow::Result<()> {
+fn cmd_bench(
+    state_dir: &std::path::Path,
+    bench_root: &std::path::Path,
+    action: BenchAction,
+    worker_binary: Option<&str>,
+    skip_prereq_check: bool,
+) -> anyhow::Result<()> {
     use orboros::bench::cmd as bench_cmd;
+    use orboros::bench::runner::BenchRunConfig;
     use orboros::bench::store::BenchStore;
-    let cases_root = std::path::PathBuf::from("bench/cases");
+    use orboros::config::ModelRole;
+    let cases_root = bench_root.join("cases");
+    let fixtures_root = bench_root.join("fixtures");
     let bench_dir = state_dir.join("bench");
     let store = BenchStore::new(&bench_dir);
 
@@ -701,6 +725,8 @@ fn cmd_bench(state_dir: &std::path::Path, action: BenchAction) -> anyhow::Result
         BenchAction::Run {
             tier,
             case,
+            model,
+            variant,
             no_budget,
         } => {
             let tier = match tier.as_deref() {
@@ -710,30 +736,50 @@ fn cmd_bench(state_dir: &std::path::Path, action: BenchAction) -> anyhow::Result
                         .map_err(anyhow::Error::msg)?,
                 ),
             };
-            let worker_config = orboros::worker::process::WorkerConfig {
-                command: "echo".into(),
-                args: vec![],
-                cwd: None,
-                env: vec![],
-                model: "mock/bench".into(),
-                system_prompt: String::new(),
-                tools: vec![],
-                max_iterations: Some(1),
-                init_timeout: None,
-                send_timeout: None,
-                shutdown_timeout: None,
-                task_id: None,
-                worker_id: None,
+            let project_dir = std::env::current_dir().ok();
+            let cfg = config::load_config(project_dir.as_deref())?;
+            let resolver = cfg.model_resolver();
+            let resolved_model = if let Some(selector) = model.as_deref() {
+                resolver.resolve_selector(selector, "bench --model".to_string())?
+            } else {
+                resolver.resolve(ModelRole::BenchDefault)?
+            };
+            let resolved_grader = resolver.resolve(ModelRole::BenchGrader).ok();
+            let binary_owned;
+            let binary = if let Some(binary) = worker_binary {
+                binary
+            } else {
+                binary_owned = cfg
+                    .worker_binary
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("worker_binary is unset in OrbConfig"))?;
+                &binary_owned
+            };
+            prereq_check(Some(binary), &resolved_model.model, skip_prereq_check)?;
+            let worker_config = make_worker_config(binary, &resolved_model.model, "");
+            let run_config = BenchRunConfig {
+                variant,
+                model_selector: model
+                    .clone()
+                    .or_else(|| resolved_model.key.clone())
+                    .or_else(|| Some(resolved_model.model.clone())),
+                model_key: resolved_model.key.clone(),
+                worker_model: Some(resolved_model.model.clone()),
+                grader_model: resolved_grader.map(|m| m.model),
+                prompt_variant: None,
+                cases_root: Some(cases_root.display().to_string()),
             };
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(bench_cmd::cmd_bench_run(
-                &cases_root,
-                &store,
+            rt.block_on(bench_cmd::cmd_bench_run(bench_cmd::BenchRunRequest {
+                cases_root: &cases_root,
+                store: &store,
                 tier,
-                case.as_deref(),
-                &worker_config,
+                case_id: case.as_deref(),
+                worker_config: &worker_config,
                 no_budget,
-            ))
+                run_config: &run_config,
+                fixtures_root: &fixtures_root,
+            }))
         }
         BenchAction::Show { run_id } => bench_cmd::cmd_bench_show(&store, &run_id),
         BenchAction::Compare { run_a, run_b } => {

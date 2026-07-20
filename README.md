@@ -160,7 +160,7 @@ reviewer = "fast"
 bench = "balanced"
 
 [models.options.balanced]
-model = "openrouter/anthropic/claude-sonnet-4"
+model = "openrouter/anthropic/claude-sonnet-5"
 description = "Default strong coding and planning model."
 provider = "anthropic"
 router = "openrouter"
@@ -168,17 +168,33 @@ reasoning = "medium"
 effort = "medium"
 
 [models.options.fast]
-model = "openrouter/openai/gpt-4.1-mini"
+model = "openrouter/anthropic/claude-haiku-4.5"
 description = "Cheap fast model for review, grading, and simple tasks."
-provider = "openai"
+provider = "anthropic"
 router = "openrouter"
 reasoning = "low"
 effort = "low"
 
 [models.options.planner]
-model = "openrouter/openai/gpt-5"
-description = "Higher-effort planning and decomposition model."
+model = "openrouter/openai/gpt-5.6-terra"
+description = "Higher-effort OpenAI planning and decomposition model."
 provider = "openai"
+router = "openrouter"
+reasoning = "high"
+effort = "high"
+
+[models.options.kimi]
+model = "openrouter/moonshotai/kimi-k3"
+description = "Moonshot Kimi K3 candidate for coding and agentic bench runs."
+provider = "moonshotai"
+router = "openrouter"
+reasoning = "max"
+effort = "max"
+
+[models.options.qwen]
+model = "openrouter/qwen/qwen3.6-plus"
+description = "Qwen 3.6 candidate for cost/performance bench runs."
+provider = "qwen"
 router = "openrouter"
 reasoning = "high"
 effort = "high"
@@ -325,9 +341,10 @@ just ci                  # fmt-check + clippy + tests
 just test                # cargo test
 just clippy              # cargo clippy --all-targets -- -D warnings
 just fmt                 # cargo fmt
-just bench-init          # create local gitignored bench/ dirs
-just bench-list          # list local benchmark cases
-just bench-run t1        # run local T1 benchmark cases
+just bench-init ../orboros-bench # create private sibling bench corpus dirs
+just bench-list ../orboros-bench # list benchmark cases
+just bench-run t1 ../orboros-bench
+just bench-run-model kimi kimi-smoke t1 ../orboros-bench
 ```
 
 Tests use mock worker scripts (`test-fixtures/mock-worker*.sh`) for fast unit tests. Set `HEDDLE_BINARY` for integration tests against a real heddle instance.

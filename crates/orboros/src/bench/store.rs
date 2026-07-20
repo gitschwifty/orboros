@@ -83,6 +83,30 @@ pub struct BenchRun {
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
     pub tier: Option<BenchTier>,
+    /// Human-readable run variant label, e.g. `sonnet-baseline` or
+    /// `kimi-candidate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
+    /// CLI/config selector used to choose the worker model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_selector: Option<String>,
+    /// Catalog key when `model_selector` resolved through
+    /// `[models.options.<key>]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_key: Option<String>,
+    /// Resolved model string sent to the worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_model: Option<String>,
+    /// Resolved model string intended for grader/reviewer roles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grader_model: Option<String>,
+    /// Prompt variant label once prompt candidate loading is wired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_variant: Option<String>,
+    /// Corpus root used for the run, for provenance when cases live
+    /// in a sibling private repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cases_root: Option<String>,
     pub total: u32,
     pub passed: u32,
     pub failed: u32,
@@ -264,6 +288,13 @@ mod tests {
             started_at: Utc::now(),
             finished_at: Utc::now(),
             tier: Some(BenchTier::T1),
+            variant: Some("baseline".into()),
+            model_selector: Some("fast".into()),
+            model_key: Some("fast".into()),
+            worker_model: Some("mock/test".into()),
+            grader_model: Some("mock/grader".into()),
+            prompt_variant: None,
+            cases_root: Some("bench/cases".into()),
             total: 3,
             passed: 2,
             failed: 1,

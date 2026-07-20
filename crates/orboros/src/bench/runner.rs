@@ -75,6 +75,37 @@ pub struct RunOptions {
     pub no_budget: bool,
 }
 
+/// Metadata that describes how a benchmark run was configured.
+/// Stored on [`BenchRun`] so comparisons can distinguish model,
+/// prompt, and corpus changes.
+#[derive(Debug, Clone, Default)]
+pub struct BenchRunConfig {
+    pub variant: Option<String>,
+    pub model_selector: Option<String>,
+    pub model_key: Option<String>,
+    pub worker_model: Option<String>,
+    pub grader_model: Option<String>,
+    pub prompt_variant: Option<String>,
+    pub cases_root: Option<String>,
+}
+
+impl BenchRunConfig {
+    #[must_use]
+    pub fn config_hash_input(&self, base_worker_config: &WorkerConfig) -> String {
+        format!(
+            "variant={:?}\nmodel_selector={:?}\nmodel_key={:?}\nworker_model={:?}\ngrader_model={:?}\nprompt_variant={:?}\ncases_root={:?}\nsystem_prompt={}",
+            self.variant,
+            self.model_selector,
+            self.model_key,
+            self.worker_model,
+            self.grader_model,
+            self.prompt_variant,
+            self.cases_root,
+            base_worker_config.system_prompt,
+        )
+    }
+}
+
 /// SHA-256 of the prompt, hex-encoded. Used for `prompt_hash` on
 /// every result so `bench compare` can detect prompt drift between
 /// runs.
@@ -238,6 +269,7 @@ pub async fn run_t1(
     base_worker_config: &WorkerConfig,
     store: &BenchStore,
     opts: &RunOptions,
+    run_config: &BenchRunConfig,
 ) -> anyhow::Result<TierRunSummary> {
     let run_id = new_run_id();
     let started_at = Utc::now();
@@ -286,12 +318,22 @@ pub async fn run_t1(
         started_at,
         finished_at: Utc::now(),
         tier: Some(BenchTier::T1),
+        variant: run_config.variant.clone(),
+        model_selector: run_config.model_selector.clone(),
+        model_key: run_config.model_key.clone(),
+        worker_model: run_config
+            .worker_model
+            .clone()
+            .or_else(|| Some(base_worker_config.model.clone())),
+        grader_model: run_config.grader_model.clone(),
+        prompt_variant: run_config.prompt_variant.clone(),
+        cases_root: run_config.cases_root.clone(),
         total,
         passed,
         failed,
         errored,
         skipped,
-        config_hash: prompt_hash(&base_worker_config.system_prompt),
+        config_hash: prompt_hash(&run_config.config_hash_input(base_worker_config)),
         total_cost_cents: total_cost,
     };
     store.append_run(&summary)?;

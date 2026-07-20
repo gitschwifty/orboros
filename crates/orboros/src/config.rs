@@ -268,7 +268,17 @@ impl ModelResolver<'_> {
         self.resolve_selector(selector, source)
     }
 
-    fn resolve_selector(&self, selector: &str, source: String) -> anyhow::Result<ResolvedModel> {
+    /// Resolves a specific selector to a model.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `selector` is neither a known catalog key nor a
+    /// raw `provider/model` string.
+    pub fn resolve_selector(
+        &self,
+        selector: &str,
+        source: String,
+    ) -> anyhow::Result<ResolvedModel> {
         if let Some(option) = self.config.models.options.get(selector) {
             let provider = option
                 .provider

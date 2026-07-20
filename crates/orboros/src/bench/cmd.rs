@@ -10,9 +10,20 @@ use std::path::Path;
 use anyhow::Context;
 
 use crate::bench::case::{load_all, load_tier, BenchCase, BenchTier};
-use crate::bench::runner::{run_t1, RunOptions};
+use crate::bench::runner::{run_t1, BenchRunConfig, RunOptions};
 use crate::bench::store::{BenchRun, BenchStatus, BenchStore};
 use crate::worker::process::WorkerConfig;
+
+pub struct BenchRunRequest<'a> {
+    pub cases_root: &'a Path,
+    pub store: &'a BenchStore,
+    pub tier: Option<BenchTier>,
+    pub case_id: Option<&'a str>,
+    pub worker_config: &'a WorkerConfig,
+    pub no_budget: bool,
+    pub run_config: &'a BenchRunConfig,
+    pub fixtures_root: &'a Path,
+}
 
 /// Prints every case in the corpus, grouped by tier.
 ///
@@ -55,19 +66,12 @@ pub fn cmd_bench_list(cases_root: &Path) -> anyhow::Result<()> {
 /// # Errors
 ///
 /// Returns an error if loading the corpus or writing results fails.
-pub async fn cmd_bench_run(
-    cases_root: &Path,
-    store: &BenchStore,
-    tier: Option<BenchTier>,
-    case_id: Option<&str>,
-    worker_config: &WorkerConfig,
-    no_budget: bool,
-) -> anyhow::Result<()> {
-    let mut cases = match tier {
-        Some(t) => load_tier(cases_root, t)?,
-        None => load_all(cases_root)?,
+pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
+    let mut cases = match req.tier {
+        Some(t) => load_tier(req.cases_root, t)?,
+        None => load_all(req.cases_root)?,
     };
-    if let Some(id) = case_id {
+    if let Some(id) = req.case_id {
         cases.retain(|c| c.id == id);
         if cases.is_empty() {
             anyhow::bail!("no case found with id `{id}`");
@@ -83,12 +87,14 @@ pub async fn cmd_bench_run(
     let (t1, other): (Vec<BenchCase>, Vec<BenchCase>) =
         cases.into_iter().partition(|c| c.tier == BenchTier::T1);
 
-    let opts = RunOptions { no_budget };
+    let opts = RunOptions {
+        no_budget: req.no_budget,
+    };
     let mut all_results = Vec::new();
     let mut summary_run_id = None;
 
     if !t1.is_empty() {
-        let summary = run_t1(&t1, worker_config, store, &opts).await?;
+        let summary = run_t1(&t1, req.worker_config, req.store, &opts, req.run_config).await?;
         summary_run_id = Some(summary.run_id);
         all_results.extend(summary.results);
     }
@@ -98,33 +104,30 @@ pub async fn cmd_bench_run(
             .clone()
             .unwrap_or_else(crate::bench::store::new_run_id);
         let result = match case.tier {
-            BenchTier::T2 => crate::bench::runner_t2t3::run_t2_case_stub(
-                case,
-                &run_id,
-                &cases_root.join("..").join("fixtures"),
-                &opts,
-            )
-            .map_or_else(
-                |e| {
-                    Ok::<_, anyhow::Error>(crate::bench::store::BenchResult {
-                        case_id: case.id.clone(),
-                        run_id: run_id.clone(),
-                        tier: BenchTier::T2,
-                        status: BenchStatus::Error,
-                        score: 0.0,
-                        latency_ms: 0,
-                        cost_cents: 0,
-                        iterations: 0,
-                        worker_model: String::new(),
-                        prompt_hash: crate::bench::runner::prompt_hash(&case.prompt),
-                        system_prompt_hash: None,
-                        system_prompt_source: None,
-                        confidence: None,
-                        error: Some(e.to_string()),
-                    })
-                },
-                Ok,
-            )?,
+            BenchTier::T2 => {
+                crate::bench::runner_t2t3::run_t2_case_stub(case, &run_id, req.fixtures_root, &opts)
+                    .map_or_else(
+                        |e| {
+                            Ok::<_, anyhow::Error>(crate::bench::store::BenchResult {
+                                case_id: case.id.clone(),
+                                run_id: run_id.clone(),
+                                tier: BenchTier::T2,
+                                status: BenchStatus::Error,
+                                score: 0.0,
+                                latency_ms: 0,
+                                cost_cents: 0,
+                                iterations: 0,
+                                worker_model: String::new(),
+                                prompt_hash: crate::bench::runner::prompt_hash(&case.prompt),
+                                system_prompt_hash: None,
+                                system_prompt_source: None,
+                                confidence: None,
+                                error: Some(e.to_string()),
+                            })
+                        },
+                        Ok,
+                    )?
+            }
             BenchTier::T3 => crate::bench::runner_t2t3::run_t3_case_stub(case, &run_id, &opts)
                 .map_or_else(
                     |e| {
@@ -152,7 +155,7 @@ pub async fn cmd_bench_run(
         if summary_run_id.is_none() {
             summary_run_id = Some(run_id);
         }
-        store.append_result(&result)?;
+        req.store.append_result(&result)?;
         all_results.push(result);
     }
 
@@ -201,6 +204,17 @@ pub fn cmd_bench_compare(store: &BenchStore, run_a: &str, run_b: &str) -> anyhow
 
     let by_case_b: std::collections::HashMap<&str, &crate::bench::store::BenchResult> =
         b.iter().map(|r| (r.case_id.as_str(), r)).collect();
+    let runs = store.read_runs()?;
+    let run_meta_a = runs.iter().find(|r| r.run_id == run_a);
+    let run_meta_b = runs.iter().find(|r| r.run_id == run_b);
+
+    if let Some(run) = run_meta_a {
+        print_run_summary(run);
+    }
+    if let Some(run) = run_meta_b {
+        print_run_summary(run);
+    }
+    warn_on_run_metadata_drift(run_meta_a, run_meta_b);
 
     println!(
         "{case:<24} {a_status:<10} {b_status:<10} change",
@@ -211,45 +225,47 @@ pub fn cmd_bench_compare(store: &BenchStore, run_a: &str, run_b: &str) -> anyhow
     let mut prompt_changed = 0;
     let mut improved = 0;
     let mut regressed = 0;
+    let mut only_in_a = 0;
+    let mut only_in_b = 0;
     for r in &a {
-        let other = by_case_b.get(r.case_id.as_str());
-        match other {
-            Some(rb) => {
-                let change = match (r.status, rb.status) {
-                    (BenchStatus::Pass, BenchStatus::Pass) => "—",
-                    (BenchStatus::Fail | BenchStatus::Error, BenchStatus::Pass) => {
-                        improved += 1;
-                        "improved"
-                    }
-                    (BenchStatus::Pass, BenchStatus::Fail | BenchStatus::Error) => {
-                        regressed += 1;
-                        "regressed"
-                    }
-                    _ => "changed",
-                };
-                let prompt_note = if r.prompt_hash == rb.prompt_hash {
-                    ""
-                } else {
-                    prompt_changed += 1;
-                    "  ⚠ prompt changed"
-                };
-                println!(
-                    "{case:<24} {a:<10?} {b:<10?} {change}{prompt_note}",
-                    case = r.case_id,
-                    a = r.status,
-                    b = rb.status,
-                );
-            }
-            None => println!(
+        if let Some(rb) = by_case_b.get(r.case_id.as_str()) {
+            let change = match (r.status, rb.status) {
+                (BenchStatus::Pass, BenchStatus::Pass) => "—",
+                (BenchStatus::Fail | BenchStatus::Error, BenchStatus::Pass) => {
+                    improved += 1;
+                    "improved"
+                }
+                (BenchStatus::Pass, BenchStatus::Fail | BenchStatus::Error) => {
+                    regressed += 1;
+                    "regressed"
+                }
+                _ => "changed",
+            };
+            let prompt_note = if r.prompt_hash == rb.prompt_hash {
+                ""
+            } else {
+                prompt_changed += 1;
+                "  ⚠ prompt changed"
+            };
+            println!(
+                "{case:<24} {a:<10?} {b:<10?} {change}{prompt_note}",
+                case = r.case_id,
+                a = r.status,
+                b = rb.status,
+            );
+        } else {
+            only_in_a += 1;
+            println!(
                 "{case:<24} {a:<10?} {b:<10} only in {run_a}",
                 case = r.case_id,
                 a = r.status,
                 b = "-",
-            ),
+            );
         }
     }
     for rb in &b {
         if !a.iter().any(|ra| ra.case_id == rb.case_id) {
+            only_in_b += 1;
             println!(
                 "{case:<24} {a:<10} {b:<10?} only in {run_b}",
                 case = rb.case_id,
@@ -262,8 +278,13 @@ pub fn cmd_bench_compare(store: &BenchStore, run_a: &str, run_b: &str) -> anyhow
     println!("\nimproved: {improved}, regressed: {regressed}, prompt-changed: {prompt_changed}");
     if prompt_changed > 0 {
         eprintln!(
-            "warning: {prompt_changed} case(s) had a different prompt between runs — \
+            "warning: {prompt_changed} case(s) had a different prompt between runs - \
              direct status comparison may be misleading."
+        );
+    }
+    if only_in_a > 0 || only_in_b > 0 {
+        eprintln!(
+            "warning: case sets differ ({only_in_a} only in {run_a}, {only_in_b} only in {run_b})"
         );
     }
     Ok(())
@@ -314,10 +335,12 @@ fn print_result_table(results: &[crate::bench::store::BenchResult]) {
 
 fn print_run_summary(r: &BenchRun) {
     println!(
-        "{id}  {when}  tier={tier:?}  {passed}P/{failed}F/{errored}E/{skipped}S of {total}  ${cost:.2}",
+        "{id}  {when}  tier={tier:?}  variant={variant}  model={model}  {passed}P/{failed}F/{errored}E/{skipped}S of {total}  ${cost:.2}",
         id = r.run_id,
         when = r.started_at.to_rfc3339(),
         tier = r.tier,
+        variant = r.variant.as_deref().unwrap_or("-"),
+        model = r.worker_model.as_deref().unwrap_or("-"),
         passed = r.passed,
         failed = r.failed,
         errored = r.errored,
@@ -325,6 +348,46 @@ fn print_run_summary(r: &BenchRun) {
         total = r.total,
         cost = f64::from(r.total_cost_cents) / 100.0,
     );
+    if r.model_selector.is_some()
+        || r.model_key.is_some()
+        || r.grader_model.is_some()
+        || r.prompt_variant.is_some()
+        || r.cases_root.is_some()
+    {
+        println!(
+            "  selector={selector} key={key} grader={grader} prompt={prompt} cases={cases} config={config}",
+            selector = r.model_selector.as_deref().unwrap_or("-"),
+            key = r.model_key.as_deref().unwrap_or("-"),
+            grader = r.grader_model.as_deref().unwrap_or("-"),
+            prompt = r.prompt_variant.as_deref().unwrap_or("-"),
+            cases = r.cases_root.as_deref().unwrap_or("-"),
+            config = r.config_hash,
+        );
+    }
+}
+
+fn warn_on_run_metadata_drift(a: Option<&BenchRun>, b: Option<&BenchRun>) {
+    let Some(a) = a else { return };
+    let Some(b) = b else { return };
+    let mut drift = Vec::new();
+    if a.worker_model != b.worker_model {
+        drift.push("worker model");
+    }
+    if a.grader_model != b.grader_model {
+        drift.push("grader model");
+    }
+    if a.prompt_variant != b.prompt_variant {
+        drift.push("prompt variant");
+    }
+    if a.cases_root != b.cases_root {
+        drift.push("cases root");
+    }
+    if a.config_hash != b.config_hash {
+        drift.push("config hash");
+    }
+    if !drift.is_empty() {
+        eprintln!("warning: run metadata differs: {}", drift.join(", "));
+    }
 }
 
 #[cfg(test)]
@@ -417,6 +480,13 @@ text = "x"
                 started_at: Utc::now(),
                 finished_at: Utc::now(),
                 tier: Some(BenchTier::T1),
+                variant: None,
+                model_selector: None,
+                model_key: None,
+                worker_model: None,
+                grader_model: None,
+                prompt_variant: None,
+                cases_root: None,
                 total: 1,
                 passed: 1,
                 failed: 0,

@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use orboros::bench::case::{BenchCase, BenchExpected, BenchTier};
-use orboros::bench::runner::{run_t1, run_t1_case, RunOptions};
+use orboros::bench::runner::{run_t1, run_t1_case, BenchRunConfig, RunOptions};
 use orboros::bench::store::{BenchStatus, BenchStore};
 use orboros::worker::process::WorkerConfig;
 
@@ -156,9 +156,15 @@ async fn run_t1_writes_results_and_summary_to_store() {
         ),
     ];
     let store = BenchStore::new(dir.path().join("bench"));
-    let summary = run_t1(&cases, &wc, &store, &RunOptions::default())
-        .await
-        .unwrap();
+    let summary = run_t1(
+        &cases,
+        &wc,
+        &store,
+        &RunOptions::default(),
+        &BenchRunConfig::default(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(summary.results.len(), 2);
     let runs = store.read_runs().unwrap();

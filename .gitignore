@@ -3,8 +3,8 @@
 private
 .env
 .env.*
-bench
-bench/
+/bench
+/bench/
 
 
 # Added by cargo
