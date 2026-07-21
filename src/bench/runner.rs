@@ -66,6 +66,9 @@ pub const T1_ATTEMPTS: u32 = 3;
 /// to grade the case as Pass.
 pub const T1_PASS_THRESHOLD: u32 = 2;
 
+const T1_SYSTEM_PROMPT_BASE: &str = "Answer concisely.";
+const T1_SYSTEM_PROMPT_SOURCE: &str = "bench_t1_builtin";
+
 /// Options for [`run_t1_case`].
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
@@ -138,6 +141,7 @@ pub async fn run_t1_case(
     let mut last_confidence: Option<f32> = None;
     let mut total_iters: u32 = 0;
     let mut last_error: Option<String> = None;
+    let mut output = String::new();
 
     for attempt in 0..T1_ATTEMPTS {
         // Budget gate before spawning.
@@ -153,13 +157,15 @@ pub async fn run_t1_case(
         }
 
         let mut wc = base_worker_config.clone();
-        wc.system_prompt = "Answer concisely.".into();
+        wc.system_prompt = t1_system_prompt();
         wc.max_iterations = Some(1);
 
         let mut worker = match Worker::spawn(&wc).await {
             Ok(w) => w,
             Err(e) => {
-                last_error = Some(format!("spawn failed: {e}"));
+                let err = format!("spawn failed: {e}");
+                append_attempt_output(&mut output, attempt, "spawn_error", &err);
+                last_error = Some(err);
                 fails += 1;
                 continue;
             }
@@ -169,7 +175,9 @@ pub async fn run_t1_case(
         let outcome = match worker.send(&send_id, &case.prompt).await {
             Ok(o) => o,
             Err(e) => {
-                last_error = Some(format!("send failed: {e}"));
+                let err = format!("send failed: {e}");
+                append_attempt_output(&mut output, attempt, "send_error", &err);
+                last_error = Some(err);
                 fails += 1;
                 let _ = worker.shutdown().await;
                 continue;
@@ -181,10 +189,22 @@ pub async fn run_t1_case(
         let attempt_outcome = match grade_attempt(&response, &case.expected) {
             Ok(o) => o,
             Err(e) => {
-                last_error = Some(format!("grade failed: {e}"));
+                let err = format!("grade failed: {e}");
+                last_error = Some(err.clone());
+                append_attempt_output(&mut output, attempt, "grade_error", &err);
                 AttemptOutcome::Fail
             }
         };
+        append_attempt_output(
+            &mut output,
+            attempt,
+            match attempt_outcome {
+                AttemptOutcome::Pass => "pass",
+                AttemptOutcome::Fail => "fail",
+                AttemptOutcome::Unsupported => "unsupported",
+            },
+            &response,
+        );
 
         // Approximate per-attempt cost — placeholder until a usage→cost
         // mapping is wired up. Keeps the budget gate exercised.
@@ -243,11 +263,29 @@ pub async fn run_t1_case(
         iterations: total_iters,
         worker_model: base_worker_config.model.clone(),
         prompt_hash: prompt_hash(&case.prompt),
-        system_prompt_hash: Some(prompt_hash("Answer concisely.")),
-        system_prompt_source: Some("bench_t1_builtin".into()),
+        system_prompt_hash: Some(prompt_hash(&t1_system_prompt())),
+        system_prompt_source: Some(T1_SYSTEM_PROMPT_SOURCE.into()),
         confidence: last_confidence,
+        output: (!output.is_empty()).then_some(output),
         error: last_error.filter(|_| status == BenchStatus::Error),
     })
+}
+
+fn append_attempt_output(out: &mut String, attempt: u32, label: &str, body: &str) {
+    use std::fmt::Write as _;
+
+    let _ = writeln!(out, "== attempt {attempt} {label} ==");
+    out.push_str(body);
+    if !body.ends_with('\n') {
+        out.push('\n');
+    }
+}
+
+fn t1_system_prompt() -> String {
+    format!(
+        "{T1_SYSTEM_PROMPT_BASE}{}",
+        crate::worker::process::CONFIDENCE_PROMPT_ADDENDUM
+    )
 }
 
 /// Result of a tier run — useful for the CLI's summary print.

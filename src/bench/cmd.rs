@@ -8,10 +8,11 @@
 use std::path::Path;
 
 use anyhow::Context;
+use chrono::Utc;
 
 use crate::bench::case::{load_all, load_tier, BenchCase, BenchTier};
 use crate::bench::runner::{run_t1, BenchRunConfig, RunOptions};
-use crate::bench::store::{BenchRun, BenchStatus, BenchStore};
+use crate::bench::store::{BenchResult, BenchRun, BenchStatus, BenchStore};
 use crate::worker::process::WorkerConfig;
 
 pub struct BenchRunRequest<'a> {
@@ -66,6 +67,7 @@ pub fn cmd_bench_list(cases_root: &Path) -> anyhow::Result<()> {
 /// # Errors
 ///
 /// Returns an error if loading the corpus or writing results fails.
+#[allow(clippy::too_many_lines)]
 pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
     let mut cases = match req.tier {
         Some(t) => load_tier(req.cases_root, t)?,
@@ -93,10 +95,13 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
     let mut all_results = Vec::new();
     let mut summary_run_id = None;
 
-    if !t1.is_empty() {
+    let had_t1 = !t1.is_empty();
+    if had_t1 {
         let summary = run_t1(&t1, req.worker_config, req.store, &opts, req.run_config).await?;
         summary_run_id = Some(summary.run_id);
         all_results.extend(summary.results);
+        println!("\n== summary ==");
+        print_run_summary(&summary.summary);
     }
 
     for case in &other {
@@ -104,30 +109,36 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
             .clone()
             .unwrap_or_else(crate::bench::store::new_run_id);
         let result = match case.tier {
-            BenchTier::T2 => {
-                crate::bench::runner_t2t3::run_t2_case_stub(case, &run_id, req.fixtures_root, &opts)
-                    .map_or_else(
-                        |e| {
-                            Ok::<_, anyhow::Error>(crate::bench::store::BenchResult {
-                                case_id: case.id.clone(),
-                                run_id: run_id.clone(),
-                                tier: BenchTier::T2,
-                                status: BenchStatus::Error,
-                                score: 0.0,
-                                latency_ms: 0,
-                                cost_cents: 0,
-                                iterations: 0,
-                                worker_model: String::new(),
-                                prompt_hash: crate::bench::runner::prompt_hash(&case.prompt),
-                                system_prompt_hash: None,
-                                system_prompt_source: None,
-                                confidence: None,
-                                error: Some(e.to_string()),
-                            })
-                        },
-                        Ok,
-                    )?
-            }
+            BenchTier::T2 => crate::bench::runner_t2t3::run_t2_case(
+                case,
+                &run_id,
+                req.fixtures_root,
+                req.worker_config,
+                &opts,
+            )
+            .await
+            .map_or_else(
+                |e| {
+                    Ok::<_, anyhow::Error>(crate::bench::store::BenchResult {
+                        case_id: case.id.clone(),
+                        run_id: run_id.clone(),
+                        tier: BenchTier::T2,
+                        status: BenchStatus::Error,
+                        score: 0.0,
+                        latency_ms: 0,
+                        cost_cents: 0,
+                        iterations: 0,
+                        worker_model: String::new(),
+                        prompt_hash: crate::bench::runner::prompt_hash(&case.prompt),
+                        system_prompt_hash: None,
+                        system_prompt_source: None,
+                        confidence: None,
+                        output: None,
+                        error: Some(e.to_string()),
+                    })
+                },
+                Ok,
+            )?,
             BenchTier::T3 => crate::bench::runner_t2t3::run_t3_case_stub(case, &run_id, &opts)
                 .map_or_else(
                     |e| {
@@ -145,6 +156,7 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
                             system_prompt_hash: None,
                             system_prompt_source: None,
                             confidence: None,
+                            output: None,
                             error: Some(e.to_string()),
                         })
                     },
@@ -157,6 +169,21 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
         }
         req.store.append_result(&result)?;
         all_results.push(result);
+    }
+
+    if !had_t1 {
+        if let Some(ref id) = summary_run_id {
+            let run = summarize_run(
+                id,
+                common_tier(&all_results),
+                &all_results,
+                req.run_config,
+                req.worker_config,
+            );
+            req.store.append_run(&run)?;
+            println!("\n== summary ==");
+            print_run_summary(&run);
+        }
     }
 
     print_result_table(&all_results);
@@ -216,8 +243,11 @@ pub fn cmd_bench_compare(store: &BenchStore, run_a: &str, run_b: &str) -> anyhow
     }
     warn_on_run_metadata_drift(run_meta_a, run_meta_b);
 
+    let case_width = case_id_width(a.iter().chain(&b).map(|r| r.case_id.as_str()));
+    let a_width = run_a.len().max(10);
+    let b_width = run_b.len().max(10);
     println!(
-        "{case:<24} {a_status:<10} {b_status:<10} change",
+        "{case:<case_width$} {a_status:<a_width$} {b_status:<b_width$} change",
         case = "case",
         a_status = run_a,
         b_status = run_b,
@@ -248,7 +278,7 @@ pub fn cmd_bench_compare(store: &BenchStore, run_a: &str, run_b: &str) -> anyhow
                 "  ⚠ prompt changed"
             };
             println!(
-                "{case:<24} {a:<10?} {b:<10?} {change}{prompt_note}",
+                "{case:<case_width$} {a:<a_width$?} {b:<b_width$?} {change}{prompt_note}",
                 case = r.case_id,
                 a = r.status,
                 b = rb.status,
@@ -256,7 +286,7 @@ pub fn cmd_bench_compare(store: &BenchStore, run_a: &str, run_b: &str) -> anyhow
         } else {
             only_in_a += 1;
             println!(
-                "{case:<24} {a:<10?} {b:<10} only in {run_a}",
+                "{case:<case_width$} {a:<a_width$?} {b:<b_width$} only in {run_a}",
                 case = r.case_id,
                 a = r.status,
                 b = "-",
@@ -267,7 +297,7 @@ pub fn cmd_bench_compare(store: &BenchStore, run_a: &str, run_b: &str) -> anyhow
         if !a.iter().any(|ra| ra.case_id == rb.case_id) {
             only_in_b += 1;
             println!(
-                "{case:<24} {a:<10} {b:<10?} only in {run_b}",
+                "{case:<case_width$} {a:<a_width$} {b:<b_width$?} only in {run_b}",
                 case = rb.case_id,
                 a = "-",
                 b = rb.status,
@@ -310,27 +340,88 @@ pub fn cmd_bench_list_runs(store: &BenchStore) -> anyhow::Result<()> {
 }
 
 fn print_result_table(results: &[crate::bench::store::BenchResult]) {
+    let case_width = case_id_width(results.iter().map(|r| r.case_id.as_str()));
     println!(
-        "{case:<24} {tier:<4} {status:<8} {score:>5}  {latency:>6}ms  conf",
+        "{case:<case_width$}  {tier:<4}  {status:<8}  {score:>5}  {latency:>8}  {conf:>5}",
         case = "case",
         tier = "tier",
         status = "status",
         score = "score",
-        latency = "lat",
+        latency = "latency",
+        conf = "conf",
     );
     for r in results {
+        let tier = r.tier.to_string();
+        let status = format!("{:?}", r.status);
+        let latency = format!("{}ms", r.latency_ms);
         let conf = r
             .confidence
-            .map_or(String::from("  -"), |c| format!("{c:.2}"));
+            .map_or(String::from("-"), |c| format!("{c:.2}"));
         println!(
-            "{case:<24} {tier:<4} {status:<8?} {score:>5.2}  {latency:>6}ms  {conf}",
+            "{case:<case_width$}  {tier:<4}  {status:<8}  {score:>5.2}  {latency:>8}  {conf:>5}",
             case = r.case_id,
-            tier = r.tier,
-            status = r.status,
+            tier = tier,
+            status = status,
             score = r.score,
-            latency = r.latency_ms,
+            latency = latency,
+            conf = conf,
         );
     }
+}
+
+fn case_id_width<'a>(ids: impl Iterator<Item = &'a str>) -> usize {
+    ids.map(str::len).max().unwrap_or(4).max(24)
+}
+
+fn summarize_run(
+    run_id: &str,
+    tier: Option<BenchTier>,
+    results: &[BenchResult],
+    run_config: &BenchRunConfig,
+    base_worker_config: &WorkerConfig,
+) -> BenchRun {
+    let total = u32::try_from(results.len()).unwrap_or(u32::MAX);
+    let passed = count_status(results, BenchStatus::Pass);
+    let failed = count_status(results, BenchStatus::Fail);
+    let errored = count_status(results, BenchStatus::Error);
+    let skipped = count_status(results, BenchStatus::Skipped);
+    let total_cost_cents = results
+        .iter()
+        .fold(0u32, |sum, r| sum.saturating_add(r.cost_cents));
+    BenchRun {
+        run_id: run_id.into(),
+        started_at: Utc::now(),
+        finished_at: Utc::now(),
+        tier,
+        variant: run_config.variant.clone(),
+        model_selector: run_config.model_selector.clone(),
+        model_key: run_config.model_key.clone(),
+        worker_model: run_config
+            .worker_model
+            .clone()
+            .or_else(|| Some(base_worker_config.model.clone())),
+        grader_model: run_config.grader_model.clone(),
+        prompt_variant: run_config.prompt_variant.clone(),
+        cases_root: run_config.cases_root.clone(),
+        total,
+        passed,
+        failed,
+        errored,
+        skipped,
+        config_hash: crate::bench::runner::prompt_hash(
+            &run_config.config_hash_input(base_worker_config),
+        ),
+        total_cost_cents,
+    }
+}
+
+fn count_status(results: &[BenchResult], status: BenchStatus) -> u32 {
+    u32::try_from(results.iter().filter(|r| r.status == status).count()).unwrap_or(u32::MAX)
+}
+
+fn common_tier(results: &[BenchResult]) -> Option<BenchTier> {
+    let first = results.first()?.tier;
+    results.iter().all(|r| r.tier == first).then_some(first)
 }
 
 fn print_run_summary(r: &BenchRun) {
@@ -416,6 +507,7 @@ mod tests {
             system_prompt_hash: None,
             system_prompt_source: None,
             confidence: None,
+            output: None,
             error: None,
         }
     }

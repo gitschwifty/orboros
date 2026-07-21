@@ -135,6 +135,31 @@ async fn t1_regex_match_passes() {
 }
 
 #[tokio::test]
+async fn t1_case_extracts_confidence_line_from_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_worker_script(dir.path(), "conf.sh", "hello\nCONFIDENCE: 0.82");
+    let wc = worker_config(&script);
+    let case = t1_case(
+        "c-conf",
+        "say hello",
+        BenchExpected::Exact {
+            text: "hello".into(),
+        },
+    );
+    let r = run_t1_case(&case, "run-x", &wc, &RunOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(r.status, BenchStatus::Pass);
+    assert_eq!(r.confidence, Some(0.82));
+    assert!(r
+        .output
+        .as_deref()
+        .is_some_and(|out| out.contains("== attempt 0 pass ==") && out.contains("hello")));
+    assert_eq!(r.system_prompt_source.as_deref(), Some("bench_t1_builtin"));
+    assert!(r.system_prompt_hash.is_some());
+}
+
+#[tokio::test]
 async fn run_t1_writes_results_and_summary_to_store() {
     let dir = tempfile::tempdir().unwrap();
     let script = write_worker_script(dir.path(), "ok.sh", "hello");

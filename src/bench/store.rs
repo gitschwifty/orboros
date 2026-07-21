@@ -71,6 +71,11 @@ pub struct BenchResult {
     /// the calibration analysis (sub-task 59.7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f32>,
+    /// Captured benchmark output for later inspection. This is not
+    /// printed in the default table; use the JSONL result file or
+    /// `jq -r '.output'` when detailed worker/grader output is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
     /// Free-form error message when `status == Error`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -278,6 +283,7 @@ mod tests {
             system_prompt_hash: Some("cafe".into()),
             system_prompt_source: Some("built_in".into()),
             confidence: Some(0.88),
+            output: Some("details".into()),
             error: None,
         }
     }

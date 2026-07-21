@@ -222,6 +222,7 @@ mod tests {
             system_prompt_hash: None,
             system_prompt_source: None,
             confidence,
+            output: None,
             error: None,
         }
     }
