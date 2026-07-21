@@ -21,12 +21,14 @@ bench-run tier="" root="bench":
         cargo run -- bench --bench-root "{{root}}" run; \
     fi
 
-# Run benchmark cases with an explicit model/variant tag.
-bench-run-model model variant tier="" root="bench":
-    @if [ -n "{{tier}}" ]; then \
-        cargo run -- bench --bench-root "{{root}}" run --tier "{{tier}}" --model "{{model}}" --variant "{{variant}}"; \
+# Run benchmark cases with an explicit model. Empty tier runs all cases.
+bench-run-model model tier="" variant="" root="bench":
+    @variant_arg=""; \
+    if [ -n "{{variant}}" ]; then variant_arg='--variant "{{variant}}"'; fi; \
+    if [ -n "{{tier}}" ]; then \
+        cargo run -- bench --bench-root "{{root}}" run --tier "{{tier}}" --model "{{model}}" $variant_arg; \
     else \
-        cargo run -- bench --bench-root "{{root}}" run --model "{{model}}" --variant "{{variant}}"; \
+        cargo run -- bench --bench-root "{{root}}" run --model "{{model}}" $variant_arg; \
     fi
 
 # Run one benchmark case by id.

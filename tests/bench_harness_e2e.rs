@@ -43,6 +43,27 @@ done
     path
 }
 
+fn write_error_worker_script(dir: &Path, name: &str, message: &str) -> PathBuf {
+    let path = dir.join(name);
+    let body = format!(
+        r#"#!/bin/bash
+export MESSAGE='{message}'
+while IFS= read -r line; do
+  type=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['type'])" 2>/dev/null)
+  id=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['id'])" 2>/dev/null)
+  case "$type" in
+    init) echo "{{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"s\",\"protocol_version\":\"0.2.0\"}}" ;;
+    send) python3 -c "import json,os; print(json.dumps({{'type':'result','id':'$id','status':'error','error':{{'code':'model_error','message':os.environ['MESSAGE'],'retryable':False}},'tool_calls_made':[],'iterations':1}}))" ;;
+    shutdown) echo "{{\"type\":\"shutdown_ok\",\"id\":\"$id\"}}"; exit 0 ;;
+  esac
+done
+"#
+    );
+    fs::write(&path, body).unwrap();
+    make_executable(&path);
+    path
+}
+
 fn worker_config(script: &Path) -> WorkerConfig {
     WorkerConfig {
         command: "bash".into(),
@@ -69,8 +90,10 @@ fn t1_case(id: &str, prompt: &str, expected: BenchExpected) -> BenchCase {
         description: "test".into(),
         prompt: prompt.into(),
         expected,
+        runner: None,
         seed_repo: None,
-        timeout_s: 60,
+        timeout_s: Some(60),
+        max_iterations: None,
         max_cost_cents: 100,
     }
 }
@@ -114,6 +137,29 @@ async fn t1_case_no_match_grades_fail() {
         .unwrap();
     assert_eq!(r.status, BenchStatus::Fail);
     assert!((r.score - 0.0).abs() < f32::EPSILON);
+}
+
+#[tokio::test]
+async fn t1_case_worker_error_records_error_status_and_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_error_worker_script(dir.path(), "err.sh", "model is not available");
+    let wc = worker_config(&script);
+    let case = t1_case(
+        "c-error",
+        "say hello",
+        BenchExpected::Exact {
+            text: "hello".into(),
+        },
+    );
+    let r = run_t1_case(&case, "run-x", &wc, &RunOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(r.status, BenchStatus::Error);
+    assert_eq!(r.error.as_deref(), Some("model is not available"));
+    assert!(r.output.as_deref().is_some_and(|out| {
+        out.contains("worker_error") && out.contains("model is not available")
+    }));
 }
 
 #[tokio::test]
@@ -206,6 +252,49 @@ async fn run_t1_writes_results_and_summary_to_store() {
     assert!(case_results
         .iter()
         .any(|r| r.case_id == "c2" && r.status == BenchStatus::Fail));
+}
+
+#[tokio::test]
+async fn run_t1_stops_after_fatal_worker_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_error_worker_script(
+        dir.path(),
+        "err.sh",
+        "openrouter/nope is not a valid model ID",
+    );
+    let wc = worker_config(&script);
+    let cases = vec![
+        t1_case(
+            "c1",
+            "say hello",
+            BenchExpected::Exact {
+                text: "hello".into(),
+            },
+        ),
+        t1_case(
+            "c2",
+            "say hello",
+            BenchExpected::Exact {
+                text: "hello".into(),
+            },
+        ),
+    ];
+    let store = BenchStore::new(dir.path().join("bench"));
+    let summary = run_t1(
+        &cases,
+        &wc,
+        &store,
+        &RunOptions::default(),
+        &BenchRunConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.results.len(), 1);
+    assert_eq!(summary.results[0].case_id, "c1");
+    assert_eq!(summary.results[0].status, BenchStatus::Error);
+    let case_results = store.read_results(&summary.run_id).unwrap();
+    assert_eq!(case_results.len(), 1);
 }
 
 #[test]

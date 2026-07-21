@@ -8,14 +8,15 @@
 //! cheap, robust to occasional model noise, and slows the benchmark
 //! by ~3× without requiring provider-specific seed support.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tracing::{info, warn};
 
-use crate::bench::case::{BenchCase, BenchExpected, BenchTier};
+use crate::bench::case::{BenchCase, BenchExpected, BenchTier, DEFAULT_TIMEOUT_S};
 use crate::bench::store::{new_run_id, BenchResult, BenchRun, BenchStatus, BenchStore};
-use crate::worker::process::{Worker, WorkerConfig};
+use crate::ipc::types::ResultStatus;
+use crate::worker::process::{SendOutcome, Worker, WorkerConfig};
 
 /// Outcome of grading a single attempt's response against the case's
 /// expectation.
@@ -73,9 +74,61 @@ const T1_SYSTEM_PROMPT_SOURCE: &str = "bench_t1_builtin";
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
     /// If false, the harness aborts further attempts on a case once
-    /// `max_cost_cents` is exceeded. If true, all N attempts run
-    /// regardless of accumulated cost.
+    /// `max_cost_cents` is exceeded and actual provider cost is
+    /// available. If true, all N attempts run regardless of cost.
     pub no_budget: bool,
+    /// Overall benchmark timeout in seconds, overridden by
+    /// `BenchCase::timeout_s`.
+    pub timeout_s: Option<u32>,
+    /// Overall worker iteration/tool-call budget, overridden by
+    /// `BenchCase::max_iterations`.
+    pub max_iterations: Option<u32>,
+}
+
+#[must_use]
+pub fn effective_timeout_s(case: &BenchCase, opts: &RunOptions) -> u32 {
+    case.timeout_s
+        .or(opts.timeout_s)
+        .unwrap_or(DEFAULT_TIMEOUT_S)
+}
+
+#[must_use]
+pub fn effective_max_iterations(case: &BenchCase, opts: &RunOptions) -> Option<u32> {
+    case.max_iterations.or(opts.max_iterations)
+}
+
+#[must_use]
+pub fn nonzero_u32(value: u32) -> Option<u32> {
+    (value > 0).then_some(value)
+}
+
+#[must_use]
+pub fn timeout_bench_result(
+    case: &BenchCase,
+    run_id: &str,
+    worker_model: &str,
+    timeout_s: u32,
+) -> BenchResult {
+    BenchResult {
+        case_id: case.id.clone(),
+        run_id: run_id.into(),
+        tier: case.tier,
+        status: BenchStatus::Error,
+        score: 0.0,
+        latency_ms: u64::from(timeout_s).saturating_mul(1000),
+        cost_cents: None,
+        iterations: 0,
+        prompt_tokens: None,
+        completion_tokens: None,
+        total_tokens: None,
+        worker_model: worker_model.into(),
+        prompt_hash: prompt_hash(&case.prompt),
+        system_prompt_hash: None,
+        system_prompt_source: None,
+        confidence: None,
+        output: None,
+        error: Some(format!("benchmark case timed out after {timeout_s}s")),
+    }
 }
 
 /// Metadata that describes how a benchmark run was configured.
@@ -137,28 +190,34 @@ pub async fn run_t1_case(
     let started = Instant::now();
     let mut passes: u32 = 0;
     let mut fails: u32 = 0;
-    let mut accumulated_cost: u32 = 0;
+    let mut errors: u32 = 0;
+    let accumulated_cost: Option<u32> = None;
     let mut last_confidence: Option<f32> = None;
     let mut total_iters: u32 = 0;
     let mut last_error: Option<String> = None;
     let mut output = String::new();
+    let mut prompt_tokens: u32 = 0;
+    let mut completion_tokens: u32 = 0;
+    let mut total_tokens: u32 = 0;
 
     for attempt in 0..T1_ATTEMPTS {
         // Budget gate before spawning.
-        if !opts.no_budget && accumulated_cost >= case.max_cost_cents {
-            warn!(
-                case = %case.id,
-                attempt,
-                accumulated_cost,
-                max = case.max_cost_cents,
-                "skipping remaining attempts: max_cost_cents exceeded"
-            );
-            break;
+        if let Some(cost) = accumulated_cost {
+            if !opts.no_budget && cost >= case.max_cost_cents {
+                warn!(
+                    case = %case.id,
+                    attempt,
+                    accumulated_cost = cost,
+                    max = case.max_cost_cents,
+                    "skipping remaining attempts: max_cost_cents exceeded"
+                );
+                break;
+            }
         }
 
         let mut wc = base_worker_config.clone();
         wc.system_prompt = t1_system_prompt();
-        wc.max_iterations = Some(1);
+        wc.max_iterations = effective_max_iterations(case, opts).or(Some(1));
 
         let mut worker = match Worker::spawn(&wc).await {
             Ok(w) => w,
@@ -166,7 +225,7 @@ pub async fn run_t1_case(
                 let err = format!("spawn failed: {e}");
                 append_attempt_output(&mut output, attempt, "spawn_error", &err);
                 last_error = Some(err);
-                fails += 1;
+                errors += 1;
                 continue;
             }
         };
@@ -178,12 +237,30 @@ pub async fn run_t1_case(
                 let err = format!("send failed: {e}");
                 append_attempt_output(&mut output, attempt, "send_error", &err);
                 last_error = Some(err);
-                fails += 1;
+                errors += 1;
                 let _ = worker.shutdown().await;
                 continue;
             }
         };
         let _ = worker.shutdown().await;
+        add_usage(
+            &mut prompt_tokens,
+            &mut completion_tokens,
+            &mut total_tokens,
+            &outcome,
+        );
+
+        if outcome.status != ResultStatus::Ok {
+            let err = send_outcome_error(&outcome);
+            append_attempt_output(&mut output, attempt, "worker_error", &err);
+            last_error = Some(err);
+            errors += 1;
+            if outcome.confidence.is_some() {
+                last_confidence = outcome.confidence;
+            }
+            total_iters = total_iters.saturating_add(outcome.iterations);
+            continue;
+        }
 
         let response = outcome.response.clone().unwrap_or_default();
         let attempt_outcome = match grade_attempt(&response, &case.expected) {
@@ -206,10 +283,6 @@ pub async fn run_t1_case(
             &response,
         );
 
-        // Approximate per-attempt cost — placeholder until a usage→cost
-        // mapping is wired up. Keeps the budget gate exercised.
-        accumulated_cost = accumulated_cost.saturating_add(1);
-
         if outcome.confidence.is_some() {
             last_confidence = outcome.confidence;
         }
@@ -227,11 +300,13 @@ pub async fn run_t1_case(
         }
     }
 
-    let attempts_run = passes + fails;
+    let attempts_run = passes + fails + errors;
     let status = if attempts_run == 0 {
         BenchStatus::Error
     } else if passes >= T1_PASS_THRESHOLD {
         BenchStatus::Pass
+    } else if errors > 0 {
+        BenchStatus::Error
     } else {
         BenchStatus::Fail
     };
@@ -248,6 +323,7 @@ pub async fn run_t1_case(
         status = ?status,
         passes,
         fails,
+        errors,
         elapsed_ms,
         "T1 case complete",
     );
@@ -261,6 +337,9 @@ pub async fn run_t1_case(
         latency_ms: elapsed_ms,
         cost_cents: accumulated_cost,
         iterations: total_iters,
+        prompt_tokens: nonzero_u32(prompt_tokens),
+        completion_tokens: nonzero_u32(completion_tokens),
+        total_tokens: nonzero_u32(total_tokens),
         worker_model: base_worker_config.model.clone(),
         prompt_hash: prompt_hash(&case.prompt),
         system_prompt_hash: Some(prompt_hash(&t1_system_prompt())),
@@ -269,6 +348,31 @@ pub async fn run_t1_case(
         output: (!output.is_empty()).then_some(output),
         error: last_error.filter(|_| status == BenchStatus::Error),
     })
+}
+
+fn add_usage(
+    prompt_tokens: &mut u32,
+    completion_tokens: &mut u32,
+    total_tokens: &mut u32,
+    outcome: &SendOutcome,
+) {
+    if let Some(usage) = &outcome.usage {
+        *prompt_tokens = prompt_tokens.saturating_add(usage.prompt_tokens);
+        *completion_tokens = completion_tokens.saturating_add(usage.completion_tokens);
+        *total_tokens = total_tokens.saturating_add(usage.total_tokens);
+    }
+}
+
+fn send_outcome_error(outcome: &SendOutcome) -> String {
+    outcome.error.as_ref().map_or_else(
+        || {
+            outcome
+                .response
+                .clone()
+                .unwrap_or_else(|| format!("worker returned status {:?}", outcome.status))
+        },
+        |e| e.message.clone(),
+    )
 }
 
 fn append_attempt_output(out: &mut String, attempt: u32, label: &str, body: &str) {
@@ -312,13 +416,32 @@ pub async fn run_t1(
     let run_id = new_run_id();
     let started_at = Utc::now();
     let mut results = Vec::with_capacity(cases.len());
-    let mut total_cost: u32 = 0;
+    let mut total_cost: Option<u32> = None;
 
     for case in cases {
-        let r = run_t1_case(case, &run_id, base_worker_config, opts).await?;
-        total_cost = total_cost.saturating_add(r.cost_cents);
+        let timeout_s = effective_timeout_s(case, opts);
+        let r = match tokio::time::timeout(
+            Duration::from_secs(u64::from(timeout_s)),
+            run_t1_case(case, &run_id, base_worker_config, opts),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => timeout_bench_result(case, &run_id, &base_worker_config.model, timeout_s),
+        };
+        if let Some(cost) = r.cost_cents {
+            total_cost = Some(total_cost.unwrap_or(0).saturating_add(cost));
+        }
         store.append_result(&r)?;
+        let fatal = is_fatal_worker_error(&r);
         results.push(r);
+        if fatal {
+            warn!(
+                case = %case.id,
+                "stopping T1 run after fatal worker/provider error"
+            );
+            break;
+        }
     }
 
     let total = u32::try_from(results.len()).unwrap_or(u32::MAX);
@@ -373,6 +496,9 @@ pub async fn run_t1(
         skipped,
         config_hash: prompt_hash(&run_config.config_hash_input(base_worker_config)),
         total_cost_cents: total_cost,
+        prompt_tokens: sum_result_tokens(&results, |r| r.prompt_tokens),
+        completion_tokens: sum_result_tokens(&results, |r| r.completion_tokens),
+        total_tokens: sum_result_tokens(&results, |r| r.total_tokens),
     };
     store.append_run(&summary)?;
 
@@ -383,9 +509,61 @@ pub async fn run_t1(
     })
 }
 
+fn sum_result_tokens(
+    results: &[BenchResult],
+    field: impl Fn(&BenchResult) -> Option<u32>,
+) -> Option<u32> {
+    nonzero_u32(
+        results
+            .iter()
+            .filter_map(field)
+            .fold(0u32, u32::saturating_add),
+    )
+}
+
+#[must_use]
+pub fn is_fatal_worker_error(result: &BenchResult) -> bool {
+    if result.status != BenchStatus::Error {
+        return false;
+    }
+    let text = result
+        .error
+        .as_deref()
+        .or(result.output.as_deref())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    text.contains("not a valid model id")
+        || text.contains("missing credentials")
+        || text.contains("api key")
+        || text.contains("unauthorized")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bench_result(case_id: &str, status: BenchStatus) -> BenchResult {
+        BenchResult {
+            case_id: case_id.into(),
+            run_id: "run-x".into(),
+            tier: BenchTier::T1,
+            status,
+            score: 0.0,
+            latency_ms: 0,
+            cost_cents: None,
+            iterations: 0,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            worker_model: "mock/model".into(),
+            prompt_hash: "hash".into(),
+            system_prompt_hash: None,
+            system_prompt_source: None,
+            confidence: None,
+            output: None,
+            error: None,
+        }
+    }
 
     // ── grade_attempt ──────────────────────────────────────────
 
@@ -502,6 +680,20 @@ mod tests {
     #[test]
     fn no_attempts_errors() {
         assert_eq!(verdict(0, 0), BenchStatus::Error);
+    }
+
+    #[test]
+    fn fatal_worker_error_detects_provider_level_failures() {
+        let mut result = bench_result("case", BenchStatus::Error);
+        result.error = Some("openrouter/foo is not a valid model ID".into());
+        assert!(is_fatal_worker_error(&result));
+
+        result.error = Some("assertion failed in grader".into());
+        assert!(!is_fatal_worker_error(&result));
+
+        result.status = BenchStatus::Fail;
+        result.error = Some("openrouter/foo is not a valid model ID".into());
+        assert!(!is_fatal_worker_error(&result));
     }
 
     // ── run_options ────────────────────────────────────────────

@@ -6,12 +6,16 @@
 //! `hooks::cmd`.
 
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::Context;
 use chrono::Utc;
 
-use crate::bench::case::{load_all, load_tier, BenchCase, BenchTier};
-use crate::bench::runner::{run_t1, BenchRunConfig, RunOptions};
+use crate::bench::case::{load_all, load_tier, BenchCase, BenchTier, DEFAULT_TIMEOUT_S};
+use crate::bench::runner::{
+    effective_timeout_s, is_fatal_worker_error, nonzero_u32, run_t1, timeout_bench_result,
+    BenchRunConfig, RunOptions,
+};
 use crate::bench::store::{BenchResult, BenchRun, BenchStatus, BenchStore};
 use crate::worker::process::WorkerConfig;
 
@@ -22,6 +26,8 @@ pub struct BenchRunRequest<'a> {
     pub case_id: Option<&'a str>,
     pub worker_config: &'a WorkerConfig,
     pub no_budget: bool,
+    pub timeout_s: Option<u32>,
+    pub max_iterations: Option<u32>,
     pub run_config: &'a BenchRunConfig,
     pub fixtures_root: &'a Path,
 }
@@ -37,6 +43,12 @@ pub fn cmd_bench_list(cases_root: &Path) -> anyhow::Result<()> {
         println!("No benchmark cases found under {}", cases_root.display());
         return Ok(());
     }
+    let id_width = cases
+        .iter()
+        .map(|case| case.id.len())
+        .max()
+        .unwrap_or(24)
+        .max(24);
     let mut tier = None;
     for case in &cases {
         if tier != Some(case.tier) {
@@ -44,12 +56,13 @@ pub fn cmd_bench_list(cases_root: &Path) -> anyhow::Result<()> {
             println!("\n== {} ==", case.tier);
         }
         let cost = case.max_cost_cents;
-        let timeout = case.timeout_s;
+        let timeout = case.timeout_s.unwrap_or(DEFAULT_TIMEOUT_S);
         println!(
-            "  {id:<24} {name}  (max ${cost_dollars:.2}, {timeout}s)",
+            "  {id:<id_width$} {name}  (max ${cost_dollars:.2}, {timeout}s)",
             id = case.id,
             name = case.name,
             cost_dollars = f64::from(cost) / 100.0,
+            id_width = id_width,
         );
     }
     println!("\n{} case(s)", cases.len());
@@ -91,6 +104,8 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
 
     let opts = RunOptions {
         no_budget: req.no_budget,
+        timeout_s: req.timeout_s,
+        max_iterations: req.max_iterations,
     };
     let mut all_results = Vec::new();
     let mut summary_run_id = None;
@@ -102,55 +117,48 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
         all_results.extend(summary.results);
         println!("\n== summary ==");
         print_run_summary(&summary.summary);
+        if all_results.iter().any(is_fatal_worker_error) {
+            eprintln!("stopping benchmark run after fatal worker/provider error");
+            print_result_table(&all_results);
+            if let Some(ref id) = summary_run_id {
+                println!("\nRun id: {id}");
+            }
+            return Ok(());
+        }
     }
 
     for case in &other {
         let run_id = summary_run_id
             .clone()
             .unwrap_or_else(crate::bench::store::new_run_id);
+        let timeout_s = effective_timeout_s(case, &opts);
         let result = match case.tier {
-            BenchTier::T2 => crate::bench::runner_t2t3::run_t2_case(
-                case,
-                &run_id,
-                req.fixtures_root,
-                req.worker_config,
-                &opts,
+            BenchTier::T2 => match tokio::time::timeout(
+                Duration::from_secs(u64::from(timeout_s)),
+                crate::bench::runner_t2t3::run_t2_case(
+                    case,
+                    &run_id,
+                    req.fixtures_root,
+                    req.worker_config,
+                    &opts,
+                ),
             )
             .await
-            .map_or_else(
-                |e| {
-                    Ok::<_, anyhow::Error>(crate::bench::store::BenchResult {
-                        case_id: case.id.clone(),
-                        run_id: run_id.clone(),
-                        tier: BenchTier::T2,
-                        status: BenchStatus::Error,
-                        score: 0.0,
-                        latency_ms: 0,
-                        cost_cents: 0,
-                        iterations: 0,
-                        worker_model: String::new(),
-                        prompt_hash: crate::bench::runner::prompt_hash(&case.prompt),
-                        system_prompt_hash: None,
-                        system_prompt_source: None,
-                        confidence: None,
-                        output: None,
-                        error: Some(e.to_string()),
-                    })
-                },
-                Ok,
-            )?,
-            BenchTier::T3 => crate::bench::runner_t2t3::run_t3_case_stub(case, &run_id, &opts)
-                .map_or_else(
+            {
+                Ok(result) => result.map_or_else(
                     |e| {
                         Ok::<_, anyhow::Error>(crate::bench::store::BenchResult {
                             case_id: case.id.clone(),
                             run_id: run_id.clone(),
-                            tier: BenchTier::T3,
+                            tier: BenchTier::T2,
                             status: BenchStatus::Error,
                             score: 0.0,
                             latency_ms: 0,
-                            cost_cents: 0,
+                            cost_cents: None,
                             iterations: 0,
+                            prompt_tokens: None,
+                            completion_tokens: None,
+                            total_tokens: None,
                             worker_model: String::new(),
                             prompt_hash: crate::bench::runner::prompt_hash(&case.prompt),
                             system_prompt_hash: None,
@@ -162,13 +170,56 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
                     },
                     Ok,
                 )?,
+                Err(_) => timeout_bench_result(case, &run_id, &req.worker_config.model, timeout_s),
+            },
+            BenchTier::T3 => {
+                match tokio::time::timeout(Duration::from_secs(u64::from(timeout_s)), async {
+                    crate::bench::runner_t2t3::run_t3_case_stub(case, &run_id, &opts)
+                })
+                .await
+                {
+                    Ok(result) => result.map_or_else(
+                        |e| {
+                            Ok::<_, anyhow::Error>(crate::bench::store::BenchResult {
+                                case_id: case.id.clone(),
+                                run_id: run_id.clone(),
+                                tier: BenchTier::T3,
+                                status: BenchStatus::Error,
+                                score: 0.0,
+                                latency_ms: 0,
+                                cost_cents: None,
+                                iterations: 0,
+                                prompt_tokens: None,
+                                completion_tokens: None,
+                                total_tokens: None,
+                                worker_model: String::new(),
+                                prompt_hash: crate::bench::runner::prompt_hash(&case.prompt),
+                                system_prompt_hash: None,
+                                system_prompt_source: None,
+                                confidence: None,
+                                output: None,
+                                error: Some(e.to_string()),
+                            })
+                        },
+                        Ok,
+                    )?,
+                    Err(_) => {
+                        timeout_bench_result(case, &run_id, &req.worker_config.model, timeout_s)
+                    }
+                }
+            }
             BenchTier::T1 => unreachable!("T1 partitioned out above"),
         };
         if summary_run_id.is_none() {
             summary_run_id = Some(run_id);
         }
         req.store.append_result(&result)?;
+        let fatal = is_fatal_worker_error(&result);
         all_results.push(result);
+        if fatal {
+            eprintln!("stopping benchmark run after fatal worker/provider error");
+            break;
+        }
     }
 
     if !had_t1 {
@@ -207,6 +258,55 @@ pub fn cmd_bench_show(store: &BenchStore, run_id: &str) -> anyhow::Result<()> {
     if let Some(run) = store.read_runs()?.into_iter().find(|r| r.run_id == run_id) {
         println!("\n== summary ==");
         print_run_summary(&run);
+    }
+    Ok(())
+}
+
+/// Prints saved error/output details for a run. Defaults to non-pass
+/// cases so failed benchmark runs are inspectable without scrolling
+/// through every passing row.
+///
+/// # Errors
+///
+/// Returns an error if the store can't be read or no matching rows exist.
+pub fn cmd_bench_details(
+    store: &BenchStore,
+    run_id: &str,
+    case_id: Option<&str>,
+    include_passes: bool,
+) -> anyhow::Result<()> {
+    let results = store.read_results(run_id)?;
+    if results.is_empty() {
+        anyhow::bail!("no results found for run `{run_id}`");
+    }
+
+    if let Some(run) = store.read_runs()?.into_iter().find(|r| r.run_id == run_id) {
+        println!("== summary ==");
+        print_run_summary(&run);
+    }
+
+    let mut printed = 0usize;
+    for result in &results {
+        if let Some(case_id) = case_id {
+            if result.case_id != case_id {
+                continue;
+            }
+        }
+        if !include_passes && result.status == BenchStatus::Pass {
+            continue;
+        }
+        print_result_details(result);
+        printed += 1;
+    }
+
+    if printed == 0 {
+        match case_id {
+            Some(case_id) => {
+                anyhow::bail!("no matching details for case `{case_id}` in `{run_id}`")
+            }
+            None if include_passes => anyhow::bail!("no result rows found for `{run_id}`"),
+            None => println!("No failed/error cases."),
+        }
     }
     Ok(())
 }
@@ -342,12 +442,13 @@ pub fn cmd_bench_list_runs(store: &BenchStore) -> anyhow::Result<()> {
 fn print_result_table(results: &[crate::bench::store::BenchResult]) {
     let case_width = case_id_width(results.iter().map(|r| r.case_id.as_str()));
     println!(
-        "{case:<case_width$}  {tier:<4}  {status:<8}  {score:>5}  {latency:>8}  {conf:>5}",
+        "{case:<case_width$}  {tier:<4}  {status:<8}  {score:>5}  {latency:>8}  {tokens:>8}  {conf:>5}",
         case = "case",
         tier = "tier",
         status = "status",
         score = "score",
         latency = "latency",
+        tokens = "tokens",
         conf = "conf",
     );
     for r in results {
@@ -357,15 +458,55 @@ fn print_result_table(results: &[crate::bench::store::BenchResult]) {
         let conf = r
             .confidence
             .map_or(String::from("-"), |c| format!("{c:.2}"));
+        let tokens = r
+            .total_tokens
+            .map_or(String::from("-"), |tokens| tokens.to_string());
         println!(
-            "{case:<case_width$}  {tier:<4}  {status:<8}  {score:>5.2}  {latency:>8}  {conf:>5}",
+            "{case:<case_width$}  {tier:<4}  {status:<8}  {score:>5.2}  {latency:>8}  {tokens:>8}  {conf:>5}",
             case = r.case_id,
             tier = tier,
             status = status,
             score = r.score,
             latency = latency,
+            tokens = tokens,
             conf = conf,
         );
+    }
+}
+
+fn print_result_details(result: &BenchResult) {
+    println!(
+        "\n== {case} [{tier}] {status:?} ==",
+        case = result.case_id,
+        tier = result.tier,
+        status = result.status,
+    );
+    println!(
+        "score={score:.2} latency={latency}ms tokens={tokens} cost={cost}",
+        score = result.score,
+        latency = result.latency_ms,
+        tokens = result
+            .total_tokens
+            .map_or_else(|| "-".to_string(), |tokens| tokens.to_string()),
+        cost = result.cost_cents.map_or_else(
+            || "-".to_string(),
+            |cents| format!("${:.2}", f64::from(cents) / 100.0),
+        ),
+    );
+    println!("worker_model={}", result.worker_model);
+    if let Some(confidence) = result.confidence {
+        println!("confidence={confidence:.2}");
+    }
+    if let Some(error) = result.error.as_deref() {
+        println!("\n-- error --");
+        println!("{error}");
+    }
+    if let Some(output) = result.output.as_deref() {
+        println!("\n-- output --");
+        println!("{output}");
+    }
+    if result.error.is_none() && result.output.is_none() {
+        println!("\n(no saved error/output)");
     }
 }
 
@@ -385,9 +526,10 @@ fn summarize_run(
     let failed = count_status(results, BenchStatus::Fail);
     let errored = count_status(results, BenchStatus::Error);
     let skipped = count_status(results, BenchStatus::Skipped);
-    let total_cost_cents = results
-        .iter()
-        .fold(0u32, |sum, r| sum.saturating_add(r.cost_cents));
+    let total_cost_cents = sum_costs(results);
+    let prompt_tokens = sum_tokens(results, |r| r.prompt_tokens);
+    let completion_tokens = sum_tokens(results, |r| r.completion_tokens);
+    let total_tokens = sum_tokens(results, |r| r.total_tokens);
     BenchRun {
         run_id: run_id.into(),
         started_at: Utc::now(),
@@ -412,7 +554,28 @@ fn summarize_run(
             &run_config.config_hash_input(base_worker_config),
         ),
         total_cost_cents,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
     }
+}
+
+fn sum_tokens(results: &[BenchResult], field: impl Fn(&BenchResult) -> Option<u32>) -> Option<u32> {
+    nonzero_u32(
+        results
+            .iter()
+            .filter_map(field)
+            .fold(0u32, u32::saturating_add),
+    )
+}
+
+fn sum_costs(results: &[BenchResult]) -> Option<u32> {
+    results
+        .iter()
+        .filter_map(|r| r.cost_cents)
+        .fold(None, |sum: Option<u32>, cost| {
+            Some(sum.unwrap_or(0).saturating_add(cost))
+        })
 }
 
 fn count_status(results: &[BenchResult], status: BenchStatus) -> u32 {
@@ -426,30 +589,43 @@ fn common_tier(results: &[BenchResult]) -> Option<BenchTier> {
 
 fn print_run_summary(r: &BenchRun) {
     println!(
-        "{id}  {when}  tier={tier:?}  variant={variant}  model={model}  {passed}P/{failed}F/{errored}E/{skipped}S of {total}  ${cost:.2}",
+        "run={id}  started={when}  tier={tier}  variant={variant}",
         id = r.run_id,
         when = r.started_at.to_rfc3339(),
-        tier = r.tier,
+        tier = r
+            .tier
+            .map_or_else(|| "mixed".to_string(), |t| t.to_string()),
         variant = r.variant.as_deref().unwrap_or("-"),
-        model = r.worker_model.as_deref().unwrap_or("-"),
+    );
+    println!(
+        "  results: pass={passed} fail={failed} error={errored} skipped={skipped} total={total} cost={cost} tokens={tokens}",
         passed = r.passed,
         failed = r.failed,
         errored = r.errored,
         skipped = r.skipped,
         total = r.total,
-        cost = f64::from(r.total_cost_cents) / 100.0,
+        cost = r.total_cost_cents.map_or_else(
+            || "-".to_string(),
+            |cents| format!("${:.2}", f64::from(cents) / 100.0),
+        ),
+        tokens = r
+            .total_tokens
+            .map_or_else(|| "-".to_string(), |tokens| tokens.to_string()),
+    );
+    println!(
+        "  models: worker={worker} grader={grader} selector={selector} key={key}",
+        worker = r.worker_model.as_deref().unwrap_or("-"),
+        grader = r.grader_model.as_deref().unwrap_or("-"),
+        selector = r.model_selector.as_deref().unwrap_or("-"),
+        key = r.model_key.as_deref().unwrap_or("-"),
     );
     if r.model_selector.is_some()
         || r.model_key.is_some()
-        || r.grader_model.is_some()
         || r.prompt_variant.is_some()
         || r.cases_root.is_some()
     {
         println!(
-            "  selector={selector} key={key} grader={grader} prompt={prompt} cases={cases} config={config}",
-            selector = r.model_selector.as_deref().unwrap_or("-"),
-            key = r.model_key.as_deref().unwrap_or("-"),
-            grader = r.grader_model.as_deref().unwrap_or("-"),
+            "  metadata: prompt={prompt} cases={cases} config={config}",
             prompt = r.prompt_variant.as_deref().unwrap_or("-"),
             cases = r.cases_root.as_deref().unwrap_or("-"),
             config = r.config_hash,
@@ -500,8 +676,11 @@ mod tests {
                 0.0
             },
             latency_ms: 100,
-            cost_cents: 1,
+            cost_cents: None,
             iterations: 1,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
             worker_model: "m".into(),
             prompt_hash: "h1".into(),
             system_prompt_hash: None,
@@ -585,7 +764,10 @@ text = "x"
                 errored: 0,
                 skipped: 0,
                 config_hash: "h".into(),
-                total_cost_cents: 1,
+                total_cost_cents: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+                total_tokens: None,
             })
             .unwrap();
         cmd_bench_show(&store, "run-1").unwrap();

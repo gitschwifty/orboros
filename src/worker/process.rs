@@ -176,7 +176,13 @@ impl Worker {
             worker.init(config).await?;
         }
         tracing::Span::current().record("session_id", tracing::field::display(&worker.session_id));
-        info!(session_id = %worker.session_id, "worker ready");
+        info!(
+            session_id = %worker.session_id,
+            task_id = ?config.task_id,
+            worker_id = ?config.worker_id,
+            model = %config.model,
+            "worker ready",
+        );
         Ok(worker)
     }
 

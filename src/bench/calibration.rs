@@ -215,8 +215,11 @@ mod tests {
                 0.0
             },
             latency_ms: 0,
-            cost_cents: 0,
+            cost_cents: None,
             iterations: 1,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
             worker_model: "m".into(),
             prompt_hash: "h".into(),
             system_prompt_hash: None,

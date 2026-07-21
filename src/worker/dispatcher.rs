@@ -104,7 +104,13 @@ impl DispatchOutcome {
 #[instrument(
     name = "dispatcher.dispatch_orb",
     skip(orb, prompt, worker_config, hooks),
-    fields(orb = %orb.id, model = %worker_config.model)
+    fields(
+        orb = %orb.id,
+        title = %orb.title,
+        orb_type = ?orb.orb_type,
+        phase = ?orb.phase,
+        model = %worker_config.model
+    )
 )]
 pub async fn dispatch_orb(
     orb: &Orb,
@@ -142,6 +148,14 @@ pub async fn dispatch_orb(
     let dispatched_at = Utc::now();
     let started = Instant::now();
     let send_id = format!("{}-dispatch", orb.id);
+    info!(
+        orb = %orb.id,
+        title = %orb.title,
+        orb_type = ?orb.orb_type,
+        phase = ?orb.phase,
+        model = %worker_config.model,
+        "dispatch_orb start",
+    );
 
     let outcome = match Worker::spawn(worker_config).await {
         Ok(mut worker) => match worker.send(&send_id, prompt).await {
@@ -177,8 +191,14 @@ pub async fn dispatch_orb(
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     info!(
         orb = %orb.id,
+        title = %orb.title,
+        orb_type = ?orb.orb_type,
+        phase = ?orb.phase,
         status = ?outcome.status,
         elapsed_ms,
+        prompt_tokens = ?outcome.prompt_tokens,
+        completion_tokens = ?outcome.completion_tokens,
+        total_tokens = ?outcome.total_tokens,
         "dispatch_orb complete",
     );
 

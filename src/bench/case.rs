@@ -7,6 +7,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Default case timeout when neither benchmark config nor the case
+/// provides one.
+pub const DEFAULT_TIMEOUT_S: u32 = 120;
+
 /// Benchmark tier — affects which runner code path executes the case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -68,6 +72,17 @@ pub enum BenchExpected {
     Rubric { criteria: Vec<String> },
 }
 
+/// Execution strategy for a benchmark case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchRunner {
+    /// T2 runner creates one task orb from the case prompt.
+    SingleTask,
+    /// T2 runner creates a feature root and drives speccing/decomposition
+    /// before dispatching the generated child task orbs.
+    Decompose,
+}
+
 /// A single benchmark case.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,20 +97,23 @@ pub struct BenchCase {
     /// Prompt sent to the worker as the user message.
     pub prompt: String,
     pub expected: BenchExpected,
+    /// Optional runner override. Defaults to `single_task`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<BenchRunner>,
     /// Optional seed repo path (T2). Relative to `bench/fixtures/`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_repo: Option<PathBuf>,
-    /// Per-case timeout in seconds.
-    #[serde(default = "default_timeout_s")]
-    pub timeout_s: u32,
+    /// Per-case timeout in seconds. Overrides `[bench].timeout_s`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_s: Option<u32>,
+    /// Per-case worker iteration/tool-call budget. Overrides
+    /// `[bench].max_iterations`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<u32>,
     /// Per-case cost ceiling in cents. The harness enforces this
     /// unless invoked with `--no-budget`.
     #[serde(default = "default_max_cost_cents")]
     pub max_cost_cents: u32,
-}
-
-fn default_timeout_s() -> u32 {
-    120
 }
 
 fn default_max_cost_cents() -> u32 {
@@ -274,7 +292,7 @@ text = "hello"
         let case = load_case(&p, Some(BenchTier::T1)).unwrap();
         assert_eq!(case.id, "smoke-1");
         assert_eq!(case.tier, BenchTier::T1);
-        assert_eq!(case.timeout_s, 120, "default timeout applied");
+        assert_eq!(case.timeout_s, None, "timeout inherits harness default");
         assert_eq!(case.max_cost_cents, 50, "default cost ceiling applied");
         assert!(case.seed_repo.is_none());
         match case.expected {
@@ -303,7 +321,7 @@ command = "cargo test"
         let p = write_case(dir.path(), "add-flag.toml", body);
         let case = load_case(&p, Some(BenchTier::T2)).unwrap();
         assert_eq!(case.tier, BenchTier::T2);
-        assert_eq!(case.timeout_s, 300);
+        assert_eq!(case.timeout_s, Some(300));
         assert_eq!(case.max_cost_cents, 200);
         assert_eq!(
             case.seed_repo.as_deref().and_then(Path::to_str),

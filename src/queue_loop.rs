@@ -673,6 +673,13 @@ async fn dispatch_one_owned(
     let system = resolved.system_prompt;
     let prompt_source = resolved.source.label();
     let wc = worker_config_for(&orb, base_wc, &system);
+    tracing::info!(
+        orb = %orb.id,
+        title = %orb.title,
+        target = ?target,
+        phase = ?orb.phase,
+        "dispatching ready orb",
+    );
 
     let outcome = dispatch_orb(&orb, &user, &wc, hooks.as_deref())
         .await

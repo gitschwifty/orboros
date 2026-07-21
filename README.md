@@ -328,8 +328,26 @@ just fmt                 # cargo fmt
 just bench-init ../orboros-bench # create private sibling bench corpus dirs
 just bench-list ../orboros-bench # list benchmark cases
 just bench-run t1 ../orboros-bench
-just bench-run-model kimi kimi-smoke t1 ../orboros-bench
+just bench-run-model kimi t1 kimi-smoke ../orboros-bench
+cargo run -- bench --bench-root ../orboros-bench details <run-id>
 ```
+
+Bench runs can set overall caps in config; individual cases can override these:
+
+```toml
+[bench]
+timeout_s = 600
+max_iterations = 16
+```
+
+`timeout_s` is a whole-case wall-clock cap. `max_iterations` is passed to
+Heddle as the per-worker agent/tool-loop budget for each dispatched orb; it is
+not the number of Orboros queue ticks or generated child tasks.
+
+Benchmark results default to `<bench-root>/results`; use
+`--bench-results-dir <dir>` or `ORBOROS_BENCH_RESULTS_DIR` to inspect or write a
+different store, including older runs under `~/.orboros/default/bench`. Each new
+run writes under `<bench-root>/results/YYYY-MM-DD/<run-id>/`.
 
 Tests use mock worker scripts (`test-fixtures/mock-worker*.sh`) for fast unit tests. Set `HEDDLE_BINARY` for integration tests against a real heddle instance.
 

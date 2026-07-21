@@ -170,6 +170,9 @@ enum Commands {
         /// Root containing cases/, fixtures/, prompts/, and results/.
         #[arg(long, env = "ORBOROS_BENCH_ROOT", default_value = "bench")]
         bench_root: PathBuf,
+        /// Directory for benchmark run/result JSONL. Defaults to `<bench-root>/results`.
+        #[arg(long, env = "ORBOROS_BENCH_RESULTS_DIR")]
+        bench_results_dir: Option<PathBuf>,
         #[command(subcommand)]
         action: BenchAction,
     },
@@ -201,6 +204,17 @@ enum BenchAction {
     Show {
         /// Run id, as printed by `bench run` or `bench list-runs`.
         run_id: String,
+    },
+    /// Print detailed saved output for failed/error cases in a run.
+    Details {
+        /// Run id, as printed by `bench run` or `bench list-runs`.
+        run_id: String,
+        /// Limit details to one case id.
+        #[arg(long)]
+        case: Option<String>,
+        /// Include passing cases too. Defaults to non-pass only.
+        #[arg(long)]
+        all: bool,
     },
     /// Diff two saved runs by case outcome.
     Compare { run_a: String, run_b: String },
@@ -694,9 +708,13 @@ fn main() -> anyhow::Result<()> {
             let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
             orb_cmd::cmd_review_queue(&orb_store)
         }
-        Commands::Bench { bench_root, action } => cmd_bench(
-            &state_dir,
+        Commands::Bench {
+            bench_root,
+            bench_results_dir,
+            action,
+        } => cmd_bench(
             &bench_root,
+            bench_results_dir.as_deref(),
             action,
             cli.worker_binary.as_deref(),
             cli.skip_prereq_check,
@@ -705,8 +723,8 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn cmd_bench(
-    state_dir: &std::path::Path,
     bench_root: &std::path::Path,
+    bench_results_dir: Option<&std::path::Path>,
     action: BenchAction,
     worker_binary: Option<&str>,
     skip_prereq_check: bool,
@@ -717,7 +735,8 @@ fn cmd_bench(
     use orboros::config::ModelRole;
     let cases_root = bench_root.join("cases");
     let fixtures_root = bench_root.join("fixtures");
-    let bench_dir = state_dir.join("bench");
+    let bench_dir =
+        bench_results_dir.map_or_else(|| bench_root.join("results"), std::path::Path::to_path_buf);
     let store = BenchStore::new(&bench_dir);
 
     match action {
@@ -744,7 +763,15 @@ fn cmd_bench(
             } else {
                 resolver.resolve(ModelRole::BenchDefault)?
             };
-            let resolved_grader = resolver.resolve(ModelRole::BenchGrader).ok();
+            let resolved_model = normalize_bench_model_for_heddle(resolved_model);
+            let resolved_grader = if model.is_some() {
+                resolved_model.model.clone()
+            } else {
+                resolver
+                    .resolve(ModelRole::BenchGrader)
+                    .map(normalize_bench_model_for_heddle)
+                    .map_or_else(|_| resolved_model.model.clone(), |m| m.model)
+            };
             let binary_owned;
             let binary = if let Some(binary) = worker_binary {
                 binary
@@ -755,7 +782,7 @@ fn cmd_bench(
                     .ok_or_else(|| anyhow::anyhow!("worker_binary is unset in OrbConfig"))?;
                 &binary_owned
             };
-            prereq_check(Some(binary), &resolved_model.model, skip_prereq_check)?;
+            bench_prereq_check(Some(binary), &resolved_model.model, skip_prereq_check)?;
             let worker_config = make_worker_config(binary, &resolved_model.model, "");
             let run_config = BenchRunConfig {
                 variant,
@@ -765,7 +792,7 @@ fn cmd_bench(
                     .or_else(|| Some(resolved_model.model.clone())),
                 model_key: resolved_model.key.clone(),
                 worker_model: Some(resolved_model.model.clone()),
-                grader_model: resolved_grader.map(|m| m.model),
+                grader_model: Some(resolved_grader),
                 prompt_variant: None,
                 cases_root: Some(cases_root.display().to_string()),
             };
@@ -777,11 +804,16 @@ fn cmd_bench(
                 case_id: case.as_deref(),
                 worker_config: &worker_config,
                 no_budget,
+                timeout_s: cfg.bench.timeout_s,
+                max_iterations: cfg.bench.max_iterations,
                 run_config: &run_config,
                 fixtures_root: &fixtures_root,
             }))
         }
         BenchAction::Show { run_id } => bench_cmd::cmd_bench_show(&store, &run_id),
+        BenchAction::Details { run_id, case, all } => {
+            bench_cmd::cmd_bench_details(&store, &run_id, case.as_deref(), all)
+        }
         BenchAction::Compare { run_a, run_b } => {
             bench_cmd::cmd_bench_compare(&store, &run_a, &run_b)
         }
@@ -790,6 +822,37 @@ fn cmd_bench(
             orboros::bench::calibration::cmd_bench_calibration(&store, &run_id, buckets)
         }
     }
+}
+
+fn normalize_bench_model_for_heddle(
+    mut resolved: orboros::config::ResolvedModel,
+) -> orboros::config::ResolvedModel {
+    if let Some(model) = resolved.model.strip_prefix("openrouter/") {
+        resolved.model = model.to_string();
+        resolved.router = Some("openrouter".into());
+    }
+    resolved
+}
+
+fn bench_prereq_check<'a>(
+    worker_binary: Option<&'a str>,
+    model: &str,
+    skip: bool,
+) -> anyhow::Result<&'a str> {
+    let binary = require_binary(worker_binary)?;
+    if skip {
+        tracing::warn!("--skip-prereq-check set; trusting caller for binary/model/credentials");
+        return Ok(binary);
+    }
+    orboros::startup_check::check_binary(binary)?;
+    orboros::startup_check::check_model_string(model)?;
+    if std::env::var("OPENROUTER_API_KEY").map_or(true, |s| s.trim().is_empty()) {
+        anyhow::bail!(
+            "missing credentials for bench OpenRouter route: set OPENROUTER_API_KEY \
+             (looked at .env and process env)"
+        );
+    }
+    Ok(binary)
 }
 
 fn cmd_sessions(state_dir: &std::path::Path, action: Option<SessionsAction>) -> anyhow::Result<()> {

@@ -1,15 +1,18 @@
 //! Append-only JSONL store for benchmark results.
 //!
-//! Layout under `.orbs/bench/`:
-//!   - `runs.jsonl` — one [`BenchRun`] per line, the index of every
+//! Layout under the benchmark results directory:
+//!   - `runs.jsonl` - one [`BenchRun`] per line, the index of every
 //!     run the harness has produced.
-//!   - `results-<run_id>.jsonl` — one [`BenchResult`] per line for
-//!     the case results within a run.
+//!   - `YYYY-MM-DD/<run_id>/run.json` - summary for one run.
+//!   - `YYYY-MM-DD/<run_id>/results.jsonl` - one [`BenchResult`] per
+//!     line for the case results within a run.
 //!
 //! The split keeps `runs.jsonl` small enough to scan for the CLI's
-//! `bench list-runs` while letting individual case results scale
-//! arbitrarily without bloating the index.
+//! `bench list-runs` while keeping each run's artifacts in a
+//! self-contained dated directory. Reads still fall back to the old
+//! flat `results-<run_id>.jsonl` layout.
 
+use std::collections::BTreeSet;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -41,7 +44,7 @@ impl BenchStatus {
     }
 }
 
-/// Per-case row written to `results-<run_id>.jsonl`.
+/// Per-case row written to a run's `results.jsonl`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchResult {
     pub case_id: String,
@@ -51,8 +54,18 @@ pub struct BenchResult {
     /// Pass rate across N=3 (or however many) attempts, in `[0.0, 1.0]`.
     pub score: f32,
     pub latency_ms: u64,
-    pub cost_cents: u32,
+    /// Actual provider cost in cents, when the worker reports it or
+    /// the harness can price it accurately. `None` means unknown;
+    /// benchmark code must not write placeholder estimates here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_cents: Option<u32>,
     pub iterations: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u32>,
     pub worker_model: String,
     /// SHA-256 of the prompt sent to the worker, hex-encoded —
     /// lets `bench compare` detect when the prompt changed between
@@ -81,7 +94,7 @@ pub struct BenchResult {
     pub error: Option<String>,
 }
 
-/// Summary row written to `runs.jsonl` once per run.
+/// Summary row written to `runs.jsonl` and the run's `run.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BenchRun {
     pub run_id: String,
@@ -121,8 +134,16 @@ pub struct BenchRun {
     /// addendum + threshold + sampling rate, etc.) hex-encoded.
     /// Used by `bench compare` for warning on config drift.
     pub config_hash: String,
-    /// Total cost across all cases in this run.
-    pub total_cost_cents: u32,
+    /// Total known cost across cases. `None` means no case reported
+    /// actual cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cost_cents: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u32>,
 }
 
 /// JSONL store at `<bench_dir>/`. Operations are append-only on disk;
@@ -159,19 +180,37 @@ impl BenchStore {
         self.bench_dir.join("runs.jsonl")
     }
 
+    /// Directory for one run's artifacts.
+    #[must_use]
+    pub fn run_dir(&self, run_id: &str) -> PathBuf {
+        self.bench_dir.join(run_date_dir(run_id)).join(run_id)
+    }
+
+    /// Path to one run's summary copy.
+    #[must_use]
+    pub fn run_summary_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("run.json")
+    }
+
     /// Path to the per-result file for a given run.
     #[must_use]
     pub fn results_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("results.jsonl")
+    }
+
+    /// Legacy flat results path used before per-run directories.
+    #[must_use]
+    pub fn legacy_results_path(&self, run_id: &str) -> PathBuf {
         self.bench_dir.join(format!("results-{run_id}.jsonl"))
     }
 
-    /// Appends a result row to `results-<run_id>.jsonl`.
+    /// Appends a result row to `<date>/<run_id>/results.jsonl`.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] on I/O or serialization failure.
     pub fn append_result(&self, result: &BenchResult) -> Result<(), StoreError> {
-        ensure_dir(&self.bench_dir)?;
+        ensure_dir(&self.run_dir(&result.run_id))?;
         let path = self.results_path(&result.run_id);
         append_jsonl(&path, result)
     }
@@ -183,8 +222,9 @@ impl BenchStore {
     /// As [`Self::append_result`].
     pub fn append_run(&self, run: &BenchRun) -> Result<(), StoreError> {
         ensure_dir(&self.bench_dir)?;
-        let path = self.runs_path();
-        append_jsonl(&path, run)
+        ensure_dir(&self.run_dir(&run.run_id))?;
+        append_jsonl(&self.runs_path(), run)?;
+        write_json(&self.run_summary_path(&run.run_id), run)
     }
 
     /// Reads all run summaries (oldest first). Skips malformed lines
@@ -194,7 +234,15 @@ impl BenchStore {
     ///
     /// Returns I/O errors. A missing file yields `Ok(vec![])`.
     pub fn read_runs(&self) -> Result<Vec<BenchRun>, StoreError> {
-        read_jsonl(&self.runs_path())
+        let mut runs: Vec<BenchRun> = read_jsonl(&self.runs_path())?;
+        let mut seen: BTreeSet<String> = runs.iter().map(|run| run.run_id.clone()).collect();
+        for run in discover_run_summaries(&self.bench_dir)? {
+            if seen.insert(run.run_id.clone()) {
+                runs.push(run);
+            }
+        }
+        runs.sort_by_key(|run| run.started_at);
+        Ok(runs)
     }
 
     /// Reads all per-case results for one run.
@@ -203,7 +251,25 @@ impl BenchStore {
     ///
     /// As [`Self::read_runs`].
     pub fn read_results(&self, run_id: &str) -> Result<Vec<BenchResult>, StoreError> {
-        read_jsonl(&self.results_path(run_id))
+        let results = read_jsonl(&self.results_path(run_id))?;
+        if results.is_empty() {
+            return read_jsonl(&self.legacy_results_path(run_id));
+        }
+        Ok(results)
+    }
+}
+
+fn run_date_dir(run_id: &str) -> String {
+    let Some(stamp) = run_id
+        .strip_prefix("bench-")
+        .and_then(|rest| rest.get(..14))
+    else {
+        return "unknown-date".into();
+    };
+    if stamp.len() == 14 && stamp.chars().all(|c| c.is_ascii_digit()) {
+        format!("{}-{}-{}", &stamp[0..4], &stamp[4..6], &stamp[6..8])
+    } else {
+        "unknown-date".into()
     }
 }
 
@@ -231,6 +297,61 @@ fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreError> 
             source: e,
         })?;
     Ok(())
+}
+
+fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {
+    let body = serde_json::to_string_pretty(value)?;
+    std::fs::write(path, body).map_err(|e| StoreError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })
+}
+
+fn read_json_file<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>, StoreError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let body = std::fs::read_to_string(path).map_err(|e| StoreError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    Ok(serde_json::from_str::<T>(&body).ok())
+}
+
+fn discover_run_summaries(bench_dir: &Path) -> Result<Vec<BenchRun>, StoreError> {
+    if !bench_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut runs = Vec::new();
+    let date_dirs = std::fs::read_dir(bench_dir).map_err(|e| StoreError::Io {
+        path: bench_dir.to_path_buf(),
+        source: e,
+    })?;
+    for date_entry in date_dirs.flatten() {
+        let Ok(file_type) = date_entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let date_path = date_entry.path();
+        let run_dirs = std::fs::read_dir(&date_path).map_err(|e| StoreError::Io {
+            path: date_path.clone(),
+            source: e,
+        })?;
+        for run_entry in run_dirs.flatten() {
+            let Ok(file_type) = run_entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            if let Some(run) = read_json_file(&run_entry.path().join("run.json"))? {
+                runs.push(run);
+            }
+        }
+    }
+    Ok(runs)
 }
 
 fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>, StoreError> {
@@ -276,8 +397,11 @@ mod tests {
             status: BenchStatus::Pass,
             score: 1.0,
             latency_ms: 1234,
-            cost_cents: 3,
+            cost_cents: Some(3),
             iterations: 1,
+            prompt_tokens: Some(20),
+            completion_tokens: Some(10),
+            total_tokens: Some(30),
             worker_model: "mock/test".into(),
             prompt_hash: "deadbeef".into(),
             system_prompt_hash: Some("cafe".into()),
@@ -307,9 +431,14 @@ mod tests {
             errored: 0,
             skipped: 0,
             config_hash: "feedface".into(),
-            total_cost_cents: 9,
+            total_cost_cents: Some(9),
+            prompt_tokens: Some(60),
+            completion_tokens: Some(30),
+            total_tokens: Some(90),
         }
     }
+
+    const DATED_RUN_ID: &str = "bench-20260721200204-16b98c28";
 
     // ── id generation ─────────────────────────────────────────
 
@@ -337,9 +466,12 @@ mod tests {
     fn append_result_creates_dir_and_writes_line() {
         let dir = tempfile::tempdir().unwrap();
         let store = BenchStore::new(dir.path().join("bench"));
-        let r = sample_result("run-1", "case-a");
+        let r = sample_result(DATED_RUN_ID, "case-a");
         store.append_result(&r).unwrap();
-        let read = store.read_results("run-1").unwrap();
+        assert!(store
+            .results_path(DATED_RUN_ID)
+            .ends_with("2026-07-21/bench-20260721200204-16b98c28/results.jsonl"));
+        let read = store.read_results(DATED_RUN_ID).unwrap();
         assert_eq!(read.len(), 1);
         assert_eq!(read[0], r);
     }
@@ -348,11 +480,23 @@ mod tests {
     fn append_run_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let store = BenchStore::new(dir.path().join("bench"));
-        let r = sample_run("run-x");
+        let r = sample_run(DATED_RUN_ID);
         store.append_run(&r).unwrap();
+        assert!(store.run_summary_path(DATED_RUN_ID).exists());
         let read = store.read_runs().unwrap();
         assert_eq!(read.len(), 1);
         assert_eq!(read[0], r);
+    }
+
+    #[test]
+    fn read_runs_discovers_dated_run_summary_without_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BenchStore::new(dir.path().join("bench"));
+        let r = sample_run(DATED_RUN_ID);
+        std::fs::create_dir_all(store.run_dir(DATED_RUN_ID)).unwrap();
+        write_json(&store.run_summary_path(DATED_RUN_ID), &r).unwrap();
+        let read = store.read_runs().unwrap();
+        assert_eq!(read, vec![r]);
     }
 
     #[test]
@@ -382,6 +526,17 @@ mod tests {
         let store = BenchStore::new(dir.path().join("bench"));
         assert!(store.read_runs().unwrap().is_empty());
         assert!(store.read_results("nonexistent").unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_results_falls_back_to_legacy_flat_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BenchStore::new(dir.path().join("bench"));
+        std::fs::create_dir_all(dir.path().join("bench")).unwrap();
+        let r = sample_result("legacy-run", "case-a");
+        append_jsonl(&store.legacy_results_path("legacy-run"), &r).unwrap();
+        let read = store.read_results("legacy-run").unwrap();
+        assert_eq!(read, vec![r]);
     }
 
     #[test]

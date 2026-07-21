@@ -15,6 +15,7 @@ pub struct OrbConfig {
     pub max_concurrency: usize,
     pub worker_binary: Option<String>,
     pub models: ModelConfig,
+    pub bench: BenchConfig,
     pub prompts: PromptConfig,
     pub review: ReviewConfig,
     pub second_opinion: SecondOpinionConfig,
@@ -28,12 +29,20 @@ impl Default for OrbConfig {
             max_concurrency: 4,
             worker_binary: None,
             models: ModelConfig::default(),
+            bench: BenchConfig::default(),
             prompts: PromptConfig::default(),
             review: ReviewConfig::default(),
             second_opinion: SecondOpinionConfig::default(),
             notification: NotificationConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct BenchConfig {
+    pub timeout_s: Option<u32>,
+    pub max_iterations: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1168,6 +1177,10 @@ system = "project speccing"
                 .into(),
                 workers: [("edit".into(), "balanced".into())].into(),
                 ..Default::default()
+            },
+            bench: BenchConfig {
+                timeout_s: Some(300),
+                max_iterations: Some(8),
             },
             prompts: PromptConfig {
                 workers: [(
