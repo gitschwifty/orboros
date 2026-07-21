@@ -97,6 +97,15 @@ pub struct OrchestrateOutcome {
     pub elapsed: Duration,
 }
 
+fn merge_usage_currency(current: Option<String>, next: Option<String>) -> Option<String> {
+    match (current, next) {
+        (Some(current), Some(next)) if current == next => Some(current),
+        (Some(current), None) => Some(current),
+        (None, Some(next)) => Some(next),
+        _ => None,
+    }
+}
+
 /// Builds a prompt with context from prior subtask results prepended.
 ///
 /// If `prior_results` is empty, returns the description unchanged.
@@ -223,13 +232,50 @@ pub async fn orchestrate(
             prompt_tokens: 0,
             completion_tokens: 0,
             total_tokens: 0,
+            cost_micros: None,
+            cost_currency: None,
+            cached_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            generation_id: None,
         };
         let mut has_any = false;
         for result in &all_results {
             if let Some(ref u) = result.usage {
-                total.prompt_tokens += u.prompt_tokens;
-                total.completion_tokens += u.completion_tokens;
-                total.total_tokens += u.total_tokens;
+                total.prompt_tokens = total.prompt_tokens.saturating_add(u.prompt_tokens);
+                total.completion_tokens =
+                    total.completion_tokens.saturating_add(u.completion_tokens);
+                total.total_tokens = total.total_tokens.saturating_add(u.total_tokens);
+                if let Some(cost_micros) = u.cost_micros {
+                    total.cost_micros =
+                        Some(total.cost_micros.unwrap_or(0).saturating_add(cost_micros));
+                }
+                total.cost_currency =
+                    merge_usage_currency(total.cost_currency.take(), u.cost_currency.clone());
+                if let Some(cached_tokens) = u.cached_tokens {
+                    total.cached_tokens = Some(
+                        total
+                            .cached_tokens
+                            .unwrap_or(0)
+                            .saturating_add(cached_tokens),
+                    );
+                }
+                if let Some(cache_write_tokens) = u.cache_write_tokens {
+                    total.cache_write_tokens = Some(
+                        total
+                            .cache_write_tokens
+                            .unwrap_or(0)
+                            .saturating_add(cache_write_tokens),
+                    );
+                }
+                if let Some(reasoning_tokens) = u.reasoning_tokens {
+                    total.reasoning_tokens = Some(
+                        total
+                            .reasoning_tokens
+                            .unwrap_or(0)
+                            .saturating_add(reasoning_tokens),
+                    );
+                }
                 has_any = true;
             }
         }
@@ -391,7 +437,7 @@ async fn execute_order_group(
             .await;
         let completed_at = Utc::now();
         if let (Some(budget), Some(usage)) = (budget, &outcome.usage) {
-            budget.record(usage.total_tokens);
+            budget.record(crate::ipc::types::u64_to_u32_saturating(usage.total_tokens));
         }
         let result = SubtaskResult {
             task_id: task.id,
@@ -471,7 +517,7 @@ async fn execute_subtask_owned(
         .await;
     let completed_at = Utc::now();
     if let (Some(budget), Some(usage)) = (&budget, &outcome.usage) {
-        budget.record(usage.total_tokens);
+        budget.record(crate::ipc::types::u64_to_u32_saturating(usage.total_tokens));
     }
     SubtaskResult {
         task_id: task.id,

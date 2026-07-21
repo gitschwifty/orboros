@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 // ── Protocol version ──
 
-pub const PROTOCOL_VERSION: &str = "0.2.0";
+pub const PROTOCOL_VERSION: &str = "0.3.0";
 
 // ── Requests (Orboros → Heddle) ──
 
@@ -42,6 +42,16 @@ pub struct InitConfig {
     pub task_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_attribution: Option<AppAttribution>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppAttribution {
+    pub referer: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub categories: Option<String>,
 }
 
 /// Structured error envelope returned by heddle in protocol 0.2.0+.
@@ -70,7 +80,7 @@ pub enum IpcResponse {
     Event {
         event: WorkerEvent,
         #[serde(default)]
-        event_seq: u32,
+        event_seq: u64,
         #[serde(default)]
         send_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -115,7 +125,9 @@ pub enum IpcResponse {
     StatusOk {
         id: String,
         model: String,
-        messages_count: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_routed_model: Option<String>,
+        messages_count: u64,
         session_id: String,
         active: bool,
     },
@@ -149,9 +161,24 @@ pub enum WorkerEvent {
         result_preview: String,
     },
     Usage {
-        prompt_tokens: u32,
-        completion_tokens: u32,
-        total_tokens: u32,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_micros: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_currency: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cached_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_write_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation_id: Option<String>,
+    },
+    RoutedModel {
+        model: String,
     },
     Error {
         message: String,
@@ -175,12 +202,12 @@ pub enum WorkerEvent {
         plan: String,
     },
     Heartbeat {
-        duration_ms: u32,
+        duration_ms: u64,
     },
     ContextPrune {
-        messages_pruned: u32,
-        tokens_before: u32,
-        tokens_after: u32,
+        messages_pruned: u64,
+        tokens_before: u64,
+        tokens_after: u64,
     },
     ContextCompact {},
     ContextHandoff {},
@@ -196,9 +223,26 @@ pub struct ToolCallRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Usage {
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-    pub total_tokens: u32,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_currency: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<String>,
+}
+
+#[must_use]
+pub fn u64_to_u32_saturating(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]
@@ -241,6 +285,11 @@ mod tests {
                 max_iterations: Some(10),
                 task_id: None,
                 worker_id: None,
+                app_attribution: Some(AppAttribution {
+                    referer: "https://github.com/gitschwifty/orboros".into(),
+                    title: "Orboros".into(),
+                    categories: Some("cli-agent".into()),
+                }),
             },
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -275,7 +324,7 @@ mod tests {
         let resp = IpcResponse::InitOk {
             id: "1".into(),
             session_id: "sess-123".into(),
-            protocol_version: Some("0.2.0".into()),
+            protocol_version: Some("0.3.0".into()),
             error: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -297,6 +346,12 @@ mod tests {
                 prompt_tokens: 42,
                 completion_tokens: 15,
                 total_tokens: 57,
+                cost_micros: Some(123),
+                cost_currency: Some("USD".into()),
+                cached_tokens: Some(4),
+                cache_write_tokens: Some(5),
+                reasoning_tokens: Some(6),
+                generation_id: Some("chatcmpl-test".into()),
             }),
             iterations: 2,
             error: None,
@@ -370,6 +425,48 @@ mod tests {
                 details: Some(serde_json::json!({"error": {"message": "fail"}})),
             },
             event_seq: 0,
+            send_id: "2".into(),
+            session_id: None,
+            task_id: None,
+            worker_id: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, parsed);
+    }
+
+    #[test]
+    fn round_trip_event_usage_with_metadata() {
+        let resp = IpcResponse::Event {
+            event: WorkerEvent::Usage {
+                prompt_tokens: 42,
+                completion_tokens: 15,
+                total_tokens: 57,
+                cost_micros: Some(123),
+                cost_currency: Some("USD".into()),
+                cached_tokens: Some(4),
+                cache_write_tokens: Some(5),
+                reasoning_tokens: Some(6),
+                generation_id: Some("chatcmpl-test".into()),
+            },
+            event_seq: 1,
+            send_id: "2".into(),
+            session_id: None,
+            task_id: None,
+            worker_id: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, parsed);
+    }
+
+    #[test]
+    fn round_trip_event_routed_model() {
+        let resp = IpcResponse::Event {
+            event: WorkerEvent::RoutedModel {
+                model: "anthropic/claude-haiku-4.5".into(),
+            },
+            event_seq: 1,
             send_id: "2".into(),
             session_id: None,
             task_id: None,
@@ -590,7 +687,7 @@ mod tests {
     #[test]
     fn ignores_unknown_fields_in_responses() {
         // Per compatibility.md: clients must ignore unknown fields
-        let json = r#"{"type":"init_ok","id":"1","session_id":"s","protocol_version":"0.2.0","some_future_field":"value"}"#;
+        let json = r#"{"type":"init_ok","id":"1","session_id":"s","protocol_version":"0.3.0","some_future_field":"value"}"#;
         let resp: IpcResponse = serde_json::from_str(json).unwrap();
         assert!(matches!(resp, IpcResponse::InitOk { .. }));
     }

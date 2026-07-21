@@ -71,5 +71,19 @@ clippy:
 test:
     cargo test
 
+# Run env-gated live Heddle IPC tests.
+# Examples:
+# `just test-heddle ../heddle-headless`
+# `just test-heddle ../heddle-headless openrouter/free`
+# `just test-heddle ../heddle-headless anthropic/claude-haiku-4.5 1`
+test-heddle binary="" model="" expect_cost="":
+    @if [ -n "{{binary}}" ]; then export HEDDLE_BINARY="{{binary}}"; fi; \
+    if [ -n "{{model}}" ]; then export HEDDLE_TEST_MODEL="{{model}}"; fi; \
+    if [ -n "{{expect_cost}}" ]; then export HEDDLE_EXPECT_COST="{{expect_cost}}"; fi; \
+    if [ -z "$${HEDDLE_BINARY:-}" ]; then \
+        echo "HEDDLE_BINARY unset; live Heddle tests will skip"; \
+    fi; \
+    cargo test --test worker_lifecycle -- --nocapture
+
 # Full local verification gate.
 ci: fmt-check clippy test

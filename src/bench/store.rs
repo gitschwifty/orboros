@@ -61,11 +61,11 @@ pub struct BenchResult {
     pub cost_cents: Option<u32>,
     pub iterations: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_tokens: Option<u32>,
+    pub prompt_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completion_tokens: Option<u32>,
+    pub completion_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total_tokens: Option<u32>,
+    pub total_tokens: Option<u64>,
     pub worker_model: String,
     /// SHA-256 of the prompt sent to the worker, hex-encoded —
     /// lets `bench compare` detect when the prompt changed between
@@ -139,11 +139,11 @@ pub struct BenchRun {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_cost_cents: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub prompt_tokens: Option<u32>,
+    pub prompt_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub completion_tokens: Option<u32>,
+    pub completion_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total_tokens: Option<u32>,
+    pub total_tokens: Option<u64>,
 }
 
 /// JSONL store at `<bench_dir>/`. Operations are append-only on disk;

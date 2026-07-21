@@ -13,8 +13,8 @@ use chrono::Utc;
 
 use crate::bench::case::{load_all, load_tier, BenchCase, BenchTier, DEFAULT_TIMEOUT_S};
 use crate::bench::runner::{
-    effective_timeout_s, is_fatal_worker_error, nonzero_u32, run_t1, timeout_bench_result,
-    BenchRunConfig, RunOptions,
+    effective_timeout_s, is_fatal_worker_error, run_t1, timeout_bench_result, BenchRunConfig,
+    RunOptions,
 };
 use crate::bench::store::{BenchResult, BenchRun, BenchStatus, BenchStore};
 use crate::worker::process::WorkerConfig;
@@ -560,12 +560,12 @@ fn summarize_run(
     }
 }
 
-fn sum_tokens(results: &[BenchResult], field: impl Fn(&BenchResult) -> Option<u32>) -> Option<u32> {
-    nonzero_u32(
+fn sum_tokens(results: &[BenchResult], field: impl Fn(&BenchResult) -> Option<u64>) -> Option<u64> {
+    crate::bench::runner::nonzero_u64(
         results
             .iter()
             .filter_map(field)
-            .fold(0u32, u32::saturating_add),
+            .fold(0u64, u64::saturating_add),
     )
 }
 

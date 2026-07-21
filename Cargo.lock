@@ -719,7 +719,7 @@ dependencies = [
 [[package]]
 name = "orbs"
 version = "0.1.0"
-source = "git+https://github.com/gitschwifty/orbs?rev=89e9e1a49ab973489f740c60c7c0883fe006f007#89e9e1a49ab973489f740c60c7c0883fe006f007"
+source = "git+https://github.com/gitschwifty/orbs?rev=3336e6539f76b5a113e4da6241ddd1c7b9502b35#3336e6539f76b5a113e4da6241ddd1c7b9502b35"
 dependencies = [
  "chrono",
  "serde",

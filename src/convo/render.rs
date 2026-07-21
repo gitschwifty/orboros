@@ -307,6 +307,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+                ..Default::default()
             },
         })
         .unwrap();
@@ -347,6 +348,7 @@ mod tests {
                 prompt_tokens: 123,
                 completion_tokens: 45,
                 total_tokens: 168,
+                ..Default::default()
             },
             tool_call_count: 2,
             status: crate::convo::TurnStatus::Ok,

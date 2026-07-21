@@ -8,7 +8,7 @@ while IFS= read -r line; do
 
   case "$type" in
     init)
-      echo "{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"mock-conf-sess\",\"protocol_version\":\"0.2.0\"}"
+      echo "{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"mock-conf-sess\",\"protocol_version\":\"0.3.0\"}"
       ;;
     send)
       echo "{\"type\":\"result\",\"id\":\"$id\",\"status\":\"ok\",\"response\":\"answer\",\"tool_calls_made\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2},\"iterations\":1,\"confidence\":0.73}"

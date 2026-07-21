@@ -29,12 +29,24 @@
 
 ### Responses/Events
 - `InitOk`
-- `Event` (`content_delta`, `tool_start`, `tool_end`, `usage`, `error`, `heartbeat`, `context_prune`, `context_compact`, `context_handoff`, `permission_request`, `permission_denied`, `plan_complete`)
+- `Event` (`content_delta`, `tool_start`, `tool_end`, `usage`, `routed_model`, `error`, `heartbeat`, `context_prune`, `context_compact`, `context_handoff`, `permission_request`, `permission_denied`, `plan_complete`)
 - `Result`
 - `StatusOk`
 - `ShutdownOk`
 
 ## Changelog
+
+### 0.3.0
+
+**Summary:** Add routed-model metadata for router aliases such as `openrouter/free`, plus optional app attribution for embedded headless clients.
+
+**From 0.2.0:**
+- `routed_model` WorkerEvent (`model`) may be emitted during a send when the provider reports the concrete model that served the response.
+- `StatusOk` gains optional `last_routed_model`; it is omitted until the provider reports a routed model.
+- `InitConfig` gains optional `app_attribution` (`referer`, `title`, optional `categories`) so headless clients can set provider dashboard attribution. It is ignored unless both `referer` and `title` are present.
+- `usage` events and result summaries gain optional `cost_micros`, `cost_currency`, token detail fields, and `generation_id`.
+
+**Compatibility:** Additive only. Existing 0.x clients with the same MAJOR version remain compatible if they ignore unknown event types and unknown optional fields as required by this policy.
 
 ### 0.2.0
 

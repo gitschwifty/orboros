@@ -46,9 +46,15 @@ pub struct DispatchOutcome {
     pub model_latency_ms: Option<u64>,
     pub tool_latency_ms: Option<u64>,
     pub total_latency_ms: Option<u64>,
-    pub prompt_tokens: Option<u32>,
-    pub completion_tokens: Option<u32>,
-    pub total_tokens: Option<u32>,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub cost_micros: Option<u64>,
+    pub cost_currency: Option<String>,
+    pub cached_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub generation_id: Option<String>,
     pub dispatched_at: chrono::DateTime<Utc>,
     pub completed_at: chrono::DateTime<Utc>,
     pub prompt_category: Option<String>,
@@ -76,6 +82,12 @@ impl DispatchOutcome {
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
+            cost_micros: None,
+            cost_currency: None,
+            cached_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            generation_id: None,
             dispatched_at: now,
             completed_at: now,
             prompt_category: None,
@@ -199,6 +211,8 @@ pub async fn dispatch_orb(
         prompt_tokens = ?outcome.prompt_tokens,
         completion_tokens = ?outcome.completion_tokens,
         total_tokens = ?outcome.total_tokens,
+        cost_micros = ?outcome.cost_micros,
+        cost_currency = ?outcome.cost_currency.as_deref(),
         "dispatch_orb complete",
     );
 
@@ -244,6 +258,12 @@ fn build_outcome(
         prompt_tokens: send.usage.as_ref().map(|u| u.prompt_tokens),
         completion_tokens: send.usage.as_ref().map(|u| u.completion_tokens),
         total_tokens: send.usage.as_ref().map(|u| u.total_tokens),
+        cost_micros: send.usage.as_ref().and_then(|u| u.cost_micros),
+        cost_currency: send.usage.as_ref().and_then(|u| u.cost_currency.clone()),
+        cached_tokens: send.usage.as_ref().and_then(|u| u.cached_tokens),
+        cache_write_tokens: send.usage.as_ref().and_then(|u| u.cache_write_tokens),
+        reasoning_tokens: send.usage.as_ref().and_then(|u| u.reasoning_tokens),
+        generation_id: send.usage.as_ref().and_then(|u| u.generation_id.clone()),
         dispatched_at,
         completed_at,
         prompt_category: None,
@@ -271,6 +291,12 @@ fn build_failure(
         prompt_tokens: None,
         completion_tokens: None,
         total_tokens: None,
+        cost_micros: None,
+        cost_currency: None,
+        cached_tokens: None,
+        cache_write_tokens: None,
+        reasoning_tokens: None,
+        generation_id: None,
         dispatched_at,
         completed_at,
         prompt_category: None,
@@ -329,6 +355,12 @@ pub fn apply_dispatch_outcome(
         prompt_tokens: outcome.prompt_tokens,
         completion_tokens: outcome.completion_tokens,
         total_tokens: outcome.total_tokens,
+        cost_micros: outcome.cost_micros,
+        cost_currency: outcome.cost_currency.clone(),
+        cached_tokens: outcome.cached_tokens,
+        cache_write_tokens: outcome.cache_write_tokens,
+        reasoning_tokens: outcome.reasoning_tokens,
+        generation_id: outcome.generation_id.clone(),
         prompt_category: outcome.prompt_category.clone(),
         system_prompt_hash: outcome.system_prompt_hash.clone(),
         system_prompt_source: outcome.system_prompt_source.clone(),
@@ -468,6 +500,12 @@ mod tests {
             prompt_tokens: Some(100),
             completion_tokens: Some(50),
             total_tokens: Some(150),
+            cost_micros: Some(12_345),
+            cost_currency: Some("USD".into()),
+            cached_tokens: Some(20),
+            cache_write_tokens: Some(5),
+            reasoning_tokens: Some(7),
+            generation_id: Some("gen-123".into()),
             dispatched_at: now,
             completed_at: now,
             prompt_category: Some("worker.execute".into()),
@@ -501,6 +539,12 @@ mod tests {
             Some("anthropic/claude-sonnet-4-6")
         );
         assert_eq!(exec.total_tokens, Some(150));
+        assert_eq!(exec.cost_micros, Some(12_345));
+        assert_eq!(exec.cost_currency.as_deref(), Some("USD"));
+        assert_eq!(exec.cached_tokens, Some(20));
+        assert_eq!(exec.cache_write_tokens, Some(5));
+        assert_eq!(exec.reasoning_tokens, Some(7));
+        assert_eq!(exec.generation_id.as_deref(), Some("gen-123"));
         assert_eq!(exec.prompt_category.as_deref(), Some("worker.execute"));
         assert_eq!(exec.system_prompt_hash.as_deref(), Some("abc123"));
         assert_eq!(exec.system_prompt_source.as_deref(), Some("built_in"));

@@ -55,6 +55,7 @@ mod tests {
                 max_iterations: None,
                 task_id: None,
                 worker_id: None,
+                app_attribution: None,
             },
         };
         let json = serde_json::to_string(&req).unwrap();

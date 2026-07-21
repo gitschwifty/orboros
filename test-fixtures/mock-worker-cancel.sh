@@ -8,7 +8,7 @@ while IFS= read -r line; do
 
   case "$type" in
     init)
-      echo "{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"cancel-sess-001\",\"protocol_version\":\"0.2.0\"}"
+      echo "{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"cancel-sess-001\",\"protocol_version\":\"0.3.0\"}"
       ;;
     send)
       SEND_ID="$id"

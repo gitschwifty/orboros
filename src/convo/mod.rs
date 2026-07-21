@@ -230,6 +230,11 @@ impl ConvoRuntime {
                 prompt_tokens: u.prompt_tokens,
                 completion_tokens: u.completion_tokens,
                 total_tokens: u.total_tokens,
+                cost_micros: u.cost_micros,
+                cost_currency: u.cost_currency.clone(),
+                cached_tokens: u.cached_tokens,
+                cache_write_tokens: u.cache_write_tokens,
+                reasoning_tokens: u.reasoning_tokens,
             })
             .unwrap_or_default();
 
@@ -419,12 +424,23 @@ fn map_worker_event(turn_id: &TurnId, event: &WorkerEvent) -> Vec<SessionEvent> 
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            cost_micros,
+            cost_currency,
+            cached_tokens,
+            cache_write_tokens,
+            reasoning_tokens,
+            generation_id: _,
         } => vec![SessionEvent::Usage {
             turn_id: turn_id.clone(),
             usage: SessionUsage {
                 prompt_tokens: *prompt_tokens,
                 completion_tokens: *completion_tokens,
                 total_tokens: *total_tokens,
+                cost_micros: *cost_micros,
+                cost_currency: cost_currency.clone(),
+                cached_tokens: *cached_tokens,
+                cache_write_tokens: *cache_write_tokens,
+                reasoning_tokens: *reasoning_tokens,
             },
         }],
         WorkerEvent::Error { message, .. } => vec![SessionEvent::Error {
@@ -437,6 +453,7 @@ fn map_worker_event(turn_id: &TurnId, event: &WorkerEvent) -> Vec<SessionEvent> 
         | WorkerEvent::PermissionRequest { .. }
         | WorkerEvent::PermissionDenied { .. }
         | WorkerEvent::PlanComplete { .. }
+        | WorkerEvent::RoutedModel { .. }
         | WorkerEvent::ContextPrune { .. }
         | WorkerEvent::ContextCompact {}
         | WorkerEvent::ContextHandoff {} => Vec::new(),
@@ -467,6 +484,12 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 20,
                 total_tokens: 30,
+                cost_micros: Some(123),
+                cost_currency: Some("USD".into()),
+                cached_tokens: Some(4),
+                cache_write_tokens: Some(5),
+                reasoning_tokens: Some(6),
+                generation_id: Some("gen-1".into()),
             },
         );
         match &mapped[0] {
@@ -474,6 +497,11 @@ mod tests {
                 assert_eq!(usage.prompt_tokens, 10);
                 assert_eq!(usage.completion_tokens, 20);
                 assert_eq!(usage.total_tokens, 30);
+                assert_eq!(usage.cost_micros, Some(123));
+                assert_eq!(usage.cost_currency.as_deref(), Some("USD"));
+                assert_eq!(usage.cached_tokens, Some(4));
+                assert_eq!(usage.cache_write_tokens, Some(5));
+                assert_eq!(usage.reasoning_tokens, Some(6));
             }
             other => panic!("expected Usage, got {other:?}"),
         }

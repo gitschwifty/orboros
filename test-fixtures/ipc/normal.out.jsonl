@@ -1,4 +1,4 @@
-{"type":"init_ok","id":"1","session_id":"sess-123","protocol_version":"0.2.0"}
+{"type":"init_ok","id":"1","session_id":"sess-123","protocol_version":"0.3.0"}
 {"type":"event","event":{"event":"tool_start","name":"glob","args":{"pattern":"*"}},"event_seq":0,"send_id":"2"}
 {"type":"event","event":{"event":"tool_end","name":"glob","result_preview":"placeholder"},"event_seq":1,"send_id":"2"}
 {"type":"event","event":{"event":"content_delta","text":"Here are the files..."},"event_seq":2,"send_id":"2"}

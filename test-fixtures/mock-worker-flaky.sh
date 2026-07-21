@@ -16,7 +16,7 @@ while IFS= read -r line; do
         exit 1
       fi
       # Second attempt: succeed
-      echo "{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"flaky-sess-001\",\"protocol_version\":\"0.2.0\"}"
+      echo "{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"flaky-sess-001\",\"protocol_version\":\"0.3.0\"}"
       ;;
     send)
       echo "{\"type\":\"event\",\"event\":{\"event\":\"content_delta\",\"text\":\"Recovered\"},\"event_seq\":0,\"send_id\":\"$id\"}"

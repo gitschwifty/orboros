@@ -60,3 +60,41 @@ async fn test_full_lifecycle_with_events() {
 
     worker.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_live_heddle_usage_metadata() {
+    let binary = match common::heddle_binary() {
+        Some(b) => b,
+        None => return,
+    };
+
+    let config = common::heddle_config(&binary);
+    let mut worker = Worker::spawn(&config).await.unwrap();
+
+    let outcome = worker
+        .send("msg-usage-metadata", "Reply with exactly: ok")
+        .await
+        .unwrap();
+    assert_eq!(outcome.status, ResultStatus::Ok);
+    let usage = outcome.usage.as_ref().expect("expected usage metadata");
+    assert!(
+        usage.total_tokens >= usage.prompt_tokens.saturating_add(usage.completion_tokens),
+        "total tokens should cover prompt + completion tokens"
+    );
+
+    if let Some(cost_micros) = usage.cost_micros {
+        assert!(usage.cost_currency.is_some(), "cost needs a currency");
+        assert!(
+            usage
+                .cost_currency
+                .as_deref()
+                .is_some_and(|currency| !currency.trim().is_empty()),
+            "cost currency should be non-empty"
+        );
+        assert!(cost_micros > 0, "reported cost should be positive");
+    } else if std::env::var_os("HEDDLE_EXPECT_COST").is_some() {
+        panic!("expected usage.cost_micros because HEDDLE_EXPECT_COST is set");
+    }
+
+    worker.shutdown().await.unwrap();
+}

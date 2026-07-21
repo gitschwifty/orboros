@@ -1,4 +1,4 @@
-{"type":"init_ok","id":"1","session_id":"sess-hb","protocol_version":"0.2.0"}
+{"type":"init_ok","id":"1","session_id":"sess-hb","protocol_version":"0.3.0"}
 {"type":"event","event":{"event":"heartbeat","duration_ms":5000},"event_seq":0,"send_id":"2"}
 {"type":"event","event":{"event":"tool_start","name":"read_file","args":{"path":"src/main.rs"}},"event_seq":1,"send_id":"2"}
 {"type":"event","event":{"event":"tool_end","name":"read_file","result_preview":"fn main() { ... }"},"event_seq":2,"send_id":"2"}

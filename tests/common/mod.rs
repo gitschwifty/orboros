@@ -14,7 +14,7 @@ pub fn heddle_config(binary: &str) -> WorkerConfig {
         args: vec![],
         cwd: None,
         env: vec![],
-        model: "openrouter/auto".into(),
+        model: std::env::var("HEDDLE_TEST_MODEL").unwrap_or_else(|_| "openrouter/free".into()),
         system_prompt: "You are a helpful test assistant. Keep responses very short.".into(),
         tools: vec![],
         max_iterations: Some(1),

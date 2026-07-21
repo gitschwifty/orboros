@@ -103,6 +103,11 @@ pub fn nonzero_u32(value: u32) -> Option<u32> {
 }
 
 #[must_use]
+pub fn nonzero_u64(value: u64) -> Option<u64> {
+    (value > 0).then_some(value)
+}
+
+#[must_use]
 pub fn timeout_bench_result(
     case: &BenchCase,
     run_id: &str,
@@ -191,14 +196,14 @@ pub async fn run_t1_case(
     let mut passes: u32 = 0;
     let mut fails: u32 = 0;
     let mut errors: u32 = 0;
-    let accumulated_cost: Option<u32> = None;
+    let mut accumulated_cost: Option<u32> = None;
     let mut last_confidence: Option<f32> = None;
     let mut total_iters: u32 = 0;
     let mut last_error: Option<String> = None;
     let mut output = String::new();
-    let mut prompt_tokens: u32 = 0;
-    let mut completion_tokens: u32 = 0;
-    let mut total_tokens: u32 = 0;
+    let mut prompt_tokens: u64 = 0;
+    let mut completion_tokens: u64 = 0;
+    let mut total_tokens: u64 = 0;
 
     for attempt in 0..T1_ATTEMPTS {
         // Budget gate before spawning.
@@ -247,6 +252,7 @@ pub async fn run_t1_case(
             &mut prompt_tokens,
             &mut completion_tokens,
             &mut total_tokens,
+            &mut accumulated_cost,
             &outcome,
         );
 
@@ -337,9 +343,9 @@ pub async fn run_t1_case(
         latency_ms: elapsed_ms,
         cost_cents: accumulated_cost,
         iterations: total_iters,
-        prompt_tokens: nonzero_u32(prompt_tokens),
-        completion_tokens: nonzero_u32(completion_tokens),
-        total_tokens: nonzero_u32(total_tokens),
+        prompt_tokens: nonzero_u64(prompt_tokens),
+        completion_tokens: nonzero_u64(completion_tokens),
+        total_tokens: nonzero_u64(total_tokens),
         worker_model: base_worker_config.model.clone(),
         prompt_hash: prompt_hash(&case.prompt),
         system_prompt_hash: Some(prompt_hash(&t1_system_prompt())),
@@ -351,16 +357,28 @@ pub async fn run_t1_case(
 }
 
 fn add_usage(
-    prompt_tokens: &mut u32,
-    completion_tokens: &mut u32,
-    total_tokens: &mut u32,
+    prompt_tokens: &mut u64,
+    completion_tokens: &mut u64,
+    total_tokens: &mut u64,
+    cost_cents: &mut Option<u32>,
     outcome: &SendOutcome,
 ) {
     if let Some(usage) = &outcome.usage {
         *prompt_tokens = prompt_tokens.saturating_add(usage.prompt_tokens);
         *completion_tokens = completion_tokens.saturating_add(usage.completion_tokens);
         *total_tokens = total_tokens.saturating_add(usage.total_tokens);
+        if let Some(cents) = usage.cost_micros.map(cost_micros_to_cents_ceil) {
+            *cost_cents = Some(cost_cents.unwrap_or(0).saturating_add(cents));
+        }
     }
+}
+
+fn cost_micros_to_cents_ceil(cost_micros: u64) -> u32 {
+    if cost_micros == 0 {
+        return 0;
+    }
+    let cents = cost_micros.saturating_add(9_999) / 10_000;
+    crate::ipc::types::u64_to_u32_saturating(cents)
 }
 
 fn send_outcome_error(outcome: &SendOutcome) -> String {
@@ -511,13 +529,13 @@ pub async fn run_t1(
 
 fn sum_result_tokens(
     results: &[BenchResult],
-    field: impl Fn(&BenchResult) -> Option<u32>,
-) -> Option<u32> {
-    nonzero_u32(
+    field: impl Fn(&BenchResult) -> Option<u64>,
+) -> Option<u64> {
+    nonzero_u64(
         results
             .iter()
             .filter_map(field)
-            .fold(0u32, u32::saturating_add),
+            .fold(0u64, u64::saturating_add),
     )
 }
 

@@ -14,7 +14,8 @@ use tracing::{debug, info, instrument};
 use crate::ipc::error::IpcError;
 use crate::ipc::transport::{read_response, write_request};
 use crate::ipc::types::{
-    ErrorEnvelope, InitConfig, IpcRequest, IpcResponse, ResultStatus, WorkerEvent, PROTOCOL_VERSION,
+    AppAttribution, ErrorEnvelope, InitConfig, IpcRequest, IpcResponse, ResultStatus, WorkerEvent,
+    PROTOCOL_VERSION,
 };
 
 /// Configuration for spawning a worker process.
@@ -204,6 +205,11 @@ impl Worker {
                 max_iterations: config.max_iterations,
                 task_id: config.task_id.clone(),
                 worker_id: config.worker_id.clone(),
+                app_attribution: Some(AppAttribution {
+                    referer: "https://github.com/gitschwifty/orboros".into(),
+                    title: "Orboros".into(),
+                    categories: Some("cli-agent".into()),
+                }),
             },
         };
 

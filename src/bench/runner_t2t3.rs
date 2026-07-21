@@ -28,7 +28,7 @@ use orbs::task::TaskStatus;
 use tracing::{debug, warn};
 
 use crate::bench::case::{BenchCase, BenchExpected, BenchRunner, BenchTier};
-use crate::bench::runner::{effective_max_iterations, nonzero_u32, prompt_hash, RunOptions};
+use crate::bench::runner::{effective_max_iterations, nonzero_u64, prompt_hash, RunOptions};
 use crate::bench::store::{BenchResult, BenchStatus};
 use crate::phases::decompose::{self, DecompositionPlan};
 use crate::queue_loop::QueueLoop;
@@ -571,15 +571,15 @@ impl T2DecomposeResultCtx<'_> {
 
 #[derive(Default)]
 struct AggregateUsage {
-    prompt: Option<u32>,
-    completion: Option<u32>,
-    total: Option<u32>,
+    prompt: Option<u64>,
+    completion: Option<u64>,
+    total: Option<u64>,
 }
 
 fn aggregate_orb_usage(orbs: &[Orb]) -> AggregateUsage {
-    let mut prompt_tokens = 0u32;
-    let mut completion_tokens = 0u32;
-    let mut total_tokens = 0u32;
+    let mut prompt_tokens = 0u64;
+    let mut completion_tokens = 0u64;
+    let mut total_tokens = 0u64;
     for execution in orbs.iter().filter_map(|orb| orb.execution.as_ref()) {
         if let Some(tokens) = execution.prompt_tokens {
             prompt_tokens = prompt_tokens.saturating_add(tokens);
@@ -592,9 +592,9 @@ fn aggregate_orb_usage(orbs: &[Orb]) -> AggregateUsage {
         }
     }
     AggregateUsage {
-        prompt: nonzero_u32(prompt_tokens),
-        completion: nonzero_u32(completion_tokens),
-        total: nonzero_u32(total_tokens),
+        prompt: nonzero_u64(prompt_tokens),
+        completion: nonzero_u64(completion_tokens),
+        total: nonzero_u64(total_tokens),
     }
 }
 
@@ -819,7 +819,7 @@ mod tests {
   type=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['type'])" 2>/dev/null)
   id=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['id'])" 2>/dev/null)
   case "$type" in
-    init) echo "{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"s\",\"protocol_version\":\"0.2.0\"}" ;;
+    init) echo "{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"s\",\"protocol_version\":\"0.3.0\"}" ;;
     send) printf 'done\n' > result.txt; echo "{\"type\":\"result\",\"id\":\"$id\",\"status\":\"ok\",\"response\":\"edited\",\"tool_calls_made\":[],\"iterations\":1,\"confidence\":0.86}" ;;
     shutdown) echo "{\"type\":\"shutdown_ok\",\"id\":\"$id\"}"; exit 0 ;;
   esac

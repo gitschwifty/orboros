@@ -380,7 +380,7 @@ mod tests {
     #[test]
     fn classify_protocol_version_mismatch() {
         let err = IpcError::ProtocolVersionMismatch {
-            expected: "0.2.0".into(),
+            expected: crate::ipc::types::PROTOCOL_VERSION.into(),
             actual: "0.1.0".into(),
         };
         let class = FailureClass::from(&err);

@@ -13,7 +13,7 @@ while IFS= read -r line; do
   case "$type" in
     init)
       sleep "$INIT_DELAY"
-      echo "{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"mock-sess-slow\",\"protocol_version\":\"0.2.0\"}"
+      echo "{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"mock-sess-slow\",\"protocol_version\":\"0.3.0\"}"
       ;;
     send)
       sleep "$SEND_DELAY"
