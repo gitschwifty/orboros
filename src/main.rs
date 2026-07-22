@@ -438,6 +438,7 @@ fn prereq_check<'a>(
     orboros::startup_check::validate_worker_prereqs(&orboros::startup_check::PrereqCheck {
         worker_binary: binary,
         model,
+        router: Some("openrouter"),
         require_credentials: true,
     })?;
     Ok(binary)
@@ -777,13 +778,11 @@ fn cmd_bench(
             } else {
                 resolver.resolve(ModelRole::BenchDefault)?
             };
-            let resolved_model = normalize_bench_model_for_heddle(resolved_model);
             let resolved_grader = if model.is_some() {
                 resolved_model.model.clone()
             } else {
                 resolver
                     .resolve(ModelRole::BenchGrader)
-                    .map(normalize_bench_model_for_heddle)
                     .map_or_else(|_| resolved_model.model.clone(), |m| m.model)
             };
             let binary_owned;
@@ -845,16 +844,6 @@ fn cmd_bench(
     }
 }
 
-fn normalize_bench_model_for_heddle(
-    mut resolved: orboros::config::ResolvedModel,
-) -> orboros::config::ResolvedModel {
-    if let Some(model) = resolved.model.strip_prefix("openrouter/") {
-        resolved.model = model.to_string();
-        resolved.router = Some("openrouter".into());
-    }
-    resolved
-}
-
 fn bench_prereq_check<'a>(
     worker_binary: Option<&'a str>,
     model: &str,
@@ -866,7 +855,7 @@ fn bench_prereq_check<'a>(
         return Ok(binary);
     }
     orboros::startup_check::check_binary(binary)?;
-    orboros::startup_check::check_model_string(model)?;
+    orboros::startup_check::check_model_string_for_router(Some("openrouter"), model)?;
     if std::env::var("OPENROUTER_API_KEY").map_or(true, |s| s.trim().is_empty()) {
         anyhow::bail!(
             "missing credentials for bench OpenRouter route: set OPENROUTER_API_KEY \

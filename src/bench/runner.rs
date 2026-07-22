@@ -240,8 +240,12 @@ pub async fn run_t1_case(
             Err(e) => {
                 let err = format!("spawn failed: {e}");
                 append_attempt_output(&mut output, attempt, "spawn_error", &err);
+                let fatal = is_fatal_worker_error_text(&err);
                 last_error = Some(err);
                 errors += 1;
+                if fatal {
+                    break;
+                }
                 continue;
             }
         };
@@ -252,9 +256,13 @@ pub async fn run_t1_case(
             Err(e) => {
                 let err = format!("send failed: {e}");
                 append_attempt_output(&mut output, attempt, "send_error", &err);
+                let fatal = is_fatal_worker_error_text(&err);
                 last_error = Some(err);
                 errors += 1;
                 let _ = worker.shutdown().await;
+                if fatal {
+                    break;
+                }
                 continue;
             }
         };
@@ -508,6 +516,7 @@ pub async fn run_t1(
         started_at,
         finished_at: Utc::now(),
         tier: Some(BenchTier::T1),
+        tiers: vec![BenchTier::T1],
         variant: run_config.variant.clone(),
         model_selector: run_config.model_selector.clone(),
         model_key: run_config.model_key.clone(),
@@ -562,12 +571,18 @@ pub fn is_fatal_worker_error(result: &BenchResult) -> bool {
         .error
         .as_deref()
         .or(result.output.as_deref())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+        .unwrap_or("");
+    is_fatal_worker_error_text(text)
+}
+
+fn is_fatal_worker_error_text(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
     text.contains("not a valid model id")
         || text.contains("missing credentials")
         || text.contains("api key")
         || text.contains("unauthorized")
+        || text.contains("protocol version mismatch")
+        || text.contains("protocol_version_mismatch")
 }
 
 #[cfg(test)]
@@ -718,6 +733,10 @@ mod tests {
     fn fatal_worker_error_detects_provider_level_failures() {
         let mut result = bench_result("case", BenchStatus::Error);
         result.error = Some("openrouter/foo is not a valid model ID".into());
+        assert!(is_fatal_worker_error(&result));
+
+        result.error =
+            Some("spawn failed: protocol version mismatch: expected 0.3.0, got 0.2.0".into());
         assert!(is_fatal_worker_error(&result));
 
         result.error = Some("assertion failed in grader".into());

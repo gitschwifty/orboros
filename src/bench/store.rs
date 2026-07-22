@@ -12,7 +12,7 @@
 //! self-contained dated directory. Reads still fall back to the old
 //! flat `results-<run_id>.jsonl` layout.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -101,6 +101,10 @@ pub struct BenchRun {
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
     pub tier: Option<BenchTier>,
+    /// All tiers included in the run. Older summaries may only have `tier`;
+    /// readers should fall back to `tier` when this is empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tiers: Vec<BenchTier>,
     /// Human-readable run variant label, e.g. `sonnet-baseline` or
     /// `kimi-candidate`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -243,7 +247,7 @@ impl BenchStore {
     ///
     /// Returns I/O errors. A missing file yields `Ok(vec![])`.
     pub fn read_runs(&self) -> Result<Vec<BenchRun>, StoreError> {
-        let mut runs: Vec<BenchRun> = read_jsonl(&self.runs_path())?;
+        let mut runs: Vec<BenchRun> = dedupe_runs_last_wins(read_jsonl(&self.runs_path())?);
         let mut seen: BTreeSet<String> = runs.iter().map(|run| run.run_id.clone()).collect();
         for run in discover_run_summaries(&self.bench_dir)? {
             if seen.insert(run.run_id.clone()) {
@@ -363,6 +367,20 @@ fn discover_run_summaries(bench_dir: &Path) -> Result<Vec<BenchRun>, StoreError>
     Ok(runs)
 }
 
+fn dedupe_runs_last_wins(runs: Vec<BenchRun>) -> Vec<BenchRun> {
+    let mut deduped = Vec::with_capacity(runs.len());
+    let mut positions = HashMap::new();
+    for run in runs {
+        if let Some(index) = positions.get(&run.run_id).copied() {
+            deduped[index] = run;
+        } else {
+            positions.insert(run.run_id.clone(), deduped.len());
+            deduped.push(run);
+        }
+    }
+    deduped
+}
+
 fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>, StoreError> {
     if !path.exists() {
         return Ok(Vec::new());
@@ -427,6 +445,7 @@ mod tests {
             started_at: Utc::now(),
             finished_at: Utc::now(),
             tier: Some(BenchTier::T1),
+            tiers: vec![BenchTier::T1],
             variant: Some("baseline".into()),
             model_selector: Some("fast".into()),
             model_key: Some("fast".into()),
@@ -498,6 +517,27 @@ mod tests {
         let read = store.read_runs().unwrap();
         assert_eq!(read.len(), 1);
         assert_eq!(read[0], r);
+    }
+
+    #[test]
+    fn read_runs_uses_last_summary_for_duplicate_run_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BenchStore::new(dir.path().join("bench"));
+        let first = sample_run(DATED_RUN_ID);
+        let mut updated = first.clone();
+        updated.tier = None;
+        updated.tiers = vec![BenchTier::T1, BenchTier::T2];
+        updated.total = 14;
+        updated.passed = 10;
+        updated.failed = 1;
+        updated.errored = 3;
+
+        store.append_run(&first).unwrap();
+        store.append_run(&updated).unwrap();
+
+        let read = store.read_runs().unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0], updated);
     }
 
     #[test]

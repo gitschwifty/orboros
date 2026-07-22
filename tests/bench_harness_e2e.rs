@@ -64,6 +64,24 @@ done
     path
 }
 
+fn write_protocol_mismatch_worker_script(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    let body = r#"#!/bin/bash
+while IFS= read -r line; do
+  type=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['type'])" 2>/dev/null)
+  id=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['id'])" 2>/dev/null)
+  case "$type" in
+    init) echo "{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"s\",\"protocol_version\":\"0.2.0\"}" ;;
+    send) echo "{\"type\":\"result\",\"id\":\"$id\",\"status\":\"ok\",\"response\":\"hello\",\"tool_calls_made\":[],\"iterations\":1}" ;;
+    shutdown) echo "{\"type\":\"shutdown_ok\",\"id\":\"$id\"}"; exit 0 ;;
+  esac
+done
+"#;
+    fs::write(&path, body).unwrap();
+    make_executable(&path);
+    path
+}
+
 fn worker_config(script: &Path) -> WorkerConfig {
     WorkerConfig {
         command: "bash".into(),
@@ -293,6 +311,51 @@ async fn run_t1_stops_after_fatal_worker_error() {
     assert_eq!(summary.results.len(), 1);
     assert_eq!(summary.results[0].case_id, "c1");
     assert_eq!(summary.results[0].status, BenchStatus::Error);
+    let case_results = store.read_results(&summary.run_id).unwrap();
+    assert_eq!(case_results.len(), 1);
+}
+
+#[tokio::test]
+async fn run_t1_stops_after_protocol_mismatch_without_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_protocol_mismatch_worker_script(dir.path(), "old-protocol.sh");
+    let wc = worker_config(&script);
+    let cases = vec![
+        t1_case(
+            "c1",
+            "say hello",
+            BenchExpected::Exact {
+                text: "hello".into(),
+            },
+        ),
+        t1_case(
+            "c2",
+            "say hello",
+            BenchExpected::Exact {
+                text: "hello".into(),
+            },
+        ),
+    ];
+    let store = BenchStore::new(dir.path().join("bench"));
+    let summary = run_t1(
+        &cases,
+        &wc,
+        &store,
+        &RunOptions::default(),
+        &BenchRunConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(summary.results.len(), 1);
+    let result = &summary.results[0];
+    assert_eq!(result.case_id, "c1");
+    assert_eq!(result.status, BenchStatus::Error);
+    let output = result.output.as_deref().unwrap_or_default();
+    assert!(output.contains("protocol version mismatch"));
+    assert!(output.contains("== attempt 0 spawn_error =="));
+    assert!(!output.contains("== attempt 1 spawn_error =="));
+
     let case_results = store.read_results(&summary.run_id).unwrap();
     assert_eq!(case_results.len(), 1);
 }

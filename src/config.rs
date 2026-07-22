@@ -293,12 +293,13 @@ impl ModelResolver<'_> {
                 .provider
                 .clone()
                 .or_else(|| infer_provider(&option.model));
+            let router = option.router.clone().or(Some("openrouter".to_string()));
             return Ok(ResolvedModel {
                 key: Some(selector.to_string()),
                 model: option.model.clone(),
                 description: option.description.clone(),
                 provider,
-                router: option.router.clone().or(Some("openrouter".to_string())),
+                router,
                 reasoning: option.reasoning.clone(),
                 effort: option.effort.clone(),
                 source,
@@ -306,12 +307,13 @@ impl ModelResolver<'_> {
         }
 
         if selector.contains('/') {
+            let router = Some("openrouter".to_string());
             return Ok(ResolvedModel {
                 key: None,
                 model: selector.to_string(),
                 description: None,
                 provider: infer_provider(selector),
-                router: None,
+                router,
                 reasoning: None,
                 effort: None,
                 source,
@@ -724,7 +726,7 @@ reviewer = "fast"
 bench = "balanced"
 
 [models.options.balanced]
-model = "openrouter/anthropic/claude-sonnet-4"
+model = "anthropic/claude-sonnet-4"
 description = "Default coding model"
 provider = "anthropic"
 router = "openrouter"
@@ -732,11 +734,11 @@ reasoning = "medium"
 effort = "medium"
 
 [models.options.fast]
-model = "openrouter/openai/gpt-4.1-mini"
+model = "openai/gpt-4.1-mini"
 description = "Cheap fast model"
 
 [models.options.planner]
-model = "openrouter/openai/gpt-5"
+model = "openai/gpt-5"
 description = "Planning model"
 reasoning = "high"
 
@@ -773,11 +775,11 @@ default_model = "openrouter/free"
 worker = "balanced"
 
 [models.options.balanced]
-model = "openrouter/anthropic/claude-sonnet-4"
+model = "anthropic/claude-sonnet-4"
 description = "Balanced default"
 
 [models.options.fast]
-model = "openrouter/openai/gpt-4.1-mini"
+model = "openai/gpt-4.1-mini"
 description = "Fast cheap model"
 reasoning = "low"
 effort = "low"
@@ -793,7 +795,8 @@ research = "fast"
             .resolve(ModelRole::Worker("research"))
             .unwrap();
         assert_eq!(resolved.key.as_deref(), Some("fast"));
-        assert_eq!(resolved.model, "openrouter/openai/gpt-4.1-mini");
+        assert_eq!(resolved.model, "openai/gpt-4.1-mini");
+        assert_eq!(resolved.provider.as_deref(), Some("openai"));
         assert_eq!(resolved.description.as_deref(), Some("Fast cheap model"));
         assert_eq!(resolved.router.as_deref(), Some("openrouter"));
         assert_eq!(resolved.reasoning.as_deref(), Some("low"));
@@ -815,7 +818,93 @@ research = "fast"
         assert_eq!(resolved.key, None);
         assert_eq!(resolved.model, "openrouter/free");
         assert_eq!(resolved.provider.as_deref(), Some("openrouter"));
+        assert_eq!(resolved.router.as_deref(), Some("openrouter"));
         assert_eq!(resolved.source, "default_model");
+    }
+
+    #[test]
+    fn model_resolver_preserves_raw_provider_model_with_default_openrouter_router() {
+        let cfg = OrbConfig::default();
+        let resolved = cfg
+            .model_resolver()
+            .resolve_selector("nvidia/nemotron-3-ultra-550b-a55b:free", "test".into())
+            .unwrap();
+        assert_eq!(resolved.model, "nvidia/nemotron-3-ultra-550b-a55b:free");
+        assert_eq!(resolved.provider.as_deref(), Some("nvidia"));
+        assert_eq!(resolved.router.as_deref(), Some("openrouter"));
+    }
+
+    #[test]
+    fn model_resolver_preserves_catalog_option_with_default_openrouter_router() {
+        let cfg = OrbConfig {
+            models: ModelConfig {
+                options: [(
+                    "fast".into(),
+                    ModelOption {
+                        model: "openai/gpt-4.1-mini".into(),
+                        ..Default::default()
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let resolved = cfg
+            .model_resolver()
+            .resolve_selector("fast", "test".into())
+            .unwrap();
+        assert_eq!(resolved.model, "openai/gpt-4.1-mini");
+        assert_eq!(resolved.provider.as_deref(), Some("openai"));
+        assert_eq!(resolved.router.as_deref(), Some("openrouter"));
+    }
+
+    #[test]
+    fn model_resolver_preserves_catalog_option_with_direct_router() {
+        let cfg = OrbConfig {
+            models: ModelConfig {
+                options: [(
+                    "direct".into(),
+                    ModelOption {
+                        model: "anthropic/claude-sonnet-4-5".into(),
+                        router: Some("anthropic".into()),
+                        ..Default::default()
+                    },
+                )]
+                .into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let resolved = cfg
+            .model_resolver()
+            .resolve_selector("direct", "test".into())
+            .unwrap();
+        assert_eq!(resolved.model, "anthropic/claude-sonnet-4-5");
+        assert_eq!(resolved.provider.as_deref(), Some("anthropic"));
+        assert_eq!(resolved.router.as_deref(), Some("anthropic"));
+    }
+
+    #[test]
+    fn model_resolver_preserves_raw_openrouter_router_aliases() {
+        let cfg = OrbConfig::default();
+        for selector in [
+            "openrouter/free",
+            "openrouter/auto",
+            "openrouter/auto-beta",
+            "openrouter/fusion",
+            "openrouter/pareto-code",
+        ] {
+            let resolved = cfg
+                .model_resolver()
+                .resolve_selector(selector, "test".into())
+                .unwrap();
+            assert_eq!(resolved.model, selector);
+            assert_eq!(resolved.provider.as_deref(), Some("openrouter"));
+            assert_eq!(resolved.router.as_deref(), Some("openrouter"));
+        }
     }
 
     #[test]
@@ -834,7 +923,7 @@ research = "fast"
                 options: [(
                     "reviewer".into(),
                     ModelOption {
-                        model: "openrouter/anthropic/claude-haiku".into(),
+                        model: "anthropic/claude-haiku".into(),
                         ..Default::default()
                     },
                 )]
@@ -846,6 +935,7 @@ research = "fast"
 
         let resolved = cfg.model_resolver().resolve(ModelRole::Reviewer).unwrap();
         assert_eq!(resolved.model, "openai/gpt-4.1-mini");
+        assert_eq!(resolved.router.as_deref(), Some("openrouter"));
         assert_eq!(resolved.source, "second_opinion.reviewer_model");
     }
 
@@ -899,10 +989,10 @@ edit = "missing"
 worker = "balanced"
 
 [models.options.balanced]
-model = "openrouter/anthropic/claude-sonnet-4"
+model = "anthropic/claude-sonnet-4"
 
 [models.options.fast]
-model = "openrouter/openai/gpt-4.1-mini"
+model = "openai/gpt-4.1-mini"
 
 [models.workers]
 research = "fast"

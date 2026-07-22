@@ -2,7 +2,7 @@
 //!
 //! Called at the top of every CLI command that will eventually invoke a
 //! heddle worker. Surfaces missing binaries, malformed model strings, and
-//! absent provider credentials with clear errors before any subprocess is
+//! absent router/provider credentials with clear errors before any subprocess is
 //! spawned or any LLM call is attempted.
 
 use std::path::{Path, PathBuf};
@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 pub struct PrereqCheck<'a> {
     pub worker_binary: &'a str,
     pub model: &'a str,
+    /// Router to use for credential checks. When omitted, credentials are
+    /// inferred from the model provider prefix.
+    pub router: Option<&'a str>,
     /// When false, skip credential checks. Useful for local models
     /// (ollama, llama.cpp) or in tests.
     pub require_credentials: bool,
@@ -35,9 +38,9 @@ enum ProviderCheck {
 /// are unset.
 pub fn validate_worker_prereqs(check: &PrereqCheck<'_>) -> anyhow::Result<()> {
     check_binary(check.worker_binary)?;
-    check_model_string(check.model)?;
+    check_model_string_for_router(check.router, check.model)?;
     if check.require_credentials {
-        check_credentials_for_model(check.model)?;
+        check_credentials_for_router_or_model(check.router, check.model)?;
     }
     Ok(())
 }
@@ -74,16 +77,39 @@ pub fn check_binary(raw_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Validates that `model` looks like `provider/model-id` — a single `/`
-/// with non-empty halves. Emits a `tracing::warn!` when the provider
-/// prefix is not in the known list; provider lists drift so we don't
-/// hard-fail on unknown ones.
+/// Validates that `model` looks like `provider/model-id`, allowing additional
+/// slashes inside the model id for routed model strings. Emits a
+/// `tracing::warn!` when the provider prefix is not in the known list; provider
+/// lists drift so we don't hard-fail on unknown ones.
 ///
 /// # Errors
 ///
 /// Returns an error only on shape failures (empty, no slash, slash at
 /// either end).
 pub fn check_model_string(model: &str) -> anyhow::Result<()> {
+    let provider = validate_model_string_shape(model)?;
+    warn_if_unknown_route(provider, "provider");
+    Ok(())
+}
+
+/// Validates a model string using explicit router metadata when available.
+/// The model string itself is still passed through unchanged; the router only
+/// determines whether the provider-prefix warning applies.
+///
+/// # Errors
+///
+/// Returns an error only on model string shape failures.
+pub fn check_model_string_for_router(router: Option<&str>, model: &str) -> anyhow::Result<()> {
+    let provider = validate_model_string_shape(model)?;
+    if let Some(router) = router {
+        warn_if_unknown_route(router, "router");
+    } else {
+        warn_if_unknown_route(provider, "provider");
+    }
+    Ok(())
+}
+
+fn validate_model_string_shape(model: &str) -> anyhow::Result<&str> {
     if model.is_empty() {
         anyhow::bail!("model string is empty");
     }
@@ -96,13 +122,17 @@ pub fn check_model_string(model: &str) -> anyhow::Result<()> {
     if provider.contains('/') || model_id.contains(' ') {
         anyhow::bail!("model string has suspicious characters (got: {model})");
     }
-    if matches!(classify_provider(provider), ProviderCheck::Unknown) {
+    Ok(provider)
+}
+
+fn warn_if_unknown_route(route: &str, route_kind: &'static str) {
+    if matches!(classify_provider(route), ProviderCheck::Unknown) {
         tracing::warn!(
-            provider,
-            "unknown model provider; credential check will be skipped"
+            route,
+            route_kind,
+            "unknown model route; credential check will be skipped"
         );
     }
-    Ok(())
 }
 
 /// Checks that the env var expected by the model's provider is set
@@ -118,6 +148,25 @@ pub fn check_model_string(model: &str) -> anyhow::Result<()> {
 /// path — this skip is not a license to swallow downstream failures.
 pub fn check_credentials_for_model(model: &str) -> anyhow::Result<()> {
     let provider = model.split('/').next().unwrap_or_default();
+    check_credentials_for_provider(provider)
+}
+
+/// Checks credentials using explicit router metadata when available, falling
+/// back to the model provider prefix for legacy call sites.
+///
+/// # Errors
+///
+/// Returns an error if the selected router/provider is known and its required
+/// credential env var is unset.
+pub fn check_credentials_for_router_or_model(
+    router: Option<&str>,
+    model: &str,
+) -> anyhow::Result<()> {
+    let route = router.unwrap_or_else(|| model.split('/').next().unwrap_or_default());
+    check_credentials_for_provider(route)
+}
+
+fn check_credentials_for_provider(provider: &str) -> anyhow::Result<()> {
     match classify_provider(provider) {
         ProviderCheck::Known { env_var } => {
             if std::env::var(env_var).map_or(true, |s| s.trim().is_empty()) {
@@ -272,6 +321,11 @@ mod tests {
     fn check_model_string_happy_paths() {
         for ok in [
             "openrouter/free",
+            "openrouter/auto",
+            "openrouter/auto-beta",
+            "openrouter/fusion",
+            "openrouter/pareto-code",
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
             "anthropic/claude-sonnet-4-5",
             "ollama/llama3:8b",
         ] {
@@ -315,6 +369,12 @@ mod tests {
         check_model_string("mystery/super-model-v3").unwrap();
     }
 
+    #[test]
+    fn check_model_string_for_openrouter_router_accepts_plain_openrouter_model_id() {
+        check_model_string_for_router(Some("openrouter"), "nvidia/nemotron-3-ultra-550b-a55b:free")
+            .unwrap();
+    }
+
     // ── check_credentials_for_model ───────────────────────────────
 
     #[test]
@@ -329,7 +389,16 @@ mod tests {
     #[test]
     fn credentials_openrouter_present_ok() {
         with_env(&[("OPENROUTER_API_KEY", Some("sk-test"))], || {
-            check_credentials_for_model("openrouter/free").unwrap();
+            for model in [
+                "openrouter/free",
+                "openrouter/auto",
+                "openrouter/auto-beta",
+                "openrouter/fusion",
+                "openrouter/pareto-code",
+                "openrouter/anthropic/claude-sonnet-4-5",
+            ] {
+                check_credentials_for_model(model).unwrap();
+            }
         });
     }
 
@@ -337,6 +406,36 @@ mod tests {
     fn credentials_openrouter_empty_string_treated_as_missing() {
         with_env(&[("OPENROUTER_API_KEY", Some("   "))], || {
             assert!(check_credentials_for_model("openrouter/free").is_err());
+        });
+    }
+
+    #[test]
+    fn credentials_explicit_openrouter_router_uses_openrouter_key() {
+        with_env(
+            &[
+                ("OPENROUTER_API_KEY", Some("sk-test")),
+                ("NVIDIA_API_KEY", None),
+            ],
+            || {
+                check_credentials_for_router_or_model(
+                    Some("openrouter"),
+                    "nvidia/nemotron-3-ultra-550b-a55b:free",
+                )
+                .unwrap();
+            },
+        );
+    }
+
+    #[test]
+    fn credentials_explicit_openrouter_router_missing_errors() {
+        with_env(&[("OPENROUTER_API_KEY", None)], || {
+            let err = check_credentials_for_router_or_model(
+                Some("openrouter"),
+                "nvidia/nemotron-3-ultra-550b-a55b:free",
+            )
+            .unwrap_err();
+            let msg = format!("{err}");
+            assert!(msg.contains("OPENROUTER_API_KEY"), "got: {msg}");
         });
     }
 
@@ -388,10 +487,38 @@ mod tests {
             validate_worker_prereqs(&PrereqCheck {
                 worker_binary: bin.to_str().unwrap(),
                 model: "openrouter/free",
+                router: Some("openrouter"),
                 require_credentials: true,
             })
             .unwrap();
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_worker_prereqs_uses_router_credentials_for_plain_model_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("heddle-fake");
+        fs::write(&bin, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&bin, perms).unwrap();
+
+        with_env(
+            &[
+                ("OPENROUTER_API_KEY", Some("sk-test")),
+                ("NVIDIA_API_KEY", None),
+            ],
+            || {
+                validate_worker_prereqs(&PrereqCheck {
+                    worker_binary: bin.to_str().unwrap(),
+                    model: "nvidia/nemotron-3-ultra-550b-a55b:free",
+                    router: Some("openrouter"),
+                    require_credentials: true,
+                })
+                .unwrap();
+            },
+        );
     }
 
     #[cfg(unix)]
@@ -409,6 +536,7 @@ mod tests {
             validate_worker_prereqs(&PrereqCheck {
                 worker_binary: bin.to_str().unwrap(),
                 model: "openrouter/free",
+                router: Some("openrouter"),
                 require_credentials: false,
             })
             .unwrap();
@@ -421,6 +549,7 @@ mod tests {
         let err = validate_worker_prereqs(&PrereqCheck {
             worker_binary: "/no/such/binary",
             model: "garbage",
+            router: Some("openrouter"),
             require_credentials: true,
         })
         .unwrap_err();

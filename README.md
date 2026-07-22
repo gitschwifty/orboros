@@ -160,7 +160,7 @@ reviewer = "fast"
 bench = "balanced"
 
 [models.options.balanced]
-model = "openrouter/anthropic/claude-sonnet-5"
+model = "anthropic/claude-sonnet-5"
 description = "Default strong coding and planning model."
 provider = "anthropic"
 router = "openrouter"
@@ -168,7 +168,7 @@ reasoning = "medium"
 effort = "medium"
 
 [models.options.fast]
-model = "openrouter/anthropic/claude-haiku-4.5"
+model = "anthropic/claude-haiku-4.5"
 description = "Cheap fast model for review, grading, and simple tasks."
 provider = "anthropic"
 router = "openrouter"
@@ -176,7 +176,7 @@ reasoning = "low"
 effort = "low"
 
 [models.options.planner]
-model = "openrouter/openai/gpt-5.6-terra"
+model = "openai/gpt-5.6-terra"
 description = "Higher-effort OpenAI planning and decomposition model."
 provider = "openai"
 router = "openrouter"
@@ -184,7 +184,7 @@ reasoning = "high"
 effort = "high"
 
 [models.options.kimi]
-model = "openrouter/moonshotai/kimi-k3"
+model = "moonshotai/kimi-k3"
 description = "Moonshot Kimi K3 candidate for coding and agentic bench runs."
 provider = "moonshotai"
 router = "openrouter"
@@ -192,7 +192,7 @@ reasoning = "max"
 effort = "max"
 
 [models.options.qwen]
-model = "openrouter/qwen/qwen3.6-plus"
+model = "qwen/qwen3.6-plus"
 description = "Qwen 3.6 candidate for cost/performance bench runs."
 provider = "qwen"
 router = "openrouter"
@@ -248,8 +248,11 @@ Projects are registered in `~/.orboros/projects.toml` automatically on `orboros 
 
 Model catalog entries are optional; configs with only `default_model` still work.
 Role mappings may reference a named catalog option or a raw `provider/model`
-string. OpenRouter-routed catalog options can use `router = "openrouter"` while
-keeping provider metadata for the underlying model family.
+string. Model strings are sent to Heddle exactly as configured; no
+`openrouter/` prefix is added or removed. Selectors default to
+`router = "openrouter"` for credential/routing metadata while OpenRouter is the
+primary inference path, and catalog options can opt out by setting a different
+`router`.
 
 Prompt overrides fall back to role-specific built-in prompts when omitted.
 Worker keys include subtask roles like `research`, `edit`, `review`, `test`,

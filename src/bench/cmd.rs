@@ -111,12 +111,15 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
     let mut summary_run_id = None;
 
     let had_t1 = !t1.is_empty();
+    let had_other = !other.is_empty();
     if had_t1 {
         let summary = run_t1(&t1, req.worker_config, req.store, &opts, req.run_config).await?;
         summary_run_id = Some(summary.run_id);
         all_results.extend(summary.results);
-        println!("\n== summary ==");
-        print_run_summary(&summary.summary);
+        if !had_other {
+            println!("\n== summary ==");
+            print_run_summary(&summary.summary);
+        }
         if all_results.iter().any(is_fatal_worker_error) {
             eprintln!("stopping benchmark run after fatal worker/provider error");
             print_result_table(&all_results);
@@ -222,16 +225,16 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
         }
     }
 
-    if !had_t1 {
-        if let Some(ref id) = summary_run_id {
-            let run = summarize_run(
-                id,
-                common_tier(&all_results),
-                &all_results,
-                req.run_config,
-                req.worker_config,
-            );
-            req.store.append_run(&run)?;
+    if let Some(ref id) = summary_run_id {
+        let run = summarize_run(
+            id,
+            common_tier(&all_results),
+            &all_results,
+            req.run_config,
+            req.worker_config,
+        );
+        req.store.append_run(&run)?;
+        if !had_t1 || had_other {
             println!("\n== summary ==");
             print_run_summary(&run);
         }
@@ -535,6 +538,7 @@ fn summarize_run(
         started_at: Utc::now(),
         finished_at: Utc::now(),
         tier,
+        tiers: tiers_in_results(results),
         variant: run_config.variant.clone(),
         model_selector: run_config.model_selector.clone(),
         model_key: run_config.model_key.clone(),
@@ -590,14 +594,23 @@ fn common_tier(results: &[BenchResult]) -> Option<BenchTier> {
     results.iter().all(|r| r.tier == first).then_some(first)
 }
 
+fn tiers_in_results(results: &[BenchResult]) -> Vec<BenchTier> {
+    let mut tiers = Vec::new();
+    for result in results {
+        if !tiers.contains(&result.tier) {
+            tiers.push(result.tier);
+        }
+    }
+    tiers
+}
+
 fn print_run_summary(r: &BenchRun) {
     println!(
-        "run={id}  started={when}  tier={tier}  variant={variant}",
+        "run={id}  started={when}  tier={tier}  status={status}  variant={variant}",
         id = r.run_id,
         when = r.started_at.to_rfc3339(),
-        tier = r
-            .tier
-            .map_or_else(|| "mixed".to_string(), |t| t.to_string()),
+        tier = run_tier_label(r),
+        status = run_status_label(r),
         variant = r.variant.as_deref().unwrap_or("-"),
     );
     println!(
@@ -638,7 +651,34 @@ fn print_run_summary(r: &BenchRun) {
             orboros_commit = short_commit(r.orboros_commit.as_deref()),
             bench_commit = short_commit(r.bench_commit.as_deref()),
             config = r.config_hash,
-        );
+    );
+    }
+}
+
+fn run_tier_label(r: &BenchRun) -> String {
+    if !r.tiers.is_empty() {
+        return r
+            .tiers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+    }
+    r.tier
+        .map_or_else(|| "mixed".to_string(), |tier| tier.to_string())
+}
+
+fn run_status_label(r: &BenchRun) -> &'static str {
+    if r.total == 0 || r.skipped == r.total {
+        "skipped"
+    } else if r.errored > 0 {
+        "error"
+    } else if r.failed > 0 {
+        "fail"
+    } else if r.passed == r.total {
+        "pass"
+    } else {
+        "mixed"
     }
 }
 
@@ -704,6 +744,36 @@ mod tests {
         }
     }
 
+    fn sample_run(run_id: &str) -> BenchRun {
+        BenchRun {
+            run_id: run_id.into(),
+            started_at: Utc::now(),
+            finished_at: Utc::now(),
+            tier: Some(BenchTier::T1),
+            tiers: vec![BenchTier::T1],
+            variant: None,
+            model_selector: None,
+            model_key: None,
+            worker_model: Some("mock/test".into()),
+            grader_model: None,
+            prompt_variant: None,
+            cases_root: None,
+            bench_config_path: None,
+            orboros_commit: None,
+            bench_commit: None,
+            total: 3,
+            passed: 2,
+            failed: 1,
+            errored: 0,
+            skipped: 0,
+            config_hash: "h".into(),
+            total_cost_cents: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+        }
+    }
+
     fn write_case(dir: &Path, tier: BenchTier, id: &str) {
         let tdir = dir.join(tier.as_str());
         std::fs::create_dir_all(&tdir).unwrap();
@@ -764,6 +834,7 @@ text = "x"
                 started_at: Utc::now(),
                 finished_at: Utc::now(),
                 tier: Some(BenchTier::T1),
+                tiers: vec![BenchTier::T1],
                 variant: None,
                 model_selector: None,
                 model_key: None,
@@ -836,6 +907,45 @@ text = "x"
         let dir = tempfile::tempdir().unwrap();
         let store = BenchStore::new(dir.path().join("bench"));
         cmd_bench_list_runs(&store).unwrap();
+    }
+
+    #[test]
+    fn run_status_label_marks_all_error_runs_as_error() {
+        let mut run = sample_run("run-error");
+        run.total = 12;
+        run.passed = 0;
+        run.failed = 0;
+        run.errored = 12;
+        run.skipped = 0;
+
+        assert_eq!(run_status_label(&run), "error");
+    }
+
+    #[test]
+    fn run_status_label_marks_pass_fail_and_partial_error() {
+        let mut run = sample_run("run-pass");
+        run.total = 3;
+        run.passed = 3;
+        run.failed = 0;
+        run.errored = 0;
+        run.skipped = 0;
+        assert_eq!(run_status_label(&run), "pass");
+
+        run.passed = 2;
+        run.failed = 1;
+        assert_eq!(run_status_label(&run), "fail");
+
+        run.errored = 1;
+        assert_eq!(run_status_label(&run), "error");
+    }
+
+    #[test]
+    fn run_tier_label_lists_multiple_tiers() {
+        let mut run = sample_run("run-mixed");
+        run.tier = None;
+        run.tiers = vec![BenchTier::T1, BenchTier::T2];
+
+        assert_eq!(run_tier_label(&run), "t1,t2");
     }
 
     // ── corpus integration with cmd_bench_list ────────────────
