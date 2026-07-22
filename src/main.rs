@@ -170,6 +170,9 @@ enum Commands {
         /// Root containing cases/, fixtures/, prompts/, and results/.
         #[arg(long, env = "ORBOROS_BENCH_ROOT", default_value = "bench")]
         bench_root: PathBuf,
+        /// Benchmark config file. Defaults to `<bench-root>/config.toml` when present.
+        #[arg(long, env = "ORBOROS_BENCH_CONFIG")]
+        bench_config: Option<PathBuf>,
         /// Directory for benchmark run/result JSONL. Defaults to `<bench-root>/results`.
         #[arg(long, env = "ORBOROS_BENCH_RESULTS_DIR")]
         bench_results_dir: Option<PathBuf>,
@@ -710,10 +713,12 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::Bench {
             bench_root,
+            bench_config,
             bench_results_dir,
             action,
         } => cmd_bench(
             &bench_root,
+            bench_config.as_deref(),
             bench_results_dir.as_deref(),
             action,
             cli.worker_binary.as_deref(),
@@ -724,6 +729,7 @@ fn main() -> anyhow::Result<()> {
 
 fn cmd_bench(
     bench_root: &std::path::Path,
+    bench_config_path: Option<&std::path::Path>,
     bench_results_dir: Option<&std::path::Path>,
     action: BenchAction,
     worker_binary: Option<&str>,
@@ -756,7 +762,15 @@ fn cmd_bench(
                 ),
             };
             let project_dir = std::env::current_dir().ok();
-            let cfg = config::load_config(project_dir.as_deref())?;
+            let (cfg, resolved_bench_config) = config::load_config_with_bench(
+                project_dir.as_deref(),
+                bench_root,
+                bench_config_path,
+            )?;
+            let orboros_commit = project_dir
+                .as_deref()
+                .and_then(orboros::bench::git_head_commit);
+            let bench_commit = orboros::bench::git_head_commit(bench_root);
             let resolver = cfg.model_resolver();
             let resolved_model = if let Some(selector) = model.as_deref() {
                 resolver.resolve_selector(selector, "bench --model".to_string())?
@@ -795,6 +809,13 @@ fn cmd_bench(
                 grader_model: Some(resolved_grader),
                 prompt_variant: None,
                 cases_root: Some(cases_root.display().to_string()),
+                bench_config_path: resolved_bench_config
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                orboros_commit,
+                bench_commit,
+                timeout_s: cfg.bench.timeout_s,
+                max_iterations: cfg.bench.max_iterations,
             };
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(bench_cmd::cmd_bench_run(bench_cmd::BenchRunRequest {

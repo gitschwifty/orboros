@@ -148,13 +148,18 @@ pub struct BenchRunConfig {
     pub grader_model: Option<String>,
     pub prompt_variant: Option<String>,
     pub cases_root: Option<String>,
+    pub bench_config_path: Option<String>,
+    pub orboros_commit: Option<String>,
+    pub bench_commit: Option<String>,
+    pub timeout_s: Option<u32>,
+    pub max_iterations: Option<u32>,
 }
 
 impl BenchRunConfig {
     #[must_use]
     pub fn config_hash_input(&self, base_worker_config: &WorkerConfig) -> String {
         format!(
-            "variant={:?}\nmodel_selector={:?}\nmodel_key={:?}\nworker_model={:?}\ngrader_model={:?}\nprompt_variant={:?}\ncases_root={:?}\nsystem_prompt={}",
+            "variant={:?}\nmodel_selector={:?}\nmodel_key={:?}\nworker_model={:?}\ngrader_model={:?}\nprompt_variant={:?}\ncases_root={:?}\nbench_config_path={:?}\norboros_commit={:?}\nbench_commit={:?}\ntimeout_s={:?}\nmax_iterations={:?}\nworker_command={}\nsystem_prompt={}",
             self.variant,
             self.model_selector,
             self.model_key,
@@ -162,6 +167,12 @@ impl BenchRunConfig {
             self.grader_model,
             self.prompt_variant,
             self.cases_root,
+            self.bench_config_path,
+            self.orboros_commit,
+            self.bench_commit,
+            self.timeout_s,
+            self.max_iterations,
+            base_worker_config.command,
             base_worker_config.system_prompt,
         )
     }
@@ -507,6 +518,9 @@ pub async fn run_t1(
         grader_model: run_config.grader_model.clone(),
         prompt_variant: run_config.prompt_variant.clone(),
         cases_root: run_config.cases_root.clone(),
+        bench_config_path: run_config.bench_config_path.clone(),
+        orboros_commit: run_config.orboros_commit.clone(),
+        bench_commit: run_config.bench_commit.clone(),
         total,
         passed,
         failed,

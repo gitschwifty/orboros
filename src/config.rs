@@ -479,10 +479,51 @@ pub fn load_config(project_dir: Option<&Path>) -> anyhow::Result<OrbConfig> {
     load_config_with_home(dirs::home_dir().as_deref(), project_dir)
 }
 
+/// Load normal config, then overlay benchmark config after project config.
+///
+/// If `bench_config_path` is provided it must exist. Otherwise
+/// `<bench_root>/config.toml` is loaded when present and ignored when absent.
+///
+/// # Errors
+/// Returns an error if any config file exists but cannot be read or parsed.
+pub fn load_config_with_bench(
+    project_dir: Option<&Path>,
+    bench_root: &Path,
+    bench_config_path: Option<&Path>,
+) -> anyhow::Result<(OrbConfig, Option<PathBuf>)> {
+    let resolved_bench_config = match bench_config_path {
+        Some(path) => {
+            if !path.exists() {
+                anyhow::bail!("bench config not found: {}", path.display());
+            }
+            Some(path.to_path_buf())
+        }
+        None => {
+            let default_path = bench_root.join("config.toml");
+            default_path.exists().then_some(default_path)
+        }
+    };
+
+    let cfg = load_config_with_home_and_bench(
+        dirs::home_dir().as_deref(),
+        project_dir,
+        resolved_bench_config.as_deref(),
+    )?;
+    Ok((cfg, resolved_bench_config))
+}
+
 /// Testable version that accepts a custom home directory.
 pub(crate) fn load_config_with_home(
     home: Option<&Path>,
     project_dir: Option<&Path>,
+) -> anyhow::Result<OrbConfig> {
+    load_config_with_home_and_bench(home, project_dir, None)
+}
+
+pub(crate) fn load_config_with_home_and_bench(
+    home: Option<&Path>,
+    project_dir: Option<&Path>,
+    bench_config_path: Option<&Path>,
 ) -> anyhow::Result<OrbConfig> {
     let mut base_table = toml::value::Table::new();
 
@@ -504,6 +545,13 @@ pub(crate) fn load_config_with_home(
             let table: toml::value::Table = toml::from_str(&content)?;
             merge_toml_tables(&mut base_table, &table);
         }
+    }
+
+    // 3. Benchmark corpus config
+    if let Some(path) = bench_config_path {
+        let content = std::fs::read_to_string(path)?;
+        let table: toml::value::Table = toml::from_str(&content)?;
+        merge_toml_tables(&mut base_table, &table);
     }
 
     let config: OrbConfig = toml::Value::Table(base_table).try_into()?;
@@ -1053,6 +1101,75 @@ default_model = "project-model"
         let cfg = load_config_with_home(Some(home.path()), Some(project.path())).unwrap();
         assert_eq!(cfg.default_model, "project-model");
         assert_eq!(cfg.max_concurrency, 2);
+    }
+
+    #[test]
+    fn load_config_with_bench_overrides_project() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let bench = tempdir().unwrap();
+
+        let global_dir = home.path().join(".orboros");
+        std::fs::create_dir_all(&global_dir).unwrap();
+        std::fs::write(
+            global_dir.join("config.toml"),
+            r#"
+default_model = "global/model"
+worker_binary = "/global/heddle"
+
+[bench]
+timeout_s = 100
+"#,
+        )
+        .unwrap();
+
+        let orbs_dir = project.path().join(".orbs");
+        std::fs::create_dir_all(&orbs_dir).unwrap();
+        std::fs::write(
+            orbs_dir.join("config.toml"),
+            r#"
+default_model = "project/model"
+
+[bench]
+max_iterations = 8
+"#,
+        )
+        .unwrap();
+
+        let bench_config = bench.path().join("config.toml");
+        std::fs::write(
+            &bench_config,
+            r#"
+worker_binary = "/bench/heddle"
+
+[bench]
+timeout_s = 200
+
+[models.bench]
+default = "bench/model"
+"#,
+        )
+        .unwrap();
+
+        let cfg = load_config_with_home_and_bench(
+            Some(home.path()),
+            Some(project.path()),
+            Some(&bench_config),
+        )
+        .unwrap();
+        assert_eq!(cfg.default_model, "project/model");
+        assert_eq!(cfg.worker_binary.as_deref(), Some("/bench/heddle"));
+        assert_eq!(cfg.bench.timeout_s, Some(200));
+        assert_eq!(cfg.bench.max_iterations, Some(8));
+        assert_eq!(cfg.models.bench.default.as_deref(), Some("bench/model"));
+    }
+
+    #[test]
+    fn load_config_with_bench_errors_when_explicit_path_is_missing() {
+        let bench = tempdir().unwrap();
+        let missing = bench.path().join("missing.toml");
+        let err = load_config_with_bench(None, bench.path(), Some(&missing)).unwrap_err();
+        assert!(err.to_string().contains("bench config not found"));
     }
 
     #[test]

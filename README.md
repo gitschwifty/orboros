@@ -329,6 +329,7 @@ just bench-init ../orboros-bench # create private sibling bench corpus dirs
 just bench-list ../orboros-bench # list benchmark cases
 just bench-run t1 ../orboros-bench
 just bench-run-model kimi t1 kimi-smoke ../orboros-bench
+cargo run -- bench --bench-root ../orboros-bench --bench-config ../orboros-bench/config.toml run --tier t1
 cargo run -- bench --bench-root ../orboros-bench details <run-id>
 ```
 
@@ -348,6 +349,13 @@ Benchmark results default to `<bench-root>/results`; use
 `--bench-results-dir <dir>` or `ORBOROS_BENCH_RESULTS_DIR` to inspect or write a
 different store, including older runs under `~/.orboros/default/bench`. Each new
 run writes under `<bench-root>/results/YYYY-MM-DD/<run-id>/`.
+
+Bench runs load normal Orboros config first, then overlay
+`<bench-root>/config.toml` when it exists. Use `--bench-config <path>` to point
+at a different file; explicit paths must exist. Benchmark config is applied
+before CLI flags such as `--worker-binary`, `bench run --model`, and
+`bench run --variant`. Run metadata records the Orboros git commit and the
+benchmark corpus git commit when each root is a git worktree.
 
 Tests use mock worker scripts (`test-fixtures/mock-worker*.sh`) for fast unit tests. Set `HEDDLE_BINARY` for integration tests against a real heddle instance.
 

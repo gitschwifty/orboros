@@ -125,6 +125,15 @@ pub struct BenchRun {
     /// in a sibling private repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cases_root: Option<String>,
+    /// Benchmark config file overlaid after normal Orboros config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bench_config_path: Option<String>,
+    /// Git commit for the Orboros source used to run this benchmark.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orboros_commit: Option<String>,
+    /// Git commit for the benchmark corpus repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bench_commit: Option<String>,
     pub total: u32,
     pub passed: u32,
     pub failed: u32,
@@ -425,6 +434,9 @@ mod tests {
             grader_model: Some("mock/grader".into()),
             prompt_variant: None,
             cases_root: Some("bench/cases".into()),
+            bench_config_path: None,
+            orboros_commit: None,
+            bench_commit: None,
             total: 3,
             passed: 2,
             failed: 1,

@@ -545,6 +545,9 @@ fn summarize_run(
         grader_model: run_config.grader_model.clone(),
         prompt_variant: run_config.prompt_variant.clone(),
         cases_root: run_config.cases_root.clone(),
+        bench_config_path: run_config.bench_config_path.clone(),
+        orboros_commit: run_config.orboros_commit.clone(),
+        bench_commit: run_config.bench_commit.clone(),
         total,
         passed,
         failed,
@@ -623,14 +626,24 @@ fn print_run_summary(r: &BenchRun) {
         || r.model_key.is_some()
         || r.prompt_variant.is_some()
         || r.cases_root.is_some()
+        || r.bench_config_path.is_some()
+        || r.orboros_commit.is_some()
+        || r.bench_commit.is_some()
     {
         println!(
-            "  metadata: prompt={prompt} cases={cases} config={config}",
+            "  metadata: prompt={prompt} cases={cases} bench_config={bench_config} orboros_commit={orboros_commit} bench_commit={bench_commit} config={config}",
             prompt = r.prompt_variant.as_deref().unwrap_or("-"),
             cases = r.cases_root.as_deref().unwrap_or("-"),
+            bench_config = r.bench_config_path.as_deref().unwrap_or("-"),
+            orboros_commit = short_commit(r.orboros_commit.as_deref()),
+            bench_commit = short_commit(r.bench_commit.as_deref()),
             config = r.config_hash,
         );
     }
+}
+
+fn short_commit(commit: Option<&str>) -> &str {
+    commit.and_then(|c| c.get(..12)).unwrap_or("-")
 }
 
 fn warn_on_run_metadata_drift(a: Option<&BenchRun>, b: Option<&BenchRun>) {
@@ -758,6 +771,9 @@ text = "x"
                 grader_model: None,
                 prompt_variant: None,
                 cases_root: None,
+                bench_config_path: None,
+                orboros_commit: None,
+                bench_commit: None,
                 total: 1,
                 passed: 1,
                 failed: 0,

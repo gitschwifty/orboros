@@ -19,3 +19,35 @@ pub mod cmd;
 pub mod runner;
 pub mod runner_t2t3;
 pub mod store;
+
+use std::path::Path;
+use std::process::Command;
+
+#[must_use]
+pub fn git_head_commit(path: &Path) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .arg("rev-parse")
+        .arg("HEAD")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let commit = String::from_utf8(output.stdout).ok()?;
+    let commit = commit.trim();
+    (!commit.is_empty()).then(|| commit.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn git_head_commit_returns_none_for_non_git_dir() {
+        let dir = tempdir().unwrap();
+        assert_eq!(git_head_commit(dir.path()), None);
+    }
+}
