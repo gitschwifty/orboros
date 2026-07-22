@@ -211,6 +211,14 @@ impl BenchStore {
         self.run_dir(run_id).join("results.jsonl")
     }
 
+    /// Directory for artifacts captured from one case within a run.
+    #[must_use]
+    pub fn case_artifact_dir(&self, run_id: &str, case_id: &str) -> PathBuf {
+        self.run_dir(run_id)
+            .join("artifacts")
+            .join(sanitize_path_component(case_id))
+    }
+
     /// Legacy flat results path used before per-run directories.
     #[must_use]
     pub fn legacy_results_path(&self, run_id: &str) -> PathBuf {
@@ -291,6 +299,18 @@ fn ensure_dir(dir: &Path) -> Result<(), StoreError> {
         path: dir.to_path_buf(),
         source: e,
     })
+}
+
+fn sanitize_path_component(raw: &str) -> String {
+    raw.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> Result<(), StoreError> {

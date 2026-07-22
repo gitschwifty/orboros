@@ -44,6 +44,8 @@ const MAX_DECOMPOSE_STEPS: usize = 32;
 pub enum HarnessError {
     #[error("seed repo `{0}` not found under bench/fixtures/")]
     SeedRepoMissing(String),
+    #[error("test overlay `{0}` not found under bench/fixtures/")]
+    TestOverlayMissing(String),
     #[error("expected `tests_pass.command` for T2 case `{0}`")]
     MissingTestsCommand(String),
     #[error("expected `rubric.criteria` for T3 case `{0}`")]
@@ -91,6 +93,49 @@ pub fn copy_seed_repo(
         ))));
     }
     Ok(dest_root)
+}
+
+/// Copies an optional test overlay into the already-mutated workdir.
+/// Used after worker dispatch and before grading so cases can keep
+/// grader tests out of the seed project the worker edits.
+///
+/// # Errors
+///
+/// Returns [`HarnessError::TestOverlayMissing`] when the named overlay
+/// does not exist, or [`HarnessError::Io`] for filesystem failures.
+pub fn copy_test_overlay(
+    fixtures_root: &Path,
+    overlay_name: &Path,
+    workdir: &Path,
+) -> Result<(), HarnessError> {
+    let src = fixtures_root.join(overlay_name);
+    if !src.exists() {
+        return Err(HarnessError::TestOverlayMissing(
+            overlay_name.display().to_string(),
+        ));
+    }
+    let status = Command::new("cp")
+        .arg("-R")
+        .arg(format!("{}/.", src.display()))
+        .arg(workdir)
+        .status()?;
+    if !status.success() {
+        return Err(HarnessError::Io(std::io::Error::other(format!(
+            "cp -R test overlay failed: {status}"
+        ))));
+    }
+    Ok(())
+}
+
+fn copy_case_test_overlay(
+    fixtures_root: &Path,
+    case: &BenchCase,
+    workdir: &Path,
+) -> Result<(), HarnessError> {
+    if let Some(overlay) = case.test_overlay.as_deref() {
+        copy_test_overlay(fixtures_root, overlay, workdir)?;
+    }
+    Ok(())
 }
 
 /// Runs the `tests_pass` command in `cwd`. Used as the final grader
@@ -185,9 +230,18 @@ pub async fn run_t2_case(
     fixtures_root: &Path,
     base_worker_config: &WorkerConfig,
     opts: &RunOptions,
+    artifact_dir: Option<&Path>,
 ) -> Result<BenchResult, HarnessError> {
     if case.runner == Some(BenchRunner::Decompose) {
-        return run_t2_decompose_case(case, run_id, fixtures_root, base_worker_config, opts).await;
+        return run_t2_decompose_case(
+            case,
+            run_id,
+            fixtures_root,
+            base_worker_config,
+            opts,
+            artifact_dir,
+        )
+        .await;
     }
 
     let started = Instant::now();
@@ -202,6 +256,7 @@ pub async fn run_t2_case(
         .seed_repo
         .as_deref()
         .ok_or_else(|| HarnessError::SeedRepoMissing("(none specified)".into()))?;
+    let seed_dir = fixtures_root.join(seed);
     let command = match &case.expected {
         BenchExpected::TestsPass { command } => command.clone(),
         _ => return Err(HarnessError::MissingTestsCommand(case.id.clone())),
@@ -234,6 +289,7 @@ pub async fn run_t2_case(
     })?;
     if completed == 0 {
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let artifact_path = snapshot_workdir(&seed_dir, &workdir, artifact_dir, &case.id)?;
         return Ok(BenchResult {
             case_id: case.id.clone(),
             run_id: run_id.into(),
@@ -257,7 +313,7 @@ pub async fn run_t2_case(
                 .as_ref()
                 .and_then(|e| e.system_prompt_source.clone()),
             confidence: updated.confidence,
-            output: t2_output(updated.result.as_ref(), None),
+            output: t2_output(updated.result.as_ref(), None, artifact_path.as_deref()),
             error: Some(
                 updated
                     .result
@@ -266,7 +322,9 @@ pub async fn run_t2_case(
         });
     }
 
+    copy_case_test_overlay(fixtures_root, case, &workdir)?;
     let tests = evaluate_tests_pass_output(&workdir, &command)?;
+    let artifact_path = snapshot_workdir(&seed_dir, &workdir, artifact_dir, &case.id)?;
     let status = if updated.status == Some(OrbStatus::Done) && tests.passed {
         BenchStatus::Pass
     } else {
@@ -296,7 +354,11 @@ pub async fn run_t2_case(
         system_prompt_hash: execution.and_then(|e| e.system_prompt_hash.clone()),
         system_prompt_source: execution.and_then(|e| e.system_prompt_source.clone()),
         confidence: updated.confidence,
-        output: t2_output(updated.result.as_ref(), Some(&tests)),
+        output: t2_output(
+            updated.result.as_ref(),
+            Some(&tests),
+            artifact_path.as_deref(),
+        ),
         error: if updated.status == Some(OrbStatus::Done) && tests.passed {
             None
         } else if !tests.passed {
@@ -314,6 +376,7 @@ async fn run_t2_decompose_case(
     fixtures_root: &Path,
     base_worker_config: &WorkerConfig,
     opts: &RunOptions,
+    artifact_dir: Option<&Path>,
 ) -> Result<BenchResult, HarnessError> {
     let started = Instant::now();
     if case.tier != BenchTier::T2 {
@@ -327,6 +390,7 @@ async fn run_t2_decompose_case(
         .seed_repo
         .as_deref()
         .ok_or_else(|| HarnessError::SeedRepoMissing("(none specified)".into()))?;
+    let seed_dir = fixtures_root.join(seed);
     let command = match &case.expected {
         BenchExpected::TestsPass { command } => command.clone(),
         _ => return Err(HarnessError::MissingTestsCommand(case.id.clone())),
@@ -370,10 +434,13 @@ async fn run_t2_decompose_case(
             .iter()
             .any(|orb| orb.effective_status() == TaskStatus::Failed)
         {
+            copy_case_test_overlay(fixtures_root, case, &workdir)?;
             let tests = evaluate_tests_pass_output(&workdir, &command).ok();
+            let artifact_path = snapshot_workdir(&seed_dir, &workdir, artifact_dir, &case.id)?;
             return Ok(result_ctx.result(
                 &all_orbs,
                 tests.as_ref(),
+                artifact_path.as_deref(),
                 BenchStatus::Error,
                 Some("decompose runner encountered a failed orb".into()),
             ));
@@ -389,7 +456,9 @@ async fn run_t2_decompose_case(
                 .all(|orb| orb.effective_status() == TaskStatus::Done)
         {
             let _ = ql.tick()?;
+            copy_case_test_overlay(fixtures_root, case, &workdir)?;
             let tests = evaluate_tests_pass_output(&workdir, &command)?;
+            let artifact_path = snapshot_workdir(&seed_dir, &workdir, artifact_dir, &case.id)?;
             let final_orbs = orb_store.load_all()?;
             let status = if tests.passed {
                 BenchStatus::Pass
@@ -397,7 +466,13 @@ async fn run_t2_decompose_case(
                 BenchStatus::Fail
             };
             let error = (!tests.passed).then(|| format_tests_pass_error(&command, &tests));
-            return Ok(result_ctx.result(&final_orbs, Some(&tests), status, error));
+            return Ok(result_ctx.result(
+                &final_orbs,
+                Some(&tests),
+                artifact_path.as_deref(),
+                status,
+                error,
+            ));
         }
 
         let progressed = !tick.is_idle() || dispatched > 0 || materialized || cleared;
@@ -406,10 +481,13 @@ async fn run_t2_decompose_case(
         } else {
             stalled_steps = stalled_steps.saturating_add(1);
             if stalled_steps >= 2 {
+                copy_case_test_overlay(fixtures_root, case, &workdir)?;
                 let tests = evaluate_tests_pass_output(&workdir, &command).ok();
+                let artifact_path = snapshot_workdir(&seed_dir, &workdir, artifact_dir, &case.id)?;
                 return Ok(result_ctx.result(
                     &all_orbs,
                     tests.as_ref(),
+                    artifact_path.as_deref(),
                     BenchStatus::Error,
                     Some("decompose runner stalled before all child tasks completed".into()),
                 ));
@@ -418,10 +496,13 @@ async fn run_t2_decompose_case(
     }
 
     let all_orbs = orb_store.load_all()?;
+    copy_case_test_overlay(fixtures_root, case, &workdir)?;
     let tests = evaluate_tests_pass_output(&workdir, &command).ok();
+    let artifact_path = snapshot_workdir(&seed_dir, &workdir, artifact_dir, &case.id)?;
     Ok(result_ctx.result(
         &all_orbs,
         tests.as_ref(),
+        artifact_path.as_deref(),
         BenchStatus::Error,
         Some(format!(
             "decompose runner exceeded {MAX_DECOMPOSE_STEPS} queue steps"
@@ -535,6 +616,7 @@ impl T2DecomposeResultCtx<'_> {
         &self,
         orbs: &[Orb],
         tests: Option<&TestsPassOutput>,
+        artifact_path: Option<&Path>,
         status: BenchStatus,
         error: Option<String>,
     ) -> BenchResult {
@@ -563,7 +645,7 @@ impl T2DecomposeResultCtx<'_> {
             system_prompt_hash: execution.and_then(|e| e.system_prompt_hash.clone()),
             system_prompt_source: execution.and_then(|e| e.system_prompt_source.clone()),
             confidence: root.and_then(|orb| orb.confidence),
-            output: t2_graph_output(orbs, self.dep_store, tests),
+            output: t2_graph_output(orbs, self.dep_store, tests, artifact_path),
             error,
         }
     }
@@ -598,7 +680,11 @@ fn aggregate_orb_usage(orbs: &[Orb]) -> AggregateUsage {
     }
 }
 
-fn t2_output(worker_result: Option<&String>, tests: Option<&TestsPassOutput>) -> Option<String> {
+fn t2_output(
+    worker_result: Option<&String>,
+    tests: Option<&TestsPassOutput>,
+    artifact_path: Option<&Path>,
+) -> Option<String> {
     let mut out = String::new();
     if let Some(result) = worker_result {
         out.push_str("== worker result ==\n");
@@ -619,6 +705,10 @@ fn t2_output(worker_result: Option<&String>, tests: Option<&TestsPassOutput>) ->
             out.push('\n');
         }
     }
+    if let Some(path) = artifact_path {
+        out.push_str("== artifact path ==\n");
+        let _ = writeln!(out, "{}", path.display());
+    }
     (!out.is_empty()).then_some(out)
 }
 
@@ -626,6 +716,7 @@ fn t2_graph_output(
     orbs: &[Orb],
     dep_store: &DepStore,
     tests: Option<&TestsPassOutput>,
+    artifact_path: Option<&Path>,
 ) -> Option<String> {
     let mut out = String::new();
     out.push_str("== orb results ==\n");
@@ -660,7 +751,81 @@ fn t2_graph_output(
             out.push('\n');
         }
     }
+    if let Some(path) = artifact_path {
+        out.push_str("== artifact path ==\n");
+        let _ = writeln!(out, "{}", path.display());
+    }
     (!out.is_empty()).then_some(out)
+}
+
+fn snapshot_workdir(
+    seed_dir: &Path,
+    workdir: &Path,
+    artifact_dir: Option<&Path>,
+    case_id: &str,
+) -> Result<Option<PathBuf>, HarnessError> {
+    let Some(artifact_dir) = artifact_dir else {
+        return Ok(None);
+    };
+    let dest = artifact_dir.join("workdir");
+    if dest.exists() {
+        std::fs::remove_dir_all(&dest)?;
+    }
+    std::fs::create_dir_all(artifact_dir)?;
+    copy_dir_filtered(workdir, &dest)?;
+    write_diff_patch(seed_dir, workdir, &artifact_dir.join("diff.patch"))?;
+    tracing::info!(
+        case = %case_id,
+        artifact = %dest.display(),
+        "captured T2 final workdir artifact"
+    );
+    Ok(Some(dest))
+}
+
+fn write_diff_patch(
+    seed_dir: &Path,
+    workdir: &Path,
+    patch_path: &Path,
+) -> Result<(), HarnessError> {
+    let output = Command::new("diff")
+        .arg("-ruN")
+        .arg("-x")
+        .arg("target")
+        .arg("-x")
+        .arg(".orbs")
+        .arg(seed_dir)
+        .arg(workdir)
+        .output()?;
+    match output.status.code() {
+        Some(0 | 1) => {
+            std::fs::write(patch_path, output.stdout)?;
+            Ok(())
+        }
+        _ => Err(HarnessError::Io(std::io::Error::other(format!(
+            "diff failed while capturing T2 artifact: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )))),
+    }
+}
+
+fn copy_dir_filtered(src: &Path, dest: &Path) -> Result<(), HarnessError> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        if file_name == "target" {
+            continue;
+        }
+        let src_path = entry.path();
+        let dest_path = dest.join(&file_name);
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            copy_dir_filtered(&src_path, &dest_path)?;
+        } else if metadata.is_file() {
+            std::fs::copy(&src_path, &dest_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn format_tests_pass_error(command: &str, output: &TestsPassOutput) -> String {
@@ -789,6 +954,7 @@ mod tests {
             },
             runner: None,
             seed_repo: Some(PathBuf::from(seed)),
+            test_overlay: None,
             timeout_s: Some(60),
             max_iterations: None,
             max_cost_cents: 100,
@@ -857,6 +1023,24 @@ done
         let err =
             copy_seed_repo(&dir.path().join("fixtures"), Path::new("nope"), &dest).unwrap_err();
         assert!(matches!(err, HarnessError::SeedRepoMissing(_)));
+    }
+
+    #[test]
+    fn copy_test_overlay_merges_files_into_workdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures = dir.path().join("fixtures");
+        let overlay = fixtures.join("tests-overlay");
+        std::fs::create_dir_all(overlay.join("tests")).unwrap();
+        std::fs::write(overlay.join("tests").join("api.rs"), "test").unwrap();
+        let workdir = dir.path().join("work");
+        std::fs::create_dir_all(&workdir).unwrap();
+
+        copy_test_overlay(&fixtures, Path::new("tests-overlay"), &workdir).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(workdir.join("tests").join("api.rs")).unwrap(),
+            "test"
+        );
     }
 
     // ── evaluate_tests_pass ───────────────────────────────────
@@ -935,9 +1119,17 @@ done
         let wc = worker_config(&script);
 
         let case = t2_case_with_seed("t2-1", "small", "test \"$(cat result.txt)\" = done");
-        let r = run_t2_case(&case, "run-x", &fixtures, &wc, &RunOptions::default())
-            .await
-            .unwrap();
+        let artifact_dir = dir.path().join("artifacts").join("t2-1");
+        let r = run_t2_case(
+            &case,
+            "run-x",
+            &fixtures,
+            &wc,
+            &RunOptions::default(),
+            Some(&artifact_dir),
+        )
+        .await
+        .unwrap();
         assert_eq!(r.status, BenchStatus::Pass);
         assert!((r.score - 1.0).abs() < f32::EPSILON);
         assert_eq!(r.tier, BenchTier::T2);
@@ -949,6 +1141,17 @@ done
         assert!(output.contains("edited"));
         assert!(output.contains("== tests_pass stdout =="));
         assert!(output.contains("== tests_pass stderr =="));
+        assert!(output.contains("== artifact path =="));
+        assert_eq!(
+            std::fs::read_to_string(artifact_dir.join("workdir").join("result.txt"))
+                .unwrap()
+                .trim(),
+            "done"
+        );
+        let patch = std::fs::read_to_string(artifact_dir.join("diff.patch")).unwrap();
+        assert!(patch.contains("result.txt"), "{patch}");
+        assert!(patch.contains("+done"), "{patch}");
+        assert!(!artifact_dir.join("workdir").join("target").exists());
     }
 
     #[tokio::test]
@@ -959,7 +1162,7 @@ done
         let script = write_editing_worker(dir.path());
         let wc = worker_config(&script);
         let case = t2_case_with_seed("t2-x", "nope", "true");
-        let err = run_t2_case(&case, "run-x", &fixtures, &wc, &RunOptions::default())
+        let err = run_t2_case(&case, "run-x", &fixtures, &wc, &RunOptions::default(), None)
             .await
             .unwrap_err();
         assert!(matches!(err, HarnessError::SeedRepoMissing(_)));
@@ -976,7 +1179,7 @@ done
         wc.args = vec![];
 
         let case = t2_case_with_seed("t2-fail", "small", "true");
-        let r = run_t2_case(&case, "run-x", &fixtures, &wc, &RunOptions::default())
+        let r = run_t2_case(&case, "run-x", &fixtures, &wc, &RunOptions::default(), None)
             .await
             .unwrap();
         assert_eq!(r.status, BenchStatus::Error);
@@ -1051,6 +1254,7 @@ done
             },
             runner: None,
             seed_repo: None,
+            test_overlay: None,
             timeout_s: Some(60),
             max_iterations: None,
             max_cost_cents: 100,

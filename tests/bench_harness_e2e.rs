@@ -110,6 +110,7 @@ fn t1_case(id: &str, prompt: &str, expected: BenchExpected) -> BenchCase {
         expected,
         runner: None,
         seed_repo: None,
+        test_overlay: None,
         timeout_s: Some(60),
         max_iterations: None,
         max_cost_cents: 100,

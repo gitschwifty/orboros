@@ -103,6 +103,11 @@ pub struct BenchCase {
     /// Optional seed repo path (T2). Relative to `bench/fixtures/`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_repo: Option<PathBuf>,
+    /// Optional test overlay path (T2). Relative to `bench/fixtures/`.
+    /// Copied into the temp project immediately before grading, after
+    /// the worker has completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_overlay: Option<PathBuf>,
     /// Per-case timeout in seconds. Overrides `[bench].timeout_s`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_s: Option<u32>,

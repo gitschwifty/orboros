@@ -135,6 +135,7 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
             .clone()
             .unwrap_or_else(crate::bench::store::new_run_id);
         let timeout_s = effective_timeout_s(case, &opts);
+        let artifact_dir = req.store.case_artifact_dir(&run_id, &case.id);
         let result = match case.tier {
             BenchTier::T2 => match tokio::time::timeout(
                 Duration::from_secs(u64::from(timeout_s)),
@@ -144,6 +145,7 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
                     req.fixtures_root,
                     req.worker_config,
                     &opts,
+                    Some(&artifact_dir),
                 ),
             )
             .await
