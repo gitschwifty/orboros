@@ -645,6 +645,10 @@ fn dispatch_target_for(orb: &Orb) -> Option<DispatchTarget> {
     }
 }
 
+fn optional_debug<T: std::fmt::Debug>(value: Option<T>) -> String {
+    value.map_or_else(|| "none".to_string(), |value| format!("{value:?}"))
+}
+
 /// Owned-argument version of `dispatch_one`, suitable for `tokio::spawn`.
 /// Returns `Ok(true)` when the orb ended at Done, `Ok(false)` otherwise.
 struct DispatchContext<'a> {
@@ -698,7 +702,7 @@ async fn dispatch_one_owned(
         orb = %orb.id,
         title = %orb.title,
         target = ?target,
-        phase = ?orb.phase,
+        phase = %optional_debug(orb.phase),
         "dispatching ready orb",
     );
 

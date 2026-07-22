@@ -120,7 +120,7 @@ impl DispatchOutcome {
         orb = %orb.id,
         title = %orb.title,
         orb_type = ?orb.orb_type,
-        phase = ?orb.phase,
+        phase = %optional_debug(orb.phase.as_ref()),
         model = %worker_config.model
     )
 )]
@@ -164,7 +164,7 @@ pub async fn dispatch_orb(
         orb = %orb.id,
         title = %orb.title,
         orb_type = ?orb.orb_type,
-        phase = ?orb.phase,
+        phase = %optional_debug(orb.phase.as_ref()),
         model = %worker_config.model,
         "dispatch_orb start",
     );
@@ -205,14 +205,14 @@ pub async fn dispatch_orb(
         orb = %orb.id,
         title = %orb.title,
         orb_type = ?orb.orb_type,
-        phase = ?orb.phase,
+        phase = %optional_debug(orb.phase.as_ref()),
         status = ?outcome.status,
         elapsed_ms,
-        prompt_tokens = ?outcome.prompt_tokens,
-        completion_tokens = ?outcome.completion_tokens,
-        total_tokens = ?outcome.total_tokens,
-        cost_micros = ?outcome.cost_micros,
-        cost_currency = ?outcome.cost_currency.as_deref(),
+        prompt_tokens = %optional_display(outcome.prompt_tokens),
+        completion_tokens = %optional_display(outcome.completion_tokens),
+        total_tokens = %optional_display(outcome.total_tokens),
+        cost_micros = %optional_display(outcome.cost_micros),
+        cost_currency = %outcome.cost_currency.as_deref().unwrap_or("none"),
         "dispatch_orb complete",
     );
 
@@ -475,6 +475,14 @@ pub fn worker_config_for(orb: &Orb, base: &WorkerConfig, system_prompt: &str) ->
         crate::worker::process::CONFIDENCE_PROMPT_ADDENDUM
     );
     wc
+}
+
+fn optional_debug<T: std::fmt::Debug>(value: Option<&T>) -> String {
+    value.map_or_else(|| "none".to_string(), |value| format!("{value:?}"))
+}
+
+fn optional_display<T: std::fmt::Display>(value: Option<T>) -> String {
+    value.map_or_else(|| "none".to_string(), |value| value.to_string())
 }
 
 #[cfg(test)]

@@ -179,8 +179,8 @@ impl Worker {
         tracing::Span::current().record("session_id", tracing::field::display(&worker.session_id));
         info!(
             session_id = %worker.session_id,
-            task_id = ?config.task_id,
-            worker_id = ?config.worker_id,
+            task_id = %optional_field(config.task_id.as_deref()),
+            worker_id = %optional_field(config.worker_id.as_deref()),
             model = %config.model,
             "worker ready",
         );
@@ -541,6 +541,10 @@ impl Worker {
             }
         }
     }
+}
+
+fn optional_field(value: Option<&str>) -> &str {
+    value.unwrap_or("none")
 }
 
 /// Clamps worker-reported confidence into `[0.0, 1.0]`. Returns `None` for

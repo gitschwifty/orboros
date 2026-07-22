@@ -239,6 +239,13 @@ pub async fn run_t1_case(
             Ok(w) => w,
             Err(e) => {
                 let err = format!("spawn failed: {e}");
+                warn!(
+                    run_id,
+                    case = %case.id,
+                    attempt,
+                    error = %err,
+                    "T1 worker spawn failed"
+                );
                 append_attempt_output(&mut output, attempt, "spawn_error", &err);
                 let fatal = is_fatal_worker_error_text(&err);
                 last_error = Some(err);
@@ -255,6 +262,13 @@ pub async fn run_t1_case(
             Ok(o) => o,
             Err(e) => {
                 let err = format!("send failed: {e}");
+                warn!(
+                    run_id,
+                    case = %case.id,
+                    attempt,
+                    error = %err,
+                    "T1 worker send failed"
+                );
                 append_attempt_output(&mut output, attempt, "send_error", &err);
                 let fatal = is_fatal_worker_error_text(&err);
                 last_error = Some(err);
@@ -277,6 +291,14 @@ pub async fn run_t1_case(
 
         if outcome.status != ResultStatus::Ok {
             let err = send_outcome_error(&outcome);
+            warn!(
+                run_id,
+                case = %case.id,
+                attempt,
+                status = ?outcome.status,
+                error = %err,
+                "T1 worker returned error status"
+            );
             append_attempt_output(&mut output, attempt, "worker_error", &err);
             last_error = Some(err);
             errors += 1;
@@ -292,6 +314,13 @@ pub async fn run_t1_case(
             Ok(o) => o,
             Err(e) => {
                 let err = format!("grade failed: {e}");
+                warn!(
+                    run_id,
+                    case = %case.id,
+                    attempt,
+                    error = %err,
+                    "T1 grading failed"
+                );
                 last_error = Some(err.clone());
                 append_attempt_output(&mut output, attempt, "grade_error", &err);
                 AttemptOutcome::Fail
@@ -342,6 +371,15 @@ pub async fn run_t1_case(
         f64::from(passes) as f32 / f64::from(attempts_run) as f32
     };
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    if status == BenchStatus::Error {
+        warn!(
+            run_id,
+            case = %case.id,
+            error = %last_error.as_deref().unwrap_or("unknown error"),
+            "T1 case errored"
+        );
+    }
 
     info!(
         case = %case.id,

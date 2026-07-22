@@ -216,6 +216,15 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
         if summary_run_id.is_none() {
             summary_run_id = Some(run_id);
         }
+        if result.status == BenchStatus::Error {
+            tracing::warn!(
+                run_id = %result.run_id,
+                case = %result.case_id,
+                tier = ?result.tier,
+                error = %result.error.as_deref().unwrap_or("unknown error"),
+                "benchmark case errored"
+            );
+        }
         req.store.append_result(&result)?;
         let fatal = is_fatal_worker_error(&result);
         all_results.push(result);

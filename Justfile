@@ -21,6 +21,20 @@ bench-run tier="" root="bench":
         cargo run -- bench --bench-root "{{root}}" run; \
     fi
 
+# Build the release binary.
+build-release:
+    cargo build --release
+
+# Build release, then run benchmark cases with a default model.
+bench-run-release model="openrouter/free" tier="" variant="" root="bench": build-release
+    @variant_arg=""; \
+    if [ -n "{{variant}}" ]; then variant_arg='--variant "{{variant}}"'; fi; \
+    if [ -n "{{tier}}" ]; then \
+        ./target/release/orboros bench --bench-root "{{root}}" run --tier "{{tier}}" --model "{{model}}" $variant_arg; \
+    else \
+        ./target/release/orboros bench --bench-root "{{root}}" run --model "{{model}}" $variant_arg; \
+    fi
+
 # Run benchmark cases with an explicit model. Empty tier runs all cases.
 bench-run-model model tier="" variant="" root="bench":
     @variant_arg=""; \
@@ -29,6 +43,16 @@ bench-run-model model tier="" variant="" root="bench":
         cargo run -- bench --bench-root "{{root}}" run --tier "{{tier}}" --model "{{model}}" $variant_arg; \
     else \
         cargo run -- bench --bench-root "{{root}}" run --model "{{model}}" $variant_arg; \
+    fi
+
+# Build release, then run benchmark cases with an explicit model.
+bench-run-model-release model tier="" variant="" root="bench": build-release
+    @variant_arg=""; \
+    if [ -n "{{variant}}" ]; then variant_arg='--variant "{{variant}}"'; fi; \
+    if [ -n "{{tier}}" ]; then \
+        ./target/release/orboros bench --bench-root "{{root}}" run --tier "{{tier}}" --model "{{model}}" $variant_arg; \
+    else \
+        ./target/release/orboros bench --bench-root "{{root}}" run --model "{{model}}" $variant_arg; \
     fi
 
 # Run one benchmark case by id.
