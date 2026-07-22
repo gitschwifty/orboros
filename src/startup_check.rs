@@ -45,15 +45,42 @@ pub fn validate_worker_prereqs(check: &PrereqCheck<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Confirms `path` exists and is an executable regular file. `~` is
-/// expanded against the user's home directory.
+/// Confirms `raw_binary` resolves to an executable regular file. `~` is
+/// expanded against the user's home directory, and bare command names are
+/// searched on `PATH`.
 ///
 /// # Errors
 ///
 /// Returns an error if the binary cannot be located, is not a file, or
 /// lacks execute permission.
-pub fn check_binary(raw_path: &str) -> anyhow::Result<()> {
-    let path = expand_tilde(raw_path);
+pub fn check_binary(raw_binary: &str) -> anyhow::Result<()> {
+    let path = resolve_binary(raw_binary)?;
+    check_binary_path(&path)
+}
+
+/// Resolves an absolute/relative binary path or a bare command name from
+/// `PATH` into the executable path that will be validated.
+///
+/// # Errors
+///
+/// Returns an error when the binary cannot be found.
+pub fn resolve_binary(raw_binary: &str) -> anyhow::Result<PathBuf> {
+    if raw_binary.trim().is_empty() {
+        anyhow::bail!("worker binary is empty");
+    }
+    let expanded = expand_tilde(raw_binary);
+    if raw_binary.contains('/') || expanded.is_absolute() {
+        return Ok(expanded);
+    }
+    if let Some(path) = find_on_path(raw_binary) {
+        return Ok(path);
+    }
+    anyhow::bail!(
+        "worker binary not found on PATH: {raw_binary} (set --worker-binary or HEDDLE_BINARY)"
+    );
+}
+
+fn check_binary_path(path: &Path) -> anyhow::Result<()> {
     if !path.exists() {
         anyhow::bail!(
             "worker binary not found: {} (set --worker-binary or HEDDLE_BINARY)",
@@ -75,6 +102,20 @@ pub fn check_binary(raw_path: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn find_on_path(binary: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(binary))
+        .find(|path| is_valid_executable_path(path))
+}
+
+fn is_valid_executable_path(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    metadata.is_file() && is_executable(path, &metadata)
 }
 
 /// Validates that `model` looks like `provider/model-id`, allowing additional
@@ -274,6 +315,13 @@ mod tests {
     }
 
     #[test]
+    fn check_binary_missing_command_errors_with_path_message() {
+        let err = check_binary("definitely-not-a-real-heddle-binary").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not found on PATH"), "got: {msg}");
+    }
+
+    #[test]
     fn check_binary_non_executable_file_errors() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("not-exec");
@@ -313,6 +361,23 @@ mod tests {
         perms.set_mode(0o755);
         fs::set_permissions(&path, perms).unwrap();
         check_binary(path.to_str().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_binary_resolves_command_on_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("heddle-test-bin");
+        fs::write(&path, "#!/bin/sh\necho hi\n").unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+
+        with_env(&[("PATH", Some(dir.path().to_str().unwrap()))], || {
+            let resolved = resolve_binary("heddle-test-bin").unwrap();
+            check_binary("heddle-test-bin").unwrap();
+            assert_eq!(resolved, path);
+        });
     }
 
     // ── check_model_string ────────────────────────────────────────

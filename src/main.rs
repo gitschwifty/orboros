@@ -424,16 +424,12 @@ fn require_binary(worker_binary: Option<&str>) -> anyhow::Result<&str> {
 /// the worker binary (errors if unset), then runs `validate_worker_prereqs`
 /// unless `skip_prereq_check` is true.
 ///
-/// Returns the borrowed binary path for the caller to keep using.
-fn prereq_check<'a>(
-    worker_binary: Option<&'a str>,
-    model: &str,
-    skip: bool,
-) -> anyhow::Result<&'a str> {
+/// Returns the resolved binary path for the caller to keep using.
+fn prereq_check(worker_binary: Option<&str>, model: &str, skip: bool) -> anyhow::Result<String> {
     let binary = require_binary(worker_binary)?;
     if skip {
         tracing::warn!("--skip-prereq-check set; trusting caller for binary/model/credentials");
-        return Ok(binary);
+        return Ok(binary.to_string());
     }
     orboros::startup_check::validate_worker_prereqs(&orboros::startup_check::PrereqCheck {
         worker_binary: binary,
@@ -441,7 +437,9 @@ fn prereq_check<'a>(
         router: Some("openrouter"),
         require_credentials: true,
     })?;
-    Ok(binary)
+    Ok(orboros::startup_check::resolve_binary(binary)?
+        .display()
+        .to_string())
 }
 
 fn load_routing_config(state_dir: Option<&std::path::Path>) -> RoutingConfig {
@@ -795,8 +793,9 @@ fn cmd_bench(
                     .ok_or_else(|| anyhow::anyhow!("worker_binary is unset in OrbConfig"))?;
                 &binary_owned
             };
-            bench_prereq_check(Some(binary), &resolved_model.model, skip_prereq_check)?;
-            let worker_config = make_worker_config(binary, &resolved_model.model, "");
+            let binary =
+                bench_prereq_check(Some(binary), &resolved_model.model, skip_prereq_check)?;
+            let worker_config = make_worker_config(&binary, &resolved_model.model, "");
             let run_config = BenchRunConfig {
                 variant,
                 model_selector: model
@@ -844,15 +843,15 @@ fn cmd_bench(
     }
 }
 
-fn bench_prereq_check<'a>(
-    worker_binary: Option<&'a str>,
+fn bench_prereq_check(
+    worker_binary: Option<&str>,
     model: &str,
     skip: bool,
-) -> anyhow::Result<&'a str> {
+) -> anyhow::Result<String> {
     let binary = require_binary(worker_binary)?;
     if skip {
         tracing::warn!("--skip-prereq-check set; trusting caller for binary/model/credentials");
-        return Ok(binary);
+        return Ok(binary.to_string());
     }
     orboros::startup_check::check_binary(binary)?;
     orboros::startup_check::check_model_string_for_router(Some("openrouter"), model)?;
@@ -862,7 +861,9 @@ fn bench_prereq_check<'a>(
              (looked at .env and process env)"
         );
     }
-    Ok(binary)
+    Ok(orboros::startup_check::resolve_binary(binary)?
+        .display()
+        .to_string())
 }
 
 fn cmd_sessions(state_dir: &std::path::Path, action: Option<SessionsAction>) -> anyhow::Result<()> {
@@ -926,7 +927,7 @@ fn cmd_chat(
             .map(|p| p.to_string_lossy().into_owned()),
         linked_orb: link_orb.map(orbs::id::OrbId::from_raw),
     };
-    let worker_config = make_worker_config(binary, model, system_prompt);
+    let worker_config = make_worker_config(&binary, model, system_prompt);
     let runtime = orboros::convo::ConvoRuntime::new(session_store);
     let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
 
@@ -971,7 +972,7 @@ fn cmd_run(
         .map_or(default_system_prompt, |resolved| {
             resolved.system_prompt.as_str()
         });
-    let config = make_worker_config(binary, model, resolved_system_prompt);
+    let config = make_worker_config(&binary, model, resolved_system_prompt);
 
     println!("  status:   executing...");
     println!();
@@ -1006,7 +1007,7 @@ fn cmd_decompose(
     skip_prereq_check: bool,
 ) -> anyhow::Result<()> {
     let binary = prereq_check(worker_binary, model, skip_prereq_check)?;
-    let config = make_worker_config(binary, model, ""); // system prompt set by decompose()
+    let config = make_worker_config(&binary, model, ""); // system prompt set by decompose()
     let prompt_config = config::load_config(None)?.prompts;
     let cli_override =
         orboros::prompt::resolve_cli_system_prompt(system_prompt, system_prompt_file)?;
@@ -1051,7 +1052,7 @@ fn cmd_orchestrate(
     skip_prereq_check: bool,
 ) -> anyhow::Result<()> {
     let binary = prereq_check(worker_binary, model, skip_prereq_check)?;
-    let config = make_worker_config(binary, model, ""); // system prompt set per step
+    let config = make_worker_config(&binary, model, ""); // system prompt set per step
     let project_dir = store.path().parent();
     let orb_config = config::load_config(project_dir)?;
     let prompt_config = orb_config.prompts.clone();
