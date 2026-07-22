@@ -273,6 +273,12 @@ as `AGENTS.md`.
 
 ## Model Routing
 
+Model selection now resolves through the `[models]` catalog first. Worker
+roles use `[models.workers]`; phase dispatch uses `[models.phases]`; reviewer
+and benchmark roles use their dedicated mappings. Selectors may be catalog keys
+or raw `provider/model` strings. `routing.toml` is legacy and remains relevant
+only for tool profiles until those move into the main config surface.
+
 ```toml
 # routing.toml in state directory
 default_model = "openrouter/auto"

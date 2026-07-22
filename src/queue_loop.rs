@@ -513,9 +513,9 @@ impl QueueLoop {
             return Ok(0);
         }
 
-        let prompt_config = crate::config::load_config(Some(&self.base_dir))
-            .map_err(std::io::Error::other)?
-            .prompts;
+        let orb_config =
+            crate::config::load_config(Some(&self.base_dir)).map_err(std::io::Error::other)?;
+        let prompt_config = orb_config.prompts.clone();
         let prompt_resolver =
             crate::prompt::PromptResolver::from_config(prompt_config, Some(&self.base_dir));
 
@@ -528,6 +528,7 @@ impl QueueLoop {
             let sem = semaphore.clone();
             let store = self.orb_store.clone();
             let base_wc = base_worker_config.clone();
+            let orb_config = orb_config.clone();
             let prompt_resolver = prompt_resolver.clone();
             let context_orbs = Arc::clone(&context_orbs);
             let context_edges = Arc::clone(&context_edges);
@@ -545,6 +546,7 @@ impl QueueLoop {
                     orb,
                     target,
                     &base_wc,
+                    &orb_config,
                     &prompt_resolver,
                     context,
                     hooks,
@@ -608,6 +610,16 @@ impl DispatchTarget {
             Self::Reevaluating => crate::prompt::PromptKind::Phase("reevaluating"),
         }
     }
+
+    fn model_role(self) -> crate::config::ModelRole<'static> {
+        match self {
+            Self::Execute => crate::config::ModelRole::Worker("execute"),
+            Self::Speccing => crate::config::ModelRole::Phase("speccing"),
+            Self::Decomposing => crate::config::ModelRole::Phase("decomposing"),
+            Self::Refining => crate::config::ModelRole::Phase("refining"),
+            Self::Reevaluating => crate::config::ModelRole::Phase("reevaluating"),
+        }
+    }
 }
 
 /// Returns `Some(target)` when the orb is in a worker-eligible state
@@ -645,6 +657,7 @@ async fn dispatch_one_owned(
     mut orb: Orb,
     target: DispatchTarget,
     base_wc: &crate::worker::process::WorkerConfig,
+    model_config: &crate::config::OrbConfig,
     prompt_resolver: &crate::prompt::PromptResolver,
     context: DispatchContext<'_>,
     hooks: Option<Arc<crate::hooks::HookSink>>,
@@ -672,7 +685,15 @@ async fn dispatch_one_owned(
         .map_err(std::io::Error::other)?;
     let system = resolved.system_prompt;
     let prompt_source = resolved.source.label();
-    let wc = worker_config_for(&orb, base_wc, &system);
+    let mut target_base_wc = base_wc.clone();
+    let resolved_model = model_config
+        .model_resolver()
+        .resolve(target.model_role())
+        .map_err(std::io::Error::other)?;
+    if resolved_model.source != "default_model" {
+        target_base_wc.model = resolved_model.model;
+    }
+    let wc = worker_config_for(&orb, &target_base_wc, &system);
     tracing::info!(
         orb = %orb.id,
         title = %orb.title,

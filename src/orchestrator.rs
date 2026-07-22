@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 pub use orbs::trace::TerminationReason;
 
+use crate::config::{ModelRole, OrbConfig};
 use crate::coordinator::aggregate::{aggregate_with_prompt_resolver, fallback_concatenate};
 use crate::coordinator::decompose::Subtask;
 use crate::routing::profile::filter_tools;
@@ -37,6 +38,10 @@ pub struct OrchestrateConfig {
     pub worker_env: Vec<(String, String)>,
     /// Routing config for model selection per worker type.
     pub routing: RoutingConfig,
+    /// Layered Orboros config for unified model catalog resolution.
+    pub model_config: Option<OrbConfig>,
+    /// Fallback model when `model_config` is absent in tests or embedded callers.
+    pub worker_default_model: String,
     /// Prompt resolver for worker-type system prompt overrides.
     pub prompt_resolver: crate::prompt::PromptResolver,
     /// Maximum concurrent workers (used in later steps).
@@ -368,7 +373,7 @@ fn prepare_subtask(
         prior_results,
         config.context_result_max_chars,
     );
-    let model = config.routing.model_for(&spec.worker_type);
+    let model = resolve_subtask_model(&spec.worker_type, config)?;
     let profile = config.routing.profile_for(&spec.worker_type);
     let filtered = filter_tools(&spec.tools_needed, profile);
     if !filtered.denied.is_empty() {
@@ -391,7 +396,7 @@ fn prepare_subtask(
         args: config.worker_args.clone(),
         cwd: config.worker_cwd.clone(),
         env: config.worker_env.clone(),
-        model: model.to_string(),
+        model,
         system_prompt: crate::prompt::with_confidence_addendum(&resolved_system),
         tools: filtered.allowed,
         max_iterations: None,
@@ -402,6 +407,17 @@ fn prepare_subtask(
         worker_id: Some(Uuid::new_v4().to_string()),
     };
     Ok((task, prompt, worker_config))
+}
+
+fn resolve_subtask_model(worker_type: &str, config: &OrchestrateConfig) -> anyhow::Result<String> {
+    if let Some(model_config) = &config.model_config {
+        let resolved = model_config
+            .model_resolver()
+            .resolve(ModelRole::Worker(worker_type))?;
+        return Ok(resolved.model);
+    }
+
+    Ok(config.worker_default_model.clone())
 }
 
 /// Executes an order group, running subtasks concurrently if there are multiple.
@@ -605,6 +621,8 @@ mod tests {
             worker_cwd: None,
             worker_env: vec![],
             routing: RoutingConfig::default(),
+            model_config: None,
+            worker_default_model: "mock/test".into(),
             prompt_resolver: crate::prompt::PromptResolver::default(),
             max_concurrency: 1,
             context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
@@ -624,6 +642,8 @@ mod tests {
             worker_cwd: None,
             worker_env: vec![],
             routing: RoutingConfig::default(),
+            model_config: None,
+            worker_default_model: "mock/test".into(),
             prompt_resolver: crate::prompt::PromptResolver::default(),
             max_concurrency: 1,
             context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
@@ -656,6 +676,48 @@ mod tests {
             tools_needed: tools,
             order,
         }
+    }
+
+    #[test]
+    fn resolve_subtask_model_prefers_unified_worker_mapping() {
+        let mut config = test_orchestrate_config();
+        config
+            .routing
+            .rules
+            .push(crate::routing::rules::RoutingRule {
+                worker_type: "research".into(),
+                model: "legacy/research".into(),
+                reason: None,
+            });
+        config.model_config = Some(
+            toml::from_str(
+                r#"
+default_model = "config/default"
+
+[models.options.fast]
+model = "catalog/fast"
+
+[models.workers]
+research = "fast"
+"#,
+            )
+            .unwrap(),
+        );
+
+        let model = resolve_subtask_model("research", &config).unwrap();
+        assert_eq!(model, "catalog/fast");
+    }
+
+    #[test]
+    fn resolve_subtask_model_falls_back_to_config_default_model() {
+        let mut config = test_orchestrate_config();
+        config.model_config = Some(OrbConfig {
+            default_model: "config/default".into(),
+            ..Default::default()
+        });
+
+        let model = resolve_subtask_model("research", &config).unwrap();
+        assert_eq!(model, "config/default");
     }
 
     // --- build_prompt tests ---
@@ -1011,6 +1073,8 @@ mod tests {
             worker_cwd: None,
             worker_env: vec![],
             routing: RoutingConfig::default(),
+            model_config: None,
+            worker_default_model: "mock/test".into(),
             prompt_resolver: crate::prompt::PromptResolver::default(),
             max_concurrency: 1,
             context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
@@ -1307,6 +1371,8 @@ mod tests {
             worker_cwd: None,
             worker_env: vec![],
             routing: RoutingConfig::default(),
+            model_config: None,
+            worker_default_model: "mock/test".into(),
             prompt_resolver: crate::prompt::PromptResolver::default(),
             max_concurrency: 1,
             context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
@@ -1357,6 +1423,8 @@ mod tests {
                 ("MOCK_SEND_DELAY".into(), "10".into()),
             ],
             routing: RoutingConfig::default(),
+            model_config: None,
+            worker_default_model: "mock/test".into(),
             prompt_resolver: crate::prompt::PromptResolver::default(),
             max_concurrency: 1,
             context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
@@ -1495,6 +1563,8 @@ mod tests {
             worker_cwd: None,
             worker_env: vec![],
             routing: RoutingConfig::default(),
+            model_config: None,
+            worker_default_model: "mock/test".into(),
             prompt_resolver: crate::prompt::PromptResolver::default(),
             max_concurrency: 1,
             context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,

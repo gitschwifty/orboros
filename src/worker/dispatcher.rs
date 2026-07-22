@@ -432,6 +432,10 @@ pub fn default_worker_config(
     project_dir: Option<&std::path::Path>,
 ) -> anyhow::Result<WorkerConfig> {
     let cfg = crate::config::load_config_with_home(home, project_dir)?;
+    let model = cfg
+        .model_resolver()
+        .resolve(crate::config::ModelRole::Worker("execute"))?
+        .model;
     let binary = cfg
         .worker_binary
         .ok_or_else(|| anyhow::anyhow!("worker_binary is unset in OrbConfig"))?;
@@ -440,7 +444,7 @@ pub fn default_worker_config(
         args: vec![],
         cwd: None,
         env: vec![],
-        model: cfg.default_model,
+        model,
         system_prompt: String::new(),
         tools: vec![],
         max_iterations: None,
@@ -700,5 +704,28 @@ worker_binary = "/usr/local/bin/heddle"
         let wc = default_worker_config(Some(home.path()), None).unwrap();
         assert_eq!(wc.command, "/usr/local/bin/heddle");
         assert_eq!(wc.model, "anthropic/test");
+    }
+
+    #[test]
+    fn default_worker_config_uses_execute_model_mapping() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg_dir = home.path().join(".orboros");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            r#"
+default_model = "fallback/model"
+worker_binary = "/usr/local/bin/heddle"
+
+[models.options.exec]
+model = "catalog/execute"
+
+[models.workers]
+execute = "exec"
+"#,
+        )
+        .unwrap();
+        let wc = default_worker_config(Some(home.path()), None).unwrap();
+        assert_eq!(wc.model, "catalog/execute");
     }
 }

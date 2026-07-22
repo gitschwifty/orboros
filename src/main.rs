@@ -1064,7 +1064,8 @@ fn cmd_orchestrate(
     let binary = prereq_check(worker_binary, model, skip_prereq_check)?;
     let config = make_worker_config(binary, model, ""); // system prompt set per step
     let project_dir = store.path().parent();
-    let prompt_config = config::load_config(project_dir)?.prompts;
+    let orb_config = config::load_config(project_dir)?;
+    let prompt_config = orb_config.prompts.clone();
     let cli_override =
         orboros::prompt::resolve_cli_system_prompt(system_prompt, system_prompt_file)?;
     let prompt_resolver =
@@ -1108,6 +1109,8 @@ fn cmd_orchestrate(
         worker_cwd: None,
         worker_env: vec![],
         routing,
+        model_config: Some(orb_config),
+        worker_default_model: model.to_string(),
         prompt_resolver,
         max_concurrency: 4,
         context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
