@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 // ── Protocol version ──
 
-pub const PROTOCOL_VERSION: &str = "0.3.0";
+pub const PROTOCOL_VERSION: &str = "0.4.0";
 
 // ── Requests (Orboros → Heddle) ──
 
@@ -44,6 +44,10 @@ pub struct InitConfig {
     pub worker_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_attribution: Option<AppAttribution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimePlacementConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,6 +56,64 @@ pub struct AppAttribution {
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub categories: Option<String>,
+}
+
+/// Requested placement for Heddle's per-worker runtime files.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeMode {
+    Default,
+    Isolated,
+}
+
+/// Optional runtime placement supplied during worker initialization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimePlacementConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<RuntimeMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherit_ambient_config: Option<bool>,
+}
+
+/// Requested or effective provider-routing metadata.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoutingMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grouping_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routed_model: Option<String>,
+}
+
+/// Effective runtime placement reported by Heddle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EffectiveRuntimeMetadata {
+    pub mode: RuntimeMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_root: Option<String>,
+    pub transcript_path: String,
+}
+
+/// Structured termination data reported for a failed worker result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FailureDetails {
+    pub code: String,
+    pub termination_reason: String,
+    pub iterations: u32,
+    pub tool_calls_made: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool_name: Option<String>,
 }
 
 /// Structured error envelope returned by heddle in protocol 0.2.0+.
@@ -76,6 +138,10 @@ pub enum IpcResponse {
         protocol_version: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<ErrorEnvelope>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime: Option<EffectiveRuntimeMetadata>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        routing: Option<RoutingMetadata>,
     },
     Event {
         event: WorkerEvent,
@@ -121,6 +187,12 @@ pub enum IpcResponse {
         /// also extracts `CONFIDENCE: X.XX` from the response body.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         confidence: Option<f32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime: Option<EffectiveRuntimeMetadata>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        routing: Option<RoutingMetadata>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<FailureDetails>,
     },
     StatusOk {
         id: String,
@@ -130,6 +202,10 @@ pub enum IpcResponse {
         messages_count: u64,
         session_id: String,
         active: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        runtime: Option<EffectiveRuntimeMetadata>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        routing: Option<RoutingMetadata>,
     },
     ShutdownOk {
         id: String,
@@ -290,6 +366,8 @@ mod tests {
                     title: "Orboros".into(),
                     categories: Some("cli-agent".into()),
                 }),
+                runtime: None,
+                routing: None,
             },
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -326,6 +404,8 @@ mod tests {
             session_id: "sess-123".into(),
             protocol_version: Some("0.3.0".into()),
             error: None,
+            runtime: None,
+            routing: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
@@ -362,6 +442,9 @@ mod tests {
             tool_latency_ms: None,
             total_latency_ms: None,
             confidence: Some(0.85),
+            runtime: None,
+            routing: None,
+            failure: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
@@ -390,6 +473,9 @@ mod tests {
             tool_latency_ms: None,
             total_latency_ms: None,
             confidence: None,
+            runtime: None,
+            routing: None,
+            failure: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: IpcResponse = serde_json::from_str(&json).unwrap();

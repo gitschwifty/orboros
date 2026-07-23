@@ -70,6 +70,8 @@ fn worker_config(script: &Path) -> WorkerConfig {
         shutdown_timeout: None,
         task_id: None,
         worker_id: None,
+        runtime: None,
+        routing: None,
     }
 }
 

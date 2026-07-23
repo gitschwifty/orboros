@@ -23,5 +23,7 @@ pub fn heddle_config(binary: &str) -> WorkerConfig {
         shutdown_timeout: Some(Duration::from_secs(10)),
         task_id: None,
         worker_id: None,
+        runtime: None,
+        routing: None,
     }
 }

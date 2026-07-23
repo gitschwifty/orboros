@@ -12,7 +12,7 @@ pub use orbs::trace::TerminationReason;
 use crate::config::{ModelRole, OrbConfig};
 use crate::coordinator::aggregate::{aggregate_with_prompt_resolver, fallback_concatenate};
 use crate::coordinator::decompose::Subtask;
-use crate::routing::profile::{filter_tools, profile_for, ToolProfile};
+use crate::routing::profile::{filter_tools, profile_for, resolve_tools, ToolProfile};
 use crate::state::store::TaskStore;
 use crate::state::task::{Task, TaskStatus};
 use crate::worker::budget::BudgetTracker;
@@ -309,6 +309,8 @@ pub async fn orchestrate(
             shutdown_timeout: None,
             task_id: None,
             worker_id: None,
+            runtime: None,
+            routing: None,
         };
 
         match aggregate_with_prompt_resolver(
@@ -397,13 +399,15 @@ fn prepare_subtask(
         env: config.worker_env.clone(),
         model,
         system_prompt: crate::prompt::with_confidence_addendum(&resolved_system),
-        tools: filtered.allowed,
+        tools: resolve_tools(&config.tool_profiles, &spec.worker_type),
         max_iterations: None,
         init_timeout: None,
         send_timeout: None,
         shutdown_timeout: None,
         task_id: Some(task.id.to_string()),
         worker_id: Some(Uuid::new_v4().to_string()),
+        runtime: None,
+        routing: None,
     };
     Ok((task, prompt, worker_config))
 }
@@ -595,6 +599,8 @@ mod tests {
             shutdown_timeout: None,
             task_id: None,
             worker_id: None,
+            runtime: None,
+            routing: None,
         }
     }
 
@@ -617,6 +623,8 @@ mod tests {
             shutdown_timeout: None,
             task_id: None,
             worker_id: None,
+            runtime: None,
+            routing: None,
         }
     }
 
@@ -991,6 +999,8 @@ aggregate = "agg"
             shutdown_timeout: None,
             task_id: None,
             worker_id: None,
+            runtime: None,
+            routing: None,
         };
 
         let mut task = Task::new("Doomed", "This will fail");

@@ -18,6 +18,7 @@ use tracing::{info, instrument, warn};
 use crate::hooks::event::HookEvent;
 use crate::hooks::runner::{FireCtx, FireOutcome};
 use crate::hooks::sink::HookSink;
+use crate::routing::profile::builtin_tools;
 use crate::worker::process::{Worker, WorkerConfig};
 
 /// Reduced view of a worker's `SendOutcome` keyed to what the orb
@@ -446,13 +447,18 @@ pub fn default_worker_config(
         env: vec![],
         model,
         system_prompt: String::new(),
-        tools: vec![],
+        tools: builtin_tools("execute")
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         max_iterations: None,
         init_timeout: None,
         send_timeout: None,
         shutdown_timeout: None,
         task_id: None,
         worker_id: None,
+        runtime: None,
+        routing: None,
     })
 }
 
@@ -676,6 +682,8 @@ mod tests {
             shutdown_timeout: None,
             task_id: None,
             worker_id: None,
+            runtime: None,
+            routing: None,
         }
     }
 

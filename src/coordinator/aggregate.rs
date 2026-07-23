@@ -112,6 +112,8 @@ async fn aggregate_with_system_prompt(
         shutdown_timeout: worker_config.shutdown_timeout,
         task_id: None,
         worker_id: None,
+        runtime: None,
+        routing: None,
     };
 
     info!("Spawning aggregation worker");
@@ -185,6 +187,8 @@ mod tests {
             shutdown_timeout: None,
             task_id: None,
             worker_id: None,
+            runtime: None,
+            routing: None,
         }
     }
 

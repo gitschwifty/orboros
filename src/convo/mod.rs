@@ -560,6 +560,9 @@ mod tests {
             tool_latency_ms: None,
             total_latency_ms: None,
             confidence: None,
+            runtime: None,
+            routing: None,
+            failure: None,
         };
         assert_eq!(turn_status_for(&outcome), TurnStatus::Ok);
         outcome.status = ResultStatus::Cancelled;

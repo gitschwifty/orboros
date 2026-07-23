@@ -32,6 +32,8 @@ fn mock_worker_config() -> WorkerConfig {
         shutdown_timeout: None,
         task_id: None,
         worker_id: None,
+        runtime: None,
+        routing: None,
     }
 }
 

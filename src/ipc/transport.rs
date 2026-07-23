@@ -56,6 +56,8 @@ mod tests {
                 task_id: None,
                 worker_id: None,
                 app_attribution: None,
+                runtime: None,
+                routing: None,
             },
         };
         let json = serde_json::to_string(&req).unwrap();

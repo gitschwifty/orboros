@@ -30,8 +30,10 @@ use tracing::{debug, warn};
 use crate::bench::case::{BenchCase, BenchExpected, BenchRunner, BenchTier};
 use crate::bench::runner::{effective_max_iterations, nonzero_u64, prompt_hash, RunOptions};
 use crate::bench::store::{BenchResult, BenchStatus};
+use crate::ipc::types::{RuntimeMode, RuntimePlacementConfig};
 use crate::phases::decompose::{self, DecompositionPlan};
 use crate::queue_loop::QueueLoop;
+use crate::routing::profile::builtin_tools;
 use crate::worker::process::WorkerConfig;
 
 const MAX_TEST_OUTPUT_CHARS: usize = 2_000;
@@ -276,6 +278,11 @@ pub async fn run_t2_case(
     let mut wc = base_worker_config.clone();
     wc.command = command_for_fixture_cwd(&wc.command)?;
     wc.cwd = Some(workdir.clone());
+    wc.tools = builtin_tools("bench_t2")
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    wc.runtime = artifact_dir.map(benchmark_runtime_placement);
     if let Some(max_iterations) = effective_max_iterations(case, opts) {
         wc.max_iterations = Some(max_iterations);
     }
@@ -410,6 +417,11 @@ async fn run_t2_decompose_case(
     let mut wc = base_worker_config.clone();
     wc.command = command_for_fixture_cwd(&wc.command)?;
     wc.cwd = Some(workdir.clone());
+    wc.tools = builtin_tools("bench_t2")
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    wc.runtime = artifact_dir.map(benchmark_runtime_placement);
     if let Some(max_iterations) = effective_max_iterations(case, opts) {
         wc.max_iterations = Some(max_iterations);
     }
@@ -859,6 +871,30 @@ fn command_for_fixture_cwd(command: &str) -> Result<String, HarnessError> {
     Ok(std::env::current_dir()?.join(path).display().to_string())
 }
 
+fn benchmark_runtime_placement(artifact_dir: &Path) -> RuntimePlacementConfig {
+    let artifact_dir = if artifact_dir.is_absolute() {
+        artifact_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(artifact_dir))
+            .unwrap_or_else(|_| artifact_dir.to_path_buf())
+    };
+    RuntimePlacementConfig {
+        mode: Some(RuntimeMode::Isolated),
+        state_root: Some(
+            artifact_dir
+                .join("heddle")
+                .join("state")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        // Leave the filename to Heddle so concurrent dispatcher workers each
+        // receive a distinct session transcript under `state/sessions/`.
+        transcript_path: None,
+        inherit_ambient_config: Some(false),
+    }
+}
+
 struct TempWorkDir {
     path: PathBuf,
 }
@@ -976,6 +1012,8 @@ mod tests {
             shutdown_timeout: None,
             task_id: None,
             worker_id: None,
+            runtime: None,
+            routing: None,
         }
     }
 

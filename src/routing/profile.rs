@@ -8,6 +8,70 @@ pub struct ToolProfile {
     pub allowed_tools: Vec<String>,
 }
 
+const NONE: &[&str] = &[];
+const READ_ONLY: &[&str] = &["read_file", "glob", "grep"];
+const TEST: &[&str] = &["read_file", "glob", "grep", "bash"];
+const RESEARCH: &[&str] = &["read_file", "glob", "grep", "web_fetch", "write_file"];
+const EDIT: &[&str] = &[
+    "read_file",
+    "write_file",
+    "edit_file",
+    "glob",
+    "grep",
+    "bash",
+];
+
+/// Returns the canonical Heddle tool names for an Orboros worker role.
+#[must_use]
+pub fn builtin_tools(worker_type: &str) -> &'static [&'static str] {
+    match worker_type {
+        "none" | "bench_t1" => NONE,
+        "coordinator" | "review" | "read_only" => READ_ONLY,
+        "test" => TEST,
+        "research" => RESEARCH,
+        "edit" | "execute" | "bench_t2" => EDIT,
+        // Unknown execution roles must never silently become no-tool workers.
+        _ => EDIT,
+    }
+}
+
+/// Resolves a worker role to either its configured profile or the built-in
+/// canonical Heddle capability set.
+#[must_use]
+pub fn resolve_tools(profiles: &BTreeMap<String, ToolProfile>, worker_type: &str) -> Vec<String> {
+    profile_for(profiles, worker_type).map_or_else(
+        || {
+            builtin_tools(worker_type)
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        },
+        |profile| profile.allowed_tools.clone(),
+    )
+}
+
+/// Validates that a config profile only names concrete Heddle tools.
+pub fn validate_profiles(profiles: &BTreeMap<String, ToolProfile>) -> Result<(), String> {
+    for (profile, config) in profiles {
+        for tool in &config.allowed_tools {
+            if !EDIT.contains(&tool.as_str()) && !RESEARCH.contains(&tool.as_str()) {
+                let suggestion = match tool.as_str() {
+                    "read" => Some("read_file"),
+                    "write" => Some("write_file or edit_file"),
+                    "execute" => Some("bash"),
+                    "web_search" => Some("web_fetch"),
+                    _ => None,
+                };
+                let hint = suggestion.map_or_else(String::new, |name| format!("; use `{name}`"));
+                return Err(format!(
+                    "tool_profiles.{profile}.allowed_tools contains unknown Heddle tool `{tool}`{hint}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Returns the tool profile for a worker type, falling back to the
 /// "default" profile when present.
 #[must_use]
@@ -128,5 +192,37 @@ mod tests {
         let result = filter_tools(&requested, Some(&profile));
         assert!(result.allowed.is_empty());
         assert_eq!(result.denied, vec!["read", "write"]);
+    }
+
+    #[test]
+    fn builtins_use_concrete_heddle_tool_names() {
+        assert_eq!(builtin_tools("bench_t1"), NONE);
+        assert_eq!(builtin_tools("coordinator"), READ_ONLY);
+        assert_eq!(builtin_tools("test"), TEST);
+        assert_eq!(builtin_tools("research"), RESEARCH);
+        assert_eq!(builtin_tools("bench_t2"), EDIT);
+    }
+
+    #[test]
+    fn configured_profile_overrides_builtin() {
+        let profiles = BTreeMap::from([(
+            "edit".into(),
+            ToolProfile {
+                allowed_tools: vec!["read_file".into()],
+            },
+        )]);
+        assert_eq!(resolve_tools(&profiles, "edit"), vec!["read_file"]);
+    }
+
+    #[test]
+    fn invalid_alias_is_rejected_with_a_suggestion() {
+        let profiles = BTreeMap::from([(
+            "edit".into(),
+            ToolProfile {
+                allowed_tools: vec!["execute".into()],
+            },
+        )]);
+        let err = validate_profiles(&profiles).unwrap_err();
+        assert!(err.contains("bash"));
     }
 }

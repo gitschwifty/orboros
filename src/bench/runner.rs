@@ -8,6 +8,7 @@
 //! cheap, robust to occasional model noise, and slows the benchmark
 //! by ~3× without requiring provider-specific seed support.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
@@ -15,7 +16,8 @@ use tracing::{info, warn};
 
 use crate::bench::case::{BenchCase, BenchExpected, BenchTier, DEFAULT_TIMEOUT_S};
 use crate::bench::store::{new_run_id, BenchResult, BenchRun, BenchStatus, BenchStore};
-use crate::ipc::types::ResultStatus;
+use crate::ipc::types::{ResultStatus, RuntimeMode, RuntimePlacementConfig};
+use crate::routing::profile::builtin_tools;
 use crate::worker::process::{SendOutcome, Worker, WorkerConfig};
 
 /// Outcome of grading a single attempt's response against the case's
@@ -200,6 +202,22 @@ pub async fn run_t1_case(
     base_worker_config: &WorkerConfig,
     opts: &RunOptions,
 ) -> anyhow::Result<BenchResult> {
+    run_t1_case_with_artifacts(case, run_id, base_worker_config, opts, None).await
+}
+
+/// Runs a T1 case with optional per-attempt Heddle artifact placement.
+///
+/// Benchmark command execution supplies the case artifact directory, while
+/// callers such as focused unit tests can omit it and retain the historical
+/// worker behavior.
+#[allow(clippy::too_many_lines)]
+pub async fn run_t1_case_with_artifacts(
+    case: &BenchCase,
+    run_id: &str,
+    base_worker_config: &WorkerConfig,
+    opts: &RunOptions,
+    artifact_dir: Option<&Path>,
+) -> anyhow::Result<BenchResult> {
     if case.tier != BenchTier::T1 {
         anyhow::bail!("run_t1_case called on non-T1 case {}", case.id);
     }
@@ -234,6 +252,11 @@ pub async fn run_t1_case(
         let mut wc = base_worker_config.clone();
         wc.system_prompt = t1_system_prompt();
         wc.max_iterations = effective_max_iterations(case, opts).or(Some(1));
+        wc.tools = builtin_tools("bench_t1")
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        wc.runtime = artifact_dir.map(|dir| benchmark_runtime_placement(dir, attempt));
 
         let mut worker = match Worker::spawn(&wc).await {
             Ok(w) => w,
@@ -413,6 +436,34 @@ pub async fn run_t1_case(
     })
 }
 
+fn benchmark_runtime_placement(artifact_dir: &Path, attempt: u32) -> RuntimePlacementConfig {
+    let artifact_dir = absolute_artifact_dir(artifact_dir);
+    let worker_dir = artifact_dir
+        .join("heddle")
+        .join(format!("attempt-{attempt}"));
+    RuntimePlacementConfig {
+        mode: Some(RuntimeMode::Isolated),
+        state_root: Some(worker_dir.join("state").to_string_lossy().into_owned()),
+        transcript_path: Some(
+            worker_dir
+                .join("transcript.jsonl")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        inherit_ambient_config: Some(false),
+    }
+}
+
+fn absolute_artifact_dir(path: &Path) -> std::path::PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
 fn add_usage(
     prompt_tokens: &mut u64,
     completion_tokens: &mut u64,
@@ -497,7 +548,13 @@ pub async fn run_t1(
         let timeout_s = effective_timeout_s(case, opts);
         let r = match tokio::time::timeout(
             Duration::from_secs(u64::from(timeout_s)),
-            run_t1_case(case, &run_id, base_worker_config, opts),
+            run_t1_case_with_artifacts(
+                case,
+                &run_id,
+                base_worker_config,
+                opts,
+                Some(&store.case_artifact_dir(&run_id, &case.id)),
+            ),
         )
         .await
         {
@@ -774,7 +831,7 @@ mod tests {
         assert!(is_fatal_worker_error(&result));
 
         result.error =
-            Some("spawn failed: protocol version mismatch: expected 0.3.0, got 0.2.0".into());
+            Some("spawn failed: protocol version mismatch: expected 0.4.0, got 1.0.0".into());
         assert!(is_fatal_worker_error(&result));
 
         result.error = Some("assertion failed in grader".into());

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::routing::profile::ToolProfile;
+use crate::routing::profile::{validate_profiles, ToolProfile};
 
 // ---------------------------------------------------------------------------
 // OrbConfig — layered config (global → project → CLI)
@@ -566,6 +566,7 @@ pub(crate) fn load_config_with_home_and_bench(
         .validate()
         .map_err(|e| anyhow::anyhow!(e))?;
     config.models.validate().map_err(|e| anyhow::anyhow!(e))?;
+    validate_profiles(&config.tool_profiles).map_err(|e| anyhow::anyhow!(e))?;
     Ok(config)
 }
 

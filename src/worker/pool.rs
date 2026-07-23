@@ -277,6 +277,8 @@ mod tests {
             shutdown_timeout: None,
             task_id: None,
             worker_id: None,
+            runtime: None,
+            routing: None,
         }
     }
 
@@ -383,6 +385,8 @@ mod tests {
             shutdown_timeout: None,
             task_id: None,
             worker_id: None,
+            runtime: None,
+            routing: None,
         };
 
         let mut task = Task::new("Doomed", "Will fail");
@@ -509,6 +513,8 @@ mod tests {
             shutdown_timeout: None,
             task_id: None,
             worker_id: None,
+            runtime: None,
+            routing: None,
         };
 
         // Run two failing tasks
@@ -621,6 +627,8 @@ mod tests {
             shutdown_timeout: None,
             task_id: None,
             worker_id: None,
+            runtime: None,
+            routing: None,
         }
     }
 
@@ -699,6 +707,8 @@ mod tests {
             shutdown_timeout: None,
             task_id: None,
             worker_id: None,
+            runtime: None,
+            routing: None,
         };
 
         let mut task = Task::new("Cancelled", "Should not retry");

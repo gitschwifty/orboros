@@ -9,12 +9,13 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use crate::ipc::error::IpcError;
 use crate::ipc::transport::{read_response, write_request};
 use crate::ipc::types::{
-    AppAttribution, ErrorEnvelope, InitConfig, IpcRequest, IpcResponse, ResultStatus, WorkerEvent,
+    AppAttribution, EffectiveRuntimeMetadata, ErrorEnvelope, FailureDetails, InitConfig,
+    IpcRequest, IpcResponse, ResultStatus, RoutingMetadata, RuntimePlacementConfig, WorkerEvent,
     PROTOCOL_VERSION,
 };
 
@@ -47,6 +48,10 @@ pub struct WorkerConfig {
     pub task_id: Option<String>,
     /// Worker ID to send in init config (for trace correlation).
     pub worker_id: Option<String>,
+    /// Optional Heddle runtime placement for this worker.
+    pub runtime: Option<RuntimePlacementConfig>,
+    /// Optional provider-routing metadata for this worker.
+    pub routing: Option<RoutingMetadata>,
 }
 
 /// A running worker process communicating over JSON-line IPC.
@@ -61,6 +66,8 @@ pub struct Worker {
     worker_id: crate::tracing_ctx::WorkerId,
     send_timeout: Option<Duration>,
     shutdown_timeout: Option<Duration>,
+    runtime: Option<EffectiveRuntimeMetadata>,
+    routing: Option<RoutingMetadata>,
 }
 
 /// The outcome of a `send` call, including streamed events and the final result.
@@ -83,6 +90,12 @@ pub struct SendOutcome {
     /// Worker-reported confidence in the result (0.0–1.0), clamped on the
     /// orchestrator side. None when the worker doesn't report one.
     pub confidence: Option<f32>,
+    /// Effective runtime metadata reported with the result.
+    pub runtime: Option<EffectiveRuntimeMetadata>,
+    /// Routing metadata reported with the result.
+    pub routing: Option<RoutingMetadata>,
+    /// Structured worker failure details reported with the result.
+    pub failure: Option<FailureDetails>,
 }
 
 /// Handle for sending a cancel request to a running worker.
@@ -167,6 +180,8 @@ impl Worker {
             worker_id,
             send_timeout: config.send_timeout,
             shutdown_timeout: config.shutdown_timeout,
+            runtime: None,
+            routing: None,
         };
 
         if let Some(dur) = config.init_timeout {
@@ -210,6 +225,8 @@ impl Worker {
                     title: "Orboros".into(),
                     categories: Some("cli-agent".into()),
                 }),
+                runtime: config.runtime.clone(),
+                routing: config.routing.clone(),
             },
         };
 
@@ -227,6 +244,8 @@ impl Worker {
                 session_id,
                 protocol_version,
                 error,
+                runtime,
+                routing,
                 ..
             } => {
                 if let Some(ref envelope) = error {
@@ -236,14 +255,23 @@ impl Worker {
                     });
                 }
                 if let Some(version) = &protocol_version {
-                    if version != PROTOCOL_VERSION {
+                    if !protocol_versions_compatible(PROTOCOL_VERSION, version) {
                         return Err(IpcError::ProtocolVersionMismatch {
                             expected: PROTOCOL_VERSION.into(),
                             actual: version.clone(),
                         });
                     }
+                    if version != PROTOCOL_VERSION {
+                        warn!(
+                            expected = PROTOCOL_VERSION,
+                            actual = version,
+                            "compatible worker protocol minor-version mismatch"
+                        );
+                    }
                 }
                 self.session_id = session_id;
+                self.runtime = runtime;
+                self.routing = routing;
                 Ok(())
             }
             IpcResponse::Result {
@@ -366,6 +394,9 @@ impl Worker {
                     tool_latency_ms,
                     total_latency_ms,
                     confidence,
+                    runtime,
+                    routing,
+                    failure,
                     ..
                 } => {
                     let confidence = resolve_confidence(confidence, &mut response);
@@ -382,6 +413,9 @@ impl Worker {
                         tool_latency_ms,
                         total_latency_ms,
                         confidence,
+                        runtime,
+                        routing,
+                        failure,
                     });
                 }
                 other => {
@@ -519,6 +553,9 @@ impl Worker {
                     tool_latency_ms,
                     total_latency_ms,
                     confidence,
+                    runtime,
+                    routing,
+                    failure,
                     ..
                 } => {
                     let confidence = resolve_confidence(confidence, &mut response);
@@ -535,6 +572,9 @@ impl Worker {
                         tool_latency_ms,
                         total_latency_ms,
                         confidence,
+                        runtime,
+                        routing,
+                        failure,
                     });
                 }
                 _ => {} // ignore other responses during cancel drain
@@ -545,6 +585,14 @@ impl Worker {
 
 fn optional_field(value: Option<&str>) -> &str {
     value.unwrap_or("none")
+}
+
+fn protocol_versions_compatible(expected: &str, actual: &str) -> bool {
+    fn major(version: &str) -> Option<u64> {
+        version.split('.').next()?.parse().ok()
+    }
+
+    matches!((major(expected), major(actual)), (Some(a), Some(b)) if a == b)
 }
 
 /// Clamps worker-reported confidence into `[0.0, 1.0]`. Returns `None` for
@@ -614,6 +662,14 @@ pub const CONFIDENCE_PROMPT_ADDENDUM: &str = "\n\nAt the end of your response, o
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_version_compatibility_requires_matching_major() {
+        assert!(protocol_versions_compatible("0.4.0", "0.3.0"));
+        assert!(protocol_versions_compatible("0.4.0", "0.4.1"));
+        assert!(!protocol_versions_compatible("0.4.0", "1.0.0"));
+        assert!(!protocol_versions_compatible("0.4.0", "not-a-version"));
+    }
 
     #[test]
     fn clamp_confidence_passes_in_range_values() {
@@ -729,6 +785,8 @@ mod tests {
             shutdown_timeout: None,
             task_id: None,
             worker_id: None,
+            runtime: None,
+            routing: None,
         }
     }
 
@@ -751,6 +809,8 @@ mod tests {
             shutdown_timeout: None,
             task_id: None,
             worker_id: None,
+            runtime: None,
+            routing: None,
         }
     }
 
@@ -782,6 +842,8 @@ mod tests {
             shutdown_timeout: None,
             task_id: None,
             worker_id: None,
+            runtime: None,
+            routing: None,
         }
     }
 
@@ -804,6 +866,8 @@ mod tests {
             shutdown_timeout: None,
             task_id: None,
             worker_id: None,
+            runtime: None,
+            routing: None,
         }
     }
 
@@ -871,6 +935,8 @@ mod tests {
             shutdown_timeout: None,
             task_id: None,
             worker_id: None,
+            runtime: None,
+            routing: None,
         };
 
         let worker = Worker::spawn(&config).await.unwrap();
@@ -899,6 +965,8 @@ mod tests {
             shutdown_timeout: Some(Duration::from_secs(5)),
             task_id: None,
             worker_id: None,
+            runtime: None,
+            routing: None,
         };
 
         let mut worker = Worker::spawn(&config).await.unwrap();
@@ -954,6 +1022,8 @@ mod tests {
             shutdown_timeout: None,
             task_id: None,
             worker_id: None,
+            runtime: None,
+            routing: None,
         };
 
         let mut worker = Worker::spawn(&config).await.unwrap();
@@ -1074,6 +1144,8 @@ mod tests {
             shutdown_timeout: None,
             task_id: None,
             worker_id: None,
+            runtime: None,
+            routing: None,
         };
         let worker = Worker::spawn(&config).await.unwrap();
         // Very short grace period — should trigger kill

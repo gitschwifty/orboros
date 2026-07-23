@@ -227,10 +227,10 @@ default = "balanced"
 grader = "fast"
 
 [tool_profiles.edit]
-allowed_tools = ["read", "write", "execute"]
+allowed_tools = ["read_file", "write_file", "edit_file", "glob", "grep", "bash"]
 
 [tool_profiles.research]
-allowed_tools = ["read", "web_search"]
+allowed_tools = ["read_file", "glob", "grep", "web_fetch", "write_file"]
 
 [review]
 requires_approval_by_default = false
@@ -297,8 +297,12 @@ and benchmark roles use their dedicated mappings. Selectors may be catalog keys
 or raw `provider/model` strings.
 
 Tool profiles live in the main config under `[tool_profiles.<worker_type>]`.
-They filter model-requested tools for the legacy `orchestrate` path. A
-`default` profile applies when no exact worker-type profile exists.
+They use concrete Heddle tool names and override the built-in capability set
+for that worker role. Built-ins are `coordinator`/`review` (read-only), `test`
+(read-only plus `bash`), `research` (read/web/write artifact), `edit`, and the
+benchmark roles `bench_t1` (none) and `bench_t2` (edit capability). A `default`
+profile applies when no exact worker-type profile exists. `tools: []` is an
+explicit no-tool allowlist, not a request for Heddle defaults.
 
 `routing.toml` is legacy and remains only as a fallback reader for old tool
 profile files.
@@ -306,7 +310,7 @@ profile files.
 ```toml
 # preferred: .orbs/config.toml
 [tool_profiles.edit]
-allowed_tools = ["read", "write", "glob", "grep"]
+allowed_tools = ["read_file", "write_file", "edit_file", "glob", "grep", "bash"]
 ```
 
 ## Architecture

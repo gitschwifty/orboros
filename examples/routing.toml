@@ -4,13 +4,13 @@
 # projects. This file remains as a profiles-only fallback for older setups.
 
 [profiles.edit]
-allowed_tools = ["read", "write", "execute", "glob", "grep"]
+allowed_tools = ["read_file", "write_file", "edit_file", "bash", "glob", "grep"]
 
 [profiles.research]
-allowed_tools = ["read", "web_search", "glob", "grep"]
+allowed_tools = ["read_file", "web_fetch", "glob", "grep", "write_file"]
 
 [profiles.review]
-allowed_tools = ["read", "glob", "grep"]
+allowed_tools = ["read_file", "glob", "grep"]
 
 [profiles.default]
-allowed_tools = ["read", "write", "execute", "glob", "grep", "web_search"]
+allowed_tools = ["read_file", "write_file", "edit_file", "bash", "glob", "grep", "web_fetch"]

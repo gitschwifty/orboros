@@ -36,6 +36,22 @@
 
 ## Changelog
 
+### 0.4.0
+
+**Summary:** Add isolated headless runtime placement, routing metadata, and
+structured worker failure details for benchmark artifact capture.
+
+**From 0.3.0:**
+- `InitConfig` gains optional `runtime` (`mode`, `state_root`,
+  `transcript_path`, `inherit_ambient_config`) and `routing` metadata.
+- `InitOk`, `StatusOk`, and `Result` gain optional effective `runtime` and
+  `routing` metadata.
+- `Result` gains optional `failure` (`code`, `termination_reason`, iteration
+  and tool-call counts, and the last tool name).
+- Minor protocol versions within the same major version are compatible;
+  Orboros logs a warning rather than rejecting a worker solely for a minor
+  mismatch.
+
 ### 0.3.0
 
 **Summary:** Add routed-model metadata for router aliases such as `openrouter/free`, plus optional app attribution for embedded headless clients.

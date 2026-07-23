@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::ipc::types::ResultStatus;
+use crate::routing::profile::builtin_tools;
 use crate::worker::process::{Worker, WorkerConfig};
 
 /// A subtask produced by the coordinator's decomposition.
@@ -98,13 +99,18 @@ async fn decompose_with_system_prompt(
         env: worker_config.env.clone(),
         model: worker_config.model.clone(),
         system_prompt: system_prompt.into(),
-        tools: vec![],           // coordinator doesn't need tools
-        max_iterations: Some(1), // single-turn, no tool loop
+        tools: builtin_tools("coordinator")
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        max_iterations: Some(4),
         init_timeout: worker_config.init_timeout,
         send_timeout: worker_config.send_timeout,
         shutdown_timeout: worker_config.shutdown_timeout,
         task_id: None,
         worker_id: None,
+        runtime: None,
+        routing: None,
     };
 
     info!("Spawning coordinator worker for task decomposition");

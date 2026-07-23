@@ -71,7 +71,7 @@ while IFS= read -r line; do
   type=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['type'])" 2>/dev/null)
   id=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['id'])" 2>/dev/null)
   case "$type" in
-    init) echo "{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"s\",\"protocol_version\":\"0.2.0\"}" ;;
+    init) echo "{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"s\",\"protocol_version\":\"1.0.0\"}" ;;
     send) echo "{\"type\":\"result\",\"id\":\"$id\",\"status\":\"ok\",\"response\":\"hello\",\"tool_calls_made\":[],\"iterations\":1}" ;;
     shutdown) echo "{\"type\":\"shutdown_ok\",\"id\":\"$id\"}"; exit 0 ;;
   esac
@@ -97,6 +97,8 @@ fn worker_config(script: &Path) -> WorkerConfig {
         shutdown_timeout: None,
         task_id: None,
         worker_id: None,
+        runtime: None,
+        routing: None,
     }
 }
 

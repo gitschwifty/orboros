@@ -59,6 +59,8 @@ fn worker_config(script: &Path) -> WorkerConfig {
         shutdown_timeout: None,
         task_id: None,
         worker_id: Some("worker-test-1".into()),
+        runtime: None,
+        routing: None,
     }
 }
 

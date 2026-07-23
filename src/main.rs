@@ -18,7 +18,7 @@ use orboros::orb_cmd;
 use orboros::orchestrator::{orchestrate, OrchestrateConfig, CONTEXT_RESULT_MAX_CHARS};
 use orboros::plan::{self, PlanConfig};
 use orboros::queue_loop::{DrainResult, QueueLoop};
-use orboros::routing::profile::ToolProfile;
+use orboros::routing::profile::{builtin_tools, ToolProfile};
 use orboros::runner::execute_task;
 use orboros::state::store::TaskStore;
 use orboros::state::task::{Task, TaskStatus};
@@ -610,13 +610,18 @@ fn make_worker_config(binary: &str, model: &str, system_prompt: &str) -> WorkerC
         env: vec![],
         model: model.into(),
         system_prompt: system_prompt.into(),
-        tools: vec![],
+        tools: builtin_tools("execute")
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         max_iterations: None,
         init_timeout: None,
         send_timeout: None,
         shutdown_timeout: None,
         task_id: None,
         worker_id: None,
+        runtime: None,
+        routing: None,
     }
 }
 

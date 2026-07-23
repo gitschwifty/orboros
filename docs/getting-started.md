@@ -174,7 +174,7 @@ worker_type = "edit"
 model = "anthropic/claude-sonnet-4-20250514"
 
 [profiles.edit]
-allowed_tools = ["read", "write", "glob", "grep"]
+allowed_tools = ["read_file", "write_file", "edit_file", "glob", "grep", "bash"]
 ```
 
 See `examples/routing.toml` for a complete example.
