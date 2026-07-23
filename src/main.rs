@@ -2,11 +2,13 @@
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::must_use_candidate)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 
 use orbs::dep_store::DepStore;
+use orbs::id::OrbId;
+use orbs::orb::{Orb, OrbType};
 use orbs::orb_store::OrbStore;
 
 use orboros::config;
@@ -15,17 +17,27 @@ use orboros::daemon::DaemonConfig;
 use orboros::orb_cmd;
 use orboros::orchestrator::{orchestrate, OrchestrateConfig, CONTEXT_RESULT_MAX_CHARS};
 use orboros::plan::{self, PlanConfig};
+use orboros::queue_loop::{DrainResult, QueueLoop};
 use orboros::routing::profile::ToolProfile;
 use orboros::runner::execute_task;
 use orboros::state::store::TaskStore;
 use orboros::state::task::{Task, TaskStatus};
 use orboros::worker::process::WorkerConfig;
 
+const DEFAULT_STATE_DIR: &str = "~/.orboros/default";
+
+#[derive(Debug, Clone)]
+struct EffectiveStateDir {
+    state_dir: PathBuf,
+    project_dir: Option<PathBuf>,
+}
+
 /// Orboros — multi-agent orchestrator.
 #[derive(Parser)]
 #[command(name = "orboros", version, about)]
 struct Cli {
-    /// Path to the project state directory.
+    /// Path to the project state directory. Defaults to nearest ancestor .orbs,
+    /// then ~/.orboros/default.
     #[arg(long, default_value = "~/.orboros/default")]
     state_dir: String,
 
@@ -49,7 +61,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Submit a new task for execution.
+    /// Create a task orb and run the normal queue/dispatch path in the foreground.
     Run {
         /// The task description.
         task: String,
@@ -59,14 +71,14 @@ enum Commands {
         /// Queue only, don't execute immediately.
         #[arg(long)]
         queue: bool,
-        /// Override the system prompt for this worker invocation.
-        #[arg(long)]
-        system_prompt: Option<String>,
-        /// Read the system prompt override from a file.
-        #[arg(long)]
-        system_prompt_file: Option<PathBuf>,
+        /// Maximum foreground queue cycles before giving up.
+        #[arg(long, default_value_t = 20)]
+        max_ticks: u32,
+        /// Delay between foreground queue cycles.
+        #[arg(long, default_value_t = 100)]
+        interval_ms: u64,
     },
-    /// Decompose a task into subtasks without executing.
+    /// Legacy TaskStore: decompose a task into subtasks without executing.
     Decompose {
         /// The high-level task to decompose.
         task: String,
@@ -77,7 +89,7 @@ enum Commands {
         #[arg(long)]
         system_prompt_file: Option<PathBuf>,
     },
-    /// Decompose a task and execute all subtasks.
+    /// Legacy TaskStore: decompose a task and execute all subtasks.
     Orchestrate {
         /// The high-level task to orchestrate.
         task: String,
@@ -91,19 +103,38 @@ enum Commands {
         #[arg(long)]
         system_prompt_file: Option<PathBuf>,
     },
-    /// List tasks, optionally filtered by status.
+    /// Legacy TaskStore: list tasks, optionally filtered by status.
     Tasks {
         /// Filter by status (pending, active, review, done, failed).
         #[arg(short, long)]
         status: Option<String>,
     },
-    /// Show status of a specific task by ID.
+    /// Legacy TaskStore: show status of a specific task by ID.
     Status {
         /// Task ID (UUID).
         id: String,
     },
-    /// List tasks awaiting review.
+    /// Legacy TaskStore: list tasks awaiting review.
     Review,
+    /// Access legacy TaskStore commands backed by tasks.jsonl.
+    Legacy {
+        #[command(subcommand)]
+        action: LegacyAction,
+    },
+    /// Drive the normal orb queue/dispatch path for an existing orb.
+    Execute {
+        /// Orb ID (e.g. orb-k4f).
+        id: String,
+        /// Wait until the target orb reaches a terminal state.
+        #[arg(long)]
+        wait: bool,
+        /// Maximum foreground queue cycles before giving up.
+        #[arg(long, default_value_t = 20)]
+        max_ticks: u32,
+        /// Delay between foreground queue cycles.
+        #[arg(long, default_value_t = 100)]
+        interval_ms: u64,
+    },
     /// Create a plan by decomposing a description into an epic with subtasks.
     Plan {
         /// The task description (or use --file to read from a markdown file).
@@ -231,6 +262,65 @@ enum BenchAction {
         #[arg(long, default_value_t = 10)]
         buckets: usize,
     },
+}
+
+#[derive(Subcommand)]
+enum LegacyAction {
+    /// Submit a new legacy task for execution.
+    Run {
+        /// The task description.
+        task: String,
+        /// Priority (1=highest, 5=lowest).
+        #[arg(short, long, default_value = "3")]
+        priority: u8,
+        /// Queue only, don't execute immediately.
+        #[arg(long)]
+        queue: bool,
+        /// Override the system prompt for this worker invocation.
+        #[arg(long)]
+        system_prompt: Option<String>,
+        /// Read the system prompt override from a file.
+        #[arg(long)]
+        system_prompt_file: Option<PathBuf>,
+    },
+    /// Decompose a legacy task into subtasks without executing.
+    Decompose {
+        /// The high-level task to decompose.
+        task: String,
+        /// Override the decomposition system prompt.
+        #[arg(long)]
+        system_prompt: Option<String>,
+        /// Read the system prompt override from a file.
+        #[arg(long)]
+        system_prompt_file: Option<PathBuf>,
+    },
+    /// Decompose a legacy task and execute all subtasks.
+    Orchestrate {
+        /// The high-level task to orchestrate.
+        task: String,
+        /// Priority for subtasks (1=highest, 5=lowest).
+        #[arg(short, long, default_value = "3")]
+        priority: u8,
+        /// Override all system prompts used by this orchestration.
+        #[arg(long)]
+        system_prompt: Option<String>,
+        /// Read the system prompt override from a file.
+        #[arg(long)]
+        system_prompt_file: Option<PathBuf>,
+    },
+    /// List legacy tasks, optionally filtered by status.
+    Tasks {
+        /// Filter by status (pending, active, review, done, failed).
+        #[arg(short, long)]
+        status: Option<String>,
+    },
+    /// Show status of a specific legacy task by ID.
+    Status {
+        /// Task ID (UUID).
+        id: String,
+    },
+    /// List legacy tasks awaiting review.
+    Review,
 }
 
 #[derive(Subcommand)]
@@ -414,6 +504,53 @@ fn resolve_state_dir(raw: &str) -> PathBuf {
     PathBuf::from(raw)
 }
 
+fn project_dir_for_state_dir(state_dir: &Path) -> Option<PathBuf> {
+    (state_dir.file_name().and_then(|name| name.to_str()) == Some(".orbs"))
+        .then(|| state_dir.parent().map(Path::to_path_buf))
+        .flatten()
+}
+
+fn find_orbs_dir_upwards(start: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    let mut current = Some(start);
+    while let Some(dir) = current {
+        if home.is_some_and(|home| dir == home) {
+            break;
+        }
+        let candidate = dir.join(".orbs");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        current = dir.parent();
+    }
+    None
+}
+
+fn resolve_effective_state_dir(raw: &str) -> EffectiveStateDir {
+    let fallback = resolve_state_dir(raw);
+    if raw != DEFAULT_STATE_DIR {
+        let project_dir = project_dir_for_state_dir(&fallback);
+        return EffectiveStateDir {
+            state_dir: fallback,
+            project_dir,
+        };
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(orbs_dir) = find_orbs_dir_upwards(&cwd, dirs::home_dir().as_deref()) {
+            let project_dir = project_dir_for_state_dir(&orbs_dir);
+            return EffectiveStateDir {
+                state_dir: orbs_dir,
+                project_dir,
+            };
+        }
+    }
+
+    EffectiveStateDir {
+        state_dir: fallback,
+        project_dir: None,
+    }
+}
+
 fn require_binary(worker_binary: Option<&str>) -> anyhow::Result<&str> {
     worker_binary.ok_or_else(|| {
         anyhow::anyhow!("No worker binary configured. Set --worker-binary or HEDDLE_BINARY.")
@@ -497,7 +634,8 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let state_dir = resolve_state_dir(&cli.state_dir);
+    let effective_state = resolve_effective_state_dir(&cli.state_dir);
+    let state_dir = effective_state.state_dir;
     std::fs::create_dir_all(&state_dir)?;
     let store = TaskStore::new(state_dir.join("tasks.jsonl"));
 
@@ -506,17 +644,34 @@ fn main() -> anyhow::Result<()> {
             task,
             priority,
             queue,
-            system_prompt,
-            system_prompt_file,
-        } => cmd_run(
-            &store,
-            cli.worker_binary.as_deref(),
-            &cli.model,
+            max_ticks,
+            interval_ms,
+        } => cmd_run_orb(
+            &state_dir,
+            effective_state.project_dir.as_deref(),
             &task,
             priority,
             queue,
-            system_prompt.as_deref(),
-            system_prompt_file.as_deref(),
+            cli.worker_binary.as_deref(),
+            &cli.model,
+            max_ticks,
+            interval_ms,
+            cli.skip_prereq_check,
+        ),
+        Commands::Execute {
+            id,
+            wait,
+            max_ticks,
+            interval_ms,
+        } => cmd_execute_orb(
+            &state_dir,
+            effective_state.project_dir.as_deref(),
+            &id,
+            wait,
+            cli.worker_binary.as_deref(),
+            &cli.model,
+            max_ticks,
+            interval_ms,
             cli.skip_prereq_check,
         ),
         Commands::Decompose {
@@ -549,6 +704,13 @@ fn main() -> anyhow::Result<()> {
         Commands::Tasks { status } => cmd_tasks(&store, status.as_deref()),
         Commands::Status { id } => cmd_status(&store, &id),
         Commands::Review => cmd_review(&store),
+        Commands::Legacy { action } => cmd_legacy(
+            &store,
+            cli.worker_binary.as_deref(),
+            &cli.model,
+            action,
+            cli.skip_prereq_check,
+        ),
         Commands::Plan {
             description,
             file,
@@ -725,6 +887,64 @@ fn main() -> anyhow::Result<()> {
             cli.worker_binary.as_deref(),
             cli.skip_prereq_check,
         ),
+    }
+}
+
+fn cmd_legacy(
+    store: &TaskStore,
+    worker_binary: Option<&str>,
+    model: &str,
+    action: LegacyAction,
+    skip_prereq_check: bool,
+) -> anyhow::Result<()> {
+    match action {
+        LegacyAction::Run {
+            task,
+            priority,
+            queue,
+            system_prompt,
+            system_prompt_file,
+        } => cmd_legacy_run(
+            store,
+            worker_binary,
+            model,
+            &task,
+            priority,
+            queue,
+            system_prompt.as_deref(),
+            system_prompt_file.as_deref(),
+            skip_prereq_check,
+        ),
+        LegacyAction::Decompose {
+            task,
+            system_prompt,
+            system_prompt_file,
+        } => cmd_decompose(
+            worker_binary,
+            model,
+            &task,
+            system_prompt.as_deref(),
+            system_prompt_file.as_deref(),
+            skip_prereq_check,
+        ),
+        LegacyAction::Orchestrate {
+            task,
+            priority,
+            system_prompt,
+            system_prompt_file,
+        } => cmd_orchestrate(
+            store,
+            worker_binary,
+            model,
+            &task,
+            priority,
+            system_prompt.as_deref(),
+            system_prompt_file.as_deref(),
+            skip_prereq_check,
+        ),
+        LegacyAction::Tasks { status } => cmd_tasks(store, status.as_deref()),
+        LegacyAction::Status { id } => cmd_status(store, &id),
+        LegacyAction::Review => cmd_review(store),
     }
 }
 
@@ -942,8 +1162,146 @@ fn cmd_chat(
     ))
 }
 
+fn foreground_worker_config(
+    project_dir: Option<&std::path::Path>,
+    worker_binary: Option<&str>,
+    model: &str,
+    skip_prereq_check: bool,
+) -> anyhow::Result<WorkerConfig> {
+    let cfg = config::load_config(project_dir)?;
+    let binary_owned;
+    let binary = if let Some(binary) = worker_binary {
+        binary
+    } else {
+        binary_owned = cfg
+            .worker_binary
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("worker_binary is unset in OrbConfig"))?;
+        &binary_owned
+    };
+    let binary = prereq_check(Some(binary), model, skip_prereq_check)?;
+    Ok(make_worker_config(&binary, model, ""))
+}
+
+fn foreground_queue_with_project(
+    state_dir: &std::path::Path,
+    project_dir: Option<&std::path::Path>,
+) -> QueueLoop {
+    let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
+    let dep_store = DepStore::new(state_dir.join("deps.jsonl"));
+    let project_cwd = project_dir
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| state_dir.to_path_buf());
+    let queue = QueueLoop::new(orb_store, dep_store, state_dir.to_path_buf());
+    if let Some(sink) = orboros::hooks::HookSink::from_state_dir(state_dir, &project_cwd)
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to load hooks; continuing without them");
+            None
+        })
+    {
+        queue.with_hooks(sink)
+    } else {
+        queue
+    }
+}
+
+fn print_drain_result(result: &DrainResult) {
+    if let Some(orb) = result.target.as_ref() {
+        println!("Orb:      {}", orb.id);
+        println!("Title:    {}", orb.title);
+        println!("Status:   {:?}", orb.effective_status());
+        println!("Cycles:   {}", result.cycles);
+        println!("Workers:  {}", result.workers_completed);
+        println!("Reason:   {:?}", result.reason);
+        if let Some(response) = orb.result.as_deref() {
+            println!();
+            println!("{response}");
+        }
+    } else {
+        println!("Orb {} not found.", result.target_id);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn cmd_run(
+fn cmd_run_orb(
+    state_dir: &std::path::Path,
+    project_dir: Option<&std::path::Path>,
+    description: &str,
+    priority: u8,
+    queue_only: bool,
+    worker_binary: Option<&str>,
+    model: &str,
+    max_ticks: u32,
+    interval_ms: u64,
+    skip_prereq_check: bool,
+) -> anyhow::Result<()> {
+    let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
+    let mut orb = Orb::new(description, description).with_type(OrbType::Task);
+    orb.priority = priority;
+    orb_store
+        .append(&orb)
+        .map_err(|e| anyhow::anyhow!("failed to append orb: {e}"))?;
+    println!("Created orb {}", orb.id);
+    println!("  priority: {}", orb.priority);
+
+    if queue_only {
+        println!("  status:   pending (queued)");
+        return Ok(());
+    }
+
+    let worker_config =
+        foreground_worker_config(project_dir, worker_binary, model, skip_prereq_check)?;
+    let queue = foreground_queue_with_project(state_dir, project_dir);
+    let rt = tokio::runtime::Runtime::new()?;
+    let result = rt.block_on(queue.drain_target(
+        &orb.id,
+        &worker_config,
+        1,
+        true,
+        max_ticks,
+        std::time::Duration::from_millis(interval_ms),
+    ))?;
+    print_drain_result(&result);
+    if !result.target_terminal() {
+        anyhow::bail!("orb did not reach a terminal state: {:?}", result.reason);
+    }
+    Ok(())
+}
+
+fn cmd_execute_orb(
+    state_dir: &std::path::Path,
+    project_dir: Option<&std::path::Path>,
+    id: &str,
+    wait: bool,
+    worker_binary: Option<&str>,
+    model: &str,
+    max_ticks: u32,
+    interval_ms: u64,
+    skip_prereq_check: bool,
+) -> anyhow::Result<()> {
+    let target_id = OrbId::from_raw(id);
+    let worker_config =
+        foreground_worker_config(project_dir, worker_binary, model, skip_prereq_check)?;
+    let queue = foreground_queue_with_project(state_dir, project_dir);
+    let rt = tokio::runtime::Runtime::new()?;
+    let result = rt.block_on(queue.drain_target(
+        &target_id,
+        &worker_config,
+        1,
+        wait,
+        max_ticks,
+        std::time::Duration::from_millis(interval_ms),
+    ))?;
+    print_drain_result(&result);
+    if wait && !result.target_terminal() {
+        anyhow::bail!("orb did not reach a terminal state: {:?}", result.reason);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_legacy_run(
     store: &TaskStore,
     worker_binary: Option<&str>,
     model: &str,
@@ -1372,6 +1730,143 @@ fn parse_status(s: &str) -> anyhow::Result<TaskStatus> {
         "failed" => Ok(TaskStatus::Failed),
         other => {
             anyhow::bail!("unknown status: {other}. Use: pending, active, review, done, failed")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_legacy_tasks_namespace() {
+        let cli = Cli::parse_from(["orboros", "legacy", "tasks", "--status", "done"]);
+
+        match cli.command {
+            Commands::Legacy {
+                action: LegacyAction::Tasks { status },
+            } => assert_eq!(status.as_deref(), Some("done")),
+            _ => panic!("expected legacy tasks command"),
+        }
+    }
+
+    #[test]
+    fn parses_legacy_run_namespace() {
+        let cli = Cli::parse_from([
+            "orboros",
+            "--model",
+            "openrouter/free",
+            "legacy",
+            "run",
+            "do the thing",
+            "--priority",
+            "2",
+            "--queue",
+        ]);
+
+        match cli.command {
+            Commands::Legacy {
+                action:
+                    LegacyAction::Run {
+                        task,
+                        priority,
+                        queue,
+                        ..
+                    },
+            } => {
+                assert_eq!(task, "do the thing");
+                assert_eq!(priority, 2);
+                assert!(queue);
+            }
+            _ => panic!("expected legacy run command"),
+        }
+    }
+
+    #[test]
+    fn top_level_run_parses_as_orb_backed_command() {
+        let cli = Cli::parse_from([
+            "orboros",
+            "run",
+            "do the thing",
+            "--priority",
+            "2",
+            "--max-ticks",
+            "3",
+        ]);
+
+        match cli.command {
+            Commands::Run {
+                task,
+                priority,
+                queue,
+                max_ticks,
+                ..
+            } => {
+                assert_eq!(task, "do the thing");
+                assert_eq!(priority, 2);
+                assert!(!queue);
+                assert_eq!(max_ticks, 3);
+            }
+            _ => panic!("expected top-level orb-backed run command"),
+        }
+    }
+
+    #[test]
+    fn parses_execute_wait_command() {
+        let cli = Cli::parse_from(["orboros", "execute", "orb-k4f", "--wait"]);
+
+        match cli.command {
+            Commands::Execute { id, wait, .. } => {
+                assert_eq!(id, "orb-k4f");
+                assert!(wait);
+            }
+            _ => panic!("expected execute command"),
+        }
+    }
+
+    #[test]
+    fn finds_orbs_dir_in_ancestor_before_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let nested = project.join("a/b/c");
+        std::fs::create_dir_all(project.join(".orbs")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let found = find_orbs_dir_upwards(&nested, Some(tmp.path()));
+
+        assert_eq!(found.as_deref(), Some(project.join(".orbs").as_path()));
+    }
+
+    #[test]
+    fn ignores_orbs_dir_at_home_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("work/project");
+        std::fs::create_dir_all(tmp.path().join(".orbs")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let found = find_orbs_dir_upwards(&nested, Some(tmp.path()));
+
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn explicit_orbs_state_dir_sets_project_root() {
+        let state = PathBuf::from("/tmp/project/.orbs");
+
+        assert_eq!(
+            project_dir_for_state_dir(&state).as_deref(),
+            Some(Path::new("/tmp/project"))
+        );
+    }
+
+    #[test]
+    fn top_level_tasks_remains_compat_alias() {
+        let cli = Cli::parse_from(["orboros", "tasks"]);
+
+        match cli.command {
+            Commands::Tasks { status } => assert!(status.is_none()),
+            _ => panic!("expected top-level tasks compatibility alias"),
         }
     }
 }

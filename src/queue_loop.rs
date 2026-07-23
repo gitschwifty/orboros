@@ -35,6 +35,44 @@ impl TickResult {
     }
 }
 
+/// Result of running the queue in the foreground for a target orb.
+#[derive(Debug, Clone)]
+pub struct DrainResult {
+    /// Target orb id.
+    pub target_id: OrbId,
+    /// Number of queue cycles performed.
+    pub cycles: u32,
+    /// Number of workers that completed successfully during the drain.
+    pub workers_completed: u32,
+    /// The target orb, if it still exists.
+    pub target: Option<Orb>,
+    /// Why the foreground loop stopped.
+    pub reason: DrainStopReason,
+}
+
+/// Reason a foreground queue drain stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrainStopReason {
+    /// The target orb reached Done, Failed, Cancelled, or Tombstone.
+    TargetTerminal,
+    /// One queue/dispatch cycle completed and the caller did not ask to wait.
+    SingleCycle,
+    /// The queue became idle before the target reached a terminal state.
+    Idle,
+    /// The configured maximum cycle count was reached.
+    MaxCycles,
+    /// The target orb no longer exists in the store.
+    MissingTarget,
+}
+
+impl DrainResult {
+    /// Returns true when the target orb reached a terminal state.
+    #[must_use]
+    pub fn target_terminal(&self) -> bool {
+        self.reason == DrainStopReason::TargetTerminal
+    }
+}
+
 /// Main daemon loop that drives the orb pipeline.
 ///
 /// Polls stores for work and advances orbs through their lifecycle.
@@ -566,6 +604,110 @@ impl QueueLoop {
         }
         Ok(completed)
     }
+
+    /// Runs queue transitions and worker dispatch in the foreground until a
+    /// target orb reaches a terminal state, the queue becomes idle, or the
+    /// cycle limit is reached.
+    ///
+    /// This is the foreground counterpart to the daemon loop: it uses the same
+    /// `tick_async` and `dispatch_ready_orbs` calls, but has a target-specific
+    /// stopping condition so commands can wait on one orb without starting the
+    /// background daemon.
+    ///
+    /// # Errors
+    ///
+    /// Returns an IO error if queue ticking, dispatch, hook firing, or store
+    /// reads fail.
+    pub async fn drain_target(
+        &self,
+        target_id: &OrbId,
+        base_worker_config: &crate::worker::process::WorkerConfig,
+        max_concurrency: usize,
+        wait: bool,
+        max_cycles: u32,
+        interval: std::time::Duration,
+    ) -> std::io::Result<DrainResult> {
+        let max_cycles = max_cycles.max(1);
+        let mut cycles = 0u32;
+        let mut workers_completed = 0u32;
+
+        loop {
+            let Some(before) = self.orb_store.load_by_id(target_id)? else {
+                return Ok(DrainResult {
+                    target_id: target_id.clone(),
+                    cycles,
+                    workers_completed,
+                    target: None,
+                    reason: DrainStopReason::MissingTarget,
+                });
+            };
+            if is_terminal(&before) {
+                return Ok(DrainResult {
+                    target_id: target_id.clone(),
+                    cycles,
+                    workers_completed,
+                    target: Some(before),
+                    reason: DrainStopReason::TargetTerminal,
+                });
+            }
+
+            let tick = self.tick_async().await?;
+            let dispatched = self
+                .dispatch_ready_orbs(base_worker_config, max_concurrency)
+                .await?;
+            self.fire_on_queue_tick().await;
+
+            cycles = cycles.saturating_add(1);
+            workers_completed = workers_completed.saturating_add(dispatched);
+
+            let target = self.orb_store.load_by_id(target_id)?;
+            if target.as_ref().is_none_or(is_terminal) {
+                return Ok(DrainResult {
+                    target_id: target_id.clone(),
+                    cycles,
+                    workers_completed,
+                    target,
+                    reason: DrainStopReason::TargetTerminal,
+                });
+            }
+            if !wait {
+                return Ok(DrainResult {
+                    target_id: target_id.clone(),
+                    cycles,
+                    workers_completed,
+                    target,
+                    reason: DrainStopReason::SingleCycle,
+                });
+            }
+            if cycles >= max_cycles {
+                return Ok(DrainResult {
+                    target_id: target_id.clone(),
+                    cycles,
+                    workers_completed,
+                    target,
+                    reason: DrainStopReason::MaxCycles,
+                });
+            }
+            if tick.is_idle() && dispatched == 0 {
+                return Ok(DrainResult {
+                    target_id: target_id.clone(),
+                    cycles,
+                    workers_completed,
+                    target,
+                    reason: DrainStopReason::Idle,
+                });
+            }
+
+            tokio::time::sleep(interval).await;
+        }
+    }
+}
+
+fn is_terminal(orb: &Orb) -> bool {
+    matches!(
+        orb.effective_status(),
+        TaskStatus::Done | TaskStatus::Failed | TaskStatus::Cancelled
+    )
 }
 
 /// Indexes the slice by `parent_id`, returning a map from each
@@ -779,6 +921,47 @@ mod tests {
         let result = ql.tick().unwrap();
         assert!(result.is_idle());
         assert_eq!(result, TickResult::default());
+    }
+
+    #[tokio::test]
+    async fn drain_target_stops_immediately_for_terminal_target() {
+        let (_tmp, orb_store, dep_store, base) = setup();
+        let mut orb = Orb::new("Done", "Already complete").with_type(OrbType::Task);
+        orb.set_status(OrbStatus::Active).unwrap();
+        orb.set_status(OrbStatus::Done).unwrap();
+        orb_store.append(&orb).unwrap();
+        let ql = QueueLoop::new(orb_store, dep_store, base);
+        let wc = crate::worker::process::WorkerConfig {
+            command: "unused".into(),
+            args: vec![],
+            cwd: None,
+            env: vec![],
+            model: "mock/drain".into(),
+            system_prompt: String::new(),
+            tools: vec![],
+            max_iterations: None,
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
+        };
+
+        let result = ql
+            .drain_target(
+                &orb.id,
+                &wc,
+                1,
+                true,
+                10,
+                std::time::Duration::from_millis(1),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.reason, DrainStopReason::TargetTerminal);
+        assert_eq!(result.cycles, 0);
+        assert_eq!(result.workers_completed, 0);
     }
 
     // ── tick detects pipeline orbs ───────────────────────────────────

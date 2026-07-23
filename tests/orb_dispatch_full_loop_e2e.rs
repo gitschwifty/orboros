@@ -16,7 +16,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use orboros::queue_loop::QueueLoop;
+use orboros::queue_loop::{DrainStopReason, QueueLoop};
 use orboros::second_opinion_trigger::apply_review_outcome;
 use orboros::worker::process::WorkerConfig;
 use orbs::dep_store::DepStore;
@@ -122,6 +122,39 @@ async fn full_loop_pending_to_done_via_tick_and_dispatch() {
     assert!(after_dispatch.execution.is_some());
     let exec = after_dispatch.execution.unwrap();
     assert_eq!(exec.worker_model.as_deref(), Some("mock/full-loop"));
+}
+
+#[tokio::test]
+async fn drain_target_runs_pending_task_to_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_worker_script(dir.path(), "drain-ok.sh", "foreground done", Some(0.91));
+    let wc = worker_config(&script);
+
+    let base = dir.path().to_path_buf();
+    let orb_store = OrbStore::new(base.join("orbs.jsonl"));
+    let dep_store = DepStore::new(base.join("deps.jsonl"));
+
+    let orb = Orb::new("Foreground task", "Run it now").with_type(OrbType::Task);
+    orb_store.append(&orb).unwrap();
+
+    let ql = QueueLoop::new(orb_store.clone(), dep_store, base);
+    let result = ql
+        .drain_target(
+            &orb.id,
+            &wc,
+            1,
+            true,
+            5,
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.reason, DrainStopReason::TargetTerminal);
+    assert_eq!(result.workers_completed, 1);
+    let loaded = orb_store.load_by_id(&orb.id).unwrap().unwrap();
+    assert_eq!(loaded.status, Some(OrbStatus::Done));
+    assert_eq!(loaded.result.as_deref(), Some("foreground done"));
 }
 
 // ── Revise re-entry: Done → Active via apply_review_outcome ──────

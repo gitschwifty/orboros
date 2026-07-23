@@ -13,22 +13,25 @@ Two crates:
 
 ```bash
 # Initialize a project
-cargo run -- init
+orboros init
 
 # Create an orb (work item)
-cargo run -- orb create "Add authentication" --type task --priority 2
+orboros orb create "Add authentication" --type task --priority 2
+
+# Run a single task orb in the foreground
+orboros run "What is the capital of France?"
 
 # Plan an epic (decompose into subtasks)
-cargo run -- plan "Build user management system"
+orboros plan "Build user management system"
 
-# Run a single task via worker
-cargo run -- run "What is the capital of France?"
+# Drive an existing orb through the foreground queue path
+orboros execute orb-k4f --wait
 
-# Full orchestration: decompose + route + execute
-cargo run -- orchestrate "Refactor the authentication module"
+# Legacy full orchestration: decompose + route + execute
+orboros legacy orchestrate "Refactor the authentication module"
 
 # Start the daemon (background processing)
-cargo run -- daemon
+orboros daemon
 ```
 
 ## CLI Commands
@@ -37,11 +40,13 @@ cargo run -- daemon
 
 | Command | Description |
 |---------|-------------|
-| `run <task>` | Execute a single task directly via worker |
-| `decompose <task>` | Break into subtasks, print plan |
-| `orchestrate <task>` | Decompose + execute all subtasks |
+| `run <task>` | Create a task orb and run queue/dispatch in the foreground |
+| `execute <orb-id> --wait` | Drive an existing orb with the foreground queue |
 | `plan <description>` | Create an epic with shallow decomposition |
 | `plan --file <path>` | Plan from a markdown file |
+| `legacy run <task>` | Execute a legacy `tasks.jsonl` task directly via worker |
+| `legacy decompose <task>` | Break a legacy task into subtasks, print plan |
+| `legacy orchestrate <task>` | Legacy TaskStore decompose + execute flow |
 
 ### Orb Management
 
@@ -65,15 +70,15 @@ cargo run -- daemon
 | `daemon` | Start background queue loop |
 | `daemon --stop` | Stop running daemon |
 | `daemon --status` | Check daemon status |
-| `tasks [-s status]` | List legacy tasks |
-| `status <id>` | Show legacy task details |
-| `review` | List tasks awaiting review |
+| `legacy tasks [-s status]` | List legacy tasks |
+| `legacy status <id>` | Show legacy task details |
+| `legacy review` | List legacy tasks awaiting review |
 
 ### Global Options
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--state-dir` | — | `~/.orboros/default` | Project state directory |
+| `--state-dir` | — | nearest ancestor `.orbs`, then `~/.orboros/default` | Project state directory |
 | `--worker-binary` | `HEDDLE_BINARY` | — | Path to heddle-headless binary |
 | `--model` | — | `openrouter/free` | Default model |
 
@@ -340,8 +345,8 @@ just bench-init ../orboros-bench # create private sibling bench corpus dirs
 just bench-list ../orboros-bench # list benchmark cases
 just bench-run t1 ../orboros-bench
 just bench-run-model kimi t1 kimi-smoke ../orboros-bench
-cargo run -- bench --bench-root ../orboros-bench --bench-config ../orboros-bench/config.toml run --tier t1
-cargo run -- bench --bench-root ../orboros-bench details <run-id>
+orboros bench --bench-root ../orboros-bench --bench-config ../orboros-bench/config.toml run --tier t1
+orboros bench --bench-root ../orboros-bench details <run-id>
 ```
 
 Bench runs can set overall caps in config; individual cases can override these:

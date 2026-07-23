@@ -8,7 +8,7 @@ orboros [OPTIONS] <COMMAND>
 
 | Option | Env Var | Default | Description |
 |--------|---------|---------|-------------|
-| `--state-dir <PATH>` | — | `~/.orboros/default` | Project state directory |
+| `--state-dir <PATH>` | — | nearest ancestor `.orbs`, then `~/.orboros/default` | Project state directory |
 | `--worker-binary <PATH>` | `HEDDLE_BINARY` | — | Path to heddle-headless binary |
 | `--model <MODEL>` | — | `openrouter/free` | Default model for workers |
 
@@ -24,15 +24,56 @@ orboros init
 
 Creates `.orbs/` with `config.toml` and `orbs.jsonl`. Registers the project in `~/.orboros/projects.toml`.
 
+When `--state-dir` is omitted, Orboros searches upward from the current
+directory for a `.orbs` directory, stopping at home. If none is found, it falls
+back to `~/.orboros/default`.
+
 ---
 
 ### `run <TASK>`
 
-Execute a single task directly via a worker.
+Create a task orb, run the normal queue transition plus worker dispatch path in
+the foreground, print the persisted result, and exit.
 
 ```bash
 orboros run "Explain how JWT works" --priority 2
-orboros run "Fix the bug" --queue  # queue only, don't execute
+orboros run "Fix the bug" --queue  # create the orb only
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--priority, -p <N>` | 3 | Priority 1-5 |
+| `--queue` | false | Create the orb without foreground execution |
+| `--max-ticks <N>` | 20 | Maximum foreground queue cycles |
+| `--interval-ms <MS>` | 100 | Delay between foreground queue cycles |
+
+---
+
+### `execute <ORB_ID>`
+
+Drive the normal orb queue/dispatch path for an existing orb. Without `--wait`,
+this performs one foreground queue cycle. With `--wait`, it loops until the
+target orb reaches a terminal state, the queue becomes idle, or `--max-ticks`
+is reached.
+
+```bash
+orboros execute orb-k4f
+orboros execute orb-k4f --wait --max-ticks 50
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--wait` | false | Continue until the target orb is terminal |
+| `--max-ticks <N>` | 20 | Maximum foreground queue cycles |
+| `--interval-ms <MS>` | 100 | Delay between foreground queue cycles |
+
+### `legacy run <TASK>`
+
+Execute a single legacy `tasks.jsonl` task directly via a worker.
+
+```bash
+orboros legacy run "Explain how JWT works" --priority 2
+orboros legacy run "Fix the bug" --queue  # queue only, don't execute
 ```
 
 | Option | Default | Description |
@@ -46,11 +87,15 @@ orboros run "Fix the bug" --queue  # queue only, don't execute
 
 ### `decompose <TASK>`
 
-Break a task into subtasks using the coordinator LLM. Prints the plan without executing.
+Legacy compatibility alias for `legacy decompose`.
+
+### `legacy decompose <TASK>`
+
+Break a legacy task into subtasks using the coordinator LLM. Prints the plan without executing.
 
 ```bash
-orboros decompose "Add error handling to the REST API"
-orboros decompose "Add error handling" --system-prompt-file prompts/decompose-v2.md
+orboros legacy decompose "Add error handling to the REST API"
+orboros legacy decompose "Add error handling" --system-prompt-file prompts/decompose-v2.md
 ```
 
 | Option | Description |
@@ -62,10 +107,15 @@ orboros decompose "Add error handling" --system-prompt-file prompts/decompose-v2
 
 ### `orchestrate <TASK>`
 
-Full orchestration: decompose into subtasks, route to models, execute, aggregate results.
+Legacy compatibility alias for `legacy orchestrate`.
+
+### `legacy orchestrate <TASK>`
+
+Legacy full orchestration: decompose into subtasks, route to models, execute,
+aggregate results in `tasks.jsonl`.
 
 ```bash
-orboros orchestrate "Refactor the authentication module" --priority 2
+orboros legacy orchestrate "Refactor the authentication module" --priority 2
 ```
 
 | Option | Default | Description |
@@ -238,18 +288,30 @@ orboros daemon --stop
 
 ### `tasks`
 
+Legacy compatibility alias for `legacy tasks`.
+
+### `legacy tasks`
+
 List legacy tasks (from `tasks.jsonl`).
 
 ```bash
-orboros tasks
-orboros tasks --status done
+orboros legacy tasks
+orboros legacy tasks --status done
 ```
 
 ### `status <ID>`
 
+Legacy compatibility alias for `legacy status`.
+
+### `legacy status <ID>`
+
 Show details for a legacy task by UUID.
 
 ### `review`
+
+Legacy compatibility alias for `legacy review`.
+
+### `legacy review`
 
 List legacy tasks awaiting review.
 
