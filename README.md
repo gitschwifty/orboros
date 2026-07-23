@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/orboros-icon.png" alt="Orboros" width="128">
+</p>
+
 # Orboros
 
 Multi-agent orchestrator and ticketing system for software development. Decomposes complex work into orbs (tracked work items), manages dependencies and lifecycles, and executes through worker processes with cancellation, budgets, retries, and tracing.
