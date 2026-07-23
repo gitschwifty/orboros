@@ -1,32 +1,8 @@
-# Example routing config for orboros.
-# Place as routing.toml in your state directory (default: ~/.orboros/default/).
+# Legacy routing.toml compatibility example.
 #
-# Maps worker types (from coordinator decomposition) to models.
-# Worker types: research, edit, review, test
+# Prefer `[tool_profiles.<worker_type>]` in `.orbs/config.toml` for new
+# projects. This file remains as a profiles-only fallback for older setups.
 
-default_model = "openrouter/auto"
-
-[[rules]]
-worker_type = "research"
-model = "google/gemini-2.0-flash-001"
-reason = "cheap, fast for search/summarize tasks"
-
-[[rules]]
-worker_type = "edit"
-model = "anthropic/claude-sonnet-4-20250514"
-reason = "good at code generation and editing"
-
-[[rules]]
-worker_type = "review"
-model = "google/gemini-2.0-flash-001"
-reason = "cheap for read-only review"
-
-[[rules]]
-worker_type = "test"
-model = "google/gemini-2.0-flash-001"
-reason = "cheap for test generation"
-
-# Tool profiles — restrict which tools each worker type can use.
 [profiles.edit]
 allowed_tools = ["read", "write", "execute", "glob", "grep"]
 

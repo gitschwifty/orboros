@@ -217,6 +217,12 @@ refining = "balanced"
 default = "balanced"
 grader = "fast"
 
+[tool_profiles.edit]
+allowed_tools = ["read", "write", "execute"]
+
+[tool_profiles.research]
+allowed_tools = ["read", "web_search"]
+
 [review]
 requires_approval_by_default = false
 review_on_completion = true
@@ -274,27 +280,23 @@ the current orb, parent/root summaries, sibling/child awareness, and upstream
 dependency results/status. Heddle remains responsible for project context such
 as `AGENTS.md`.
 
-## Model Routing
+## Model Routing And Tool Profiles
 
 Model selection now resolves through the `[models]` catalog first. Worker
 roles use `[models.workers]`; phase dispatch uses `[models.phases]`; reviewer
 and benchmark roles use their dedicated mappings. Selectors may be catalog keys
-or raw `provider/model` strings. `routing.toml` is legacy and remains relevant
-only for tool profiles until those move into the main config surface.
+or raw `provider/model` strings.
+
+Tool profiles live in the main config under `[tool_profiles.<worker_type>]`.
+They filter model-requested tools for the legacy `orchestrate` path. A
+`default` profile applies when no exact worker-type profile exists.
+
+`routing.toml` is legacy and remains only as a fallback reader for old tool
+profile files.
 
 ```toml
-# routing.toml in state directory
-default_model = "openrouter/auto"
-
-[[rules]]
-worker_type = "research"
-model = "google/gemini-2.0-flash-001"
-
-[[rules]]
-worker_type = "edit"
-model = "anthropic/claude-sonnet-4-20250514"
-
-[profiles.edit]
+# preferred: .orbs/config.toml
+[tool_profiles.edit]
 allowed_tools = ["read", "write", "glob", "grep"]
 ```
 
@@ -317,7 +319,7 @@ src/
   bench/                  # Benchmark corpus harness
   coordinator/            # LLM-powered decomposition + aggregation
   ipc/                    # JSON-line protocol with heddle workers
-  routing/                # Model selection + tool profiles
+  routing/                # Legacy tool profile compatibility
   worker/                 # Process lifecycle, pool, budget, FSM
   phases/                 # Pipeline phase implementations
     speccing.rs

@@ -9,8 +9,7 @@
 //!
 //! The split keeps `runs.jsonl` small enough to scan for the CLI's
 //! `bench list-runs` while keeping each run's artifacts in a
-//! self-contained dated directory. Reads still fall back to the old
-//! flat `results-<run_id>.jsonl` layout.
+//! self-contained dated directory.
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs::OpenOptions;
@@ -219,12 +218,6 @@ impl BenchStore {
             .join(sanitize_path_component(case_id))
     }
 
-    /// Legacy flat results path used before per-run directories.
-    #[must_use]
-    pub fn legacy_results_path(&self, run_id: &str) -> PathBuf {
-        self.bench_dir.join(format!("results-{run_id}.jsonl"))
-    }
-
     /// Appends a result row to `<date>/<run_id>/results.jsonl`.
     ///
     /// # Errors
@@ -272,11 +265,7 @@ impl BenchStore {
     ///
     /// As [`Self::read_runs`].
     pub fn read_results(&self, run_id: &str) -> Result<Vec<BenchResult>, StoreError> {
-        let results = read_jsonl(&self.results_path(run_id))?;
-        if results.is_empty() {
-            return read_jsonl(&self.legacy_results_path(run_id));
-        }
-        Ok(results)
+        read_jsonl(&self.results_path(run_id))
     }
 }
 
@@ -598,17 +587,6 @@ mod tests {
         let store = BenchStore::new(dir.path().join("bench"));
         assert!(store.read_runs().unwrap().is_empty());
         assert!(store.read_results("nonexistent").unwrap().is_empty());
-    }
-
-    #[test]
-    fn read_results_falls_back_to_legacy_flat_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = BenchStore::new(dir.path().join("bench"));
-        std::fs::create_dir_all(dir.path().join("bench")).unwrap();
-        let r = sample_result("legacy-run", "case-a");
-        append_jsonl(&store.legacy_results_path("legacy-run"), &r).unwrap();
-        let read = store.read_results("legacy-run").unwrap();
-        assert_eq!(read, vec![r]);
     }
 
     #[test]

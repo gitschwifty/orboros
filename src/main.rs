@@ -15,7 +15,7 @@ use orboros::daemon::DaemonConfig;
 use orboros::orb_cmd;
 use orboros::orchestrator::{orchestrate, OrchestrateConfig, CONTEXT_RESULT_MAX_CHARS};
 use orboros::plan::{self, PlanConfig};
-use orboros::routing::rules::RoutingConfig;
+use orboros::routing::profile::ToolProfile;
 use orboros::runner::execute_task;
 use orboros::state::store::TaskStore;
 use orboros::state::task::{Task, TaskStatus};
@@ -442,14 +442,16 @@ fn prereq_check(worker_binary: Option<&str>, model: &str, skip: bool) -> anyhow:
         .to_string())
 }
 
-fn load_routing_config(state_dir: Option<&std::path::Path>) -> RoutingConfig {
+fn load_legacy_tool_profiles(
+    state_dir: Option<&std::path::Path>,
+) -> std::collections::BTreeMap<String, ToolProfile> {
     if let Some(dir) = state_dir {
         let config_path = dir.join("routing.toml");
         if let Ok(content) = std::fs::read_to_string(&config_path) {
             match orboros::routing::rules::parse_routing_config(&content) {
                 Ok(config) => {
-                    tracing::info!("Loaded routing config from {}", config_path.display());
-                    return config;
+                    tracing::info!("Loaded legacy tool profiles from {}", config_path.display());
+                    return config.profiles.into_iter().collect();
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -460,7 +462,7 @@ fn load_routing_config(state_dir: Option<&std::path::Path>) -> RoutingConfig {
             }
         }
     }
-    RoutingConfig::default()
+    std::collections::BTreeMap::new()
 }
 
 fn make_worker_config(binary: &str, model: &str, system_prompt: &str) -> WorkerConfig {
@@ -1091,14 +1093,16 @@ fn cmd_orchestrate(
     }
     println!();
 
-    // Load routing config and build orchestrate config
-    let routing = load_routing_config(project_dir);
+    // Prefer first-class tool profiles from OrbConfig, with routing.toml
+    // retained only as a legacy fallback for existing profile files.
+    let mut tool_profiles = load_legacy_tool_profiles(project_dir);
+    tool_profiles.extend(orb_config.tool_profiles.clone());
     let orch_config = OrchestrateConfig {
         worker_binary: binary.to_string(),
         worker_args: vec![],
         worker_cwd: None,
         worker_env: vec![],
-        routing,
+        tool_profiles,
         model_config: Some(orb_config),
         worker_default_model: model.to_string(),
         prompt_resolver,

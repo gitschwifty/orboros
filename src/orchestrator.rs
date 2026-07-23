@@ -12,8 +12,7 @@ pub use orbs::trace::TerminationReason;
 use crate::config::{ModelRole, OrbConfig};
 use crate::coordinator::aggregate::{aggregate_with_prompt_resolver, fallback_concatenate};
 use crate::coordinator::decompose::Subtask;
-use crate::routing::profile::filter_tools;
-use crate::routing::rules::RoutingConfig;
+use crate::routing::profile::{filter_tools, profile_for, ToolProfile};
 use crate::state::store::TaskStore;
 use crate::state::task::{Task, TaskStatus};
 use crate::worker::budget::BudgetTracker;
@@ -36,8 +35,8 @@ pub struct OrchestrateConfig {
     pub worker_cwd: Option<std::path::PathBuf>,
     /// Environment variables for workers.
     pub worker_env: Vec<(String, String)>,
-    /// Routing config for model selection per worker type.
-    pub routing: RoutingConfig,
+    /// Tool profiles keyed by worker type.
+    pub tool_profiles: BTreeMap<String, ToolProfile>,
     /// Layered Orboros config for unified model catalog resolution.
     pub model_config: Option<OrbConfig>,
     /// Fallback model when `model_config` is absent in tests or embedded callers.
@@ -295,13 +294,13 @@ pub async fn orchestrate(
 
     // Aggregate results
     let aggregated_result = if all_done {
-        // Build an aggregation worker config using the default model
+        let aggregate_model = resolve_aggregate_model(config)?;
         let agg_config = WorkerConfig {
             command: config.worker_binary.clone(),
             args: config.worker_args.clone(),
             cwd: config.worker_cwd.clone(),
             env: config.worker_env.clone(),
-            model: config.routing.default_model.clone(),
+            model: aggregate_model,
             system_prompt: String::new(), // overridden by aggregate()
             tools: vec![],
             max_iterations: Some(1),
@@ -374,7 +373,7 @@ fn prepare_subtask(
         config.context_result_max_chars,
     );
     let model = resolve_subtask_model(&spec.worker_type, config)?;
-    let profile = config.routing.profile_for(&spec.worker_type);
+    let profile = profile_for(&config.tool_profiles, &spec.worker_type);
     let filtered = filter_tools(&spec.tools_needed, profile);
     if !filtered.denied.is_empty() {
         warn!(
@@ -414,6 +413,17 @@ fn resolve_subtask_model(worker_type: &str, config: &OrchestrateConfig) -> anyho
         let resolved = model_config
             .model_resolver()
             .resolve(ModelRole::Worker(worker_type))?;
+        return Ok(resolved.model);
+    }
+
+    Ok(config.worker_default_model.clone())
+}
+
+fn resolve_aggregate_model(config: &OrchestrateConfig) -> anyhow::Result<String> {
+    if let Some(model_config) = &config.model_config {
+        let resolved = model_config
+            .model_resolver()
+            .resolve(ModelRole::Coordinator("aggregate"))?;
         return Ok(resolved.model);
     }
 
@@ -620,7 +630,7 @@ mod tests {
                 .into()],
             worker_cwd: None,
             worker_env: vec![],
-            routing: RoutingConfig::default(),
+            tool_profiles: BTreeMap::new(),
             model_config: None,
             worker_default_model: "mock/test".into(),
             prompt_resolver: crate::prompt::PromptResolver::default(),
@@ -641,7 +651,7 @@ mod tests {
                 .into()],
             worker_cwd: None,
             worker_env: vec![],
-            routing: RoutingConfig::default(),
+            tool_profiles: BTreeMap::new(),
             model_config: None,
             worker_default_model: "mock/test".into(),
             prompt_resolver: crate::prompt::PromptResolver::default(),
@@ -681,14 +691,6 @@ mod tests {
     #[test]
     fn resolve_subtask_model_prefers_unified_worker_mapping() {
         let mut config = test_orchestrate_config();
-        config
-            .routing
-            .rules
-            .push(crate::routing::rules::RoutingRule {
-                worker_type: "research".into(),
-                model: "legacy/research".into(),
-                reason: None,
-            });
         config.model_config = Some(
             toml::from_str(
                 r#"
@@ -706,6 +708,28 @@ research = "fast"
 
         let model = resolve_subtask_model("research", &config).unwrap();
         assert_eq!(model, "catalog/fast");
+    }
+
+    #[test]
+    fn resolve_aggregate_model_uses_coordinator_mapping() {
+        let mut config = test_orchestrate_config();
+        config.model_config = Some(
+            toml::from_str(
+                r#"
+default_model = "config/default"
+
+[models.options.agg]
+model = "catalog/aggregate"
+
+[models.coordinators]
+aggregate = "agg"
+"#,
+            )
+            .unwrap(),
+        );
+
+        let model = resolve_aggregate_model(&config).unwrap();
+        assert_eq!(model, "catalog/aggregate");
     }
 
     #[test]
@@ -1072,7 +1096,7 @@ research = "fast"
             worker_args: vec![],
             worker_cwd: None,
             worker_env: vec![],
-            routing: RoutingConfig::default(),
+            tool_profiles: BTreeMap::new(),
             model_config: None,
             worker_default_model: "mock/test".into(),
             prompt_resolver: crate::prompt::PromptResolver::default(),
@@ -1291,13 +1315,10 @@ research = "fast"
 
     #[tokio::test]
     async fn orchestrate_profile_filters_tools() {
-        use crate::routing::profile::ToolProfile;
-        use std::collections::HashMap;
-
         let dir = tempfile::tempdir().unwrap();
         let store = TaskStore::new(dir.path().join("tasks.jsonl"));
 
-        let mut profiles = HashMap::new();
+        let mut profiles = BTreeMap::new();
         profiles.insert(
             "edit".into(),
             ToolProfile {
@@ -1306,7 +1327,7 @@ research = "fast"
         );
 
         let mut config = echo_orchestrate_config();
-        config.routing.profiles = profiles;
+        config.tool_profiles = profiles;
 
         let mut parent = Task::new("Parent", "Profile filter test");
         store.append(&parent).unwrap();
@@ -1332,13 +1353,10 @@ research = "fast"
 
     #[tokio::test]
     async fn orchestrate_succeeds_with_profiles() {
-        use crate::routing::profile::ToolProfile;
-        use std::collections::HashMap;
-
         let dir = tempfile::tempdir().unwrap();
         let store = TaskStore::new(dir.path().join("tasks.jsonl"));
 
-        let mut profiles = HashMap::new();
+        let mut profiles = BTreeMap::new();
         profiles.insert(
             "default".into(),
             ToolProfile {
@@ -1347,7 +1365,7 @@ research = "fast"
         );
 
         let mut config = test_orchestrate_config();
-        config.routing.profiles = profiles;
+        config.tool_profiles = profiles;
 
         let mut parent = Task::new("Parent", "With default profile");
         store.append(&parent).unwrap();
@@ -1370,7 +1388,7 @@ research = "fast"
             worker_args: vec![],
             worker_cwd: None,
             worker_env: vec![],
-            routing: RoutingConfig::default(),
+            tool_profiles: BTreeMap::new(),
             model_config: None,
             worker_default_model: "mock/test".into(),
             prompt_resolver: crate::prompt::PromptResolver::default(),
@@ -1422,7 +1440,7 @@ research = "fast"
                 ("MOCK_DELAY".into(), "0".into()),
                 ("MOCK_SEND_DELAY".into(), "10".into()),
             ],
-            routing: RoutingConfig::default(),
+            tool_profiles: BTreeMap::new(),
             model_config: None,
             worker_default_model: "mock/test".into(),
             prompt_resolver: crate::prompt::PromptResolver::default(),
@@ -1562,7 +1580,7 @@ research = "fast"
             worker_args: vec![],
             worker_cwd: None,
             worker_env: vec![],
-            routing: RoutingConfig::default(),
+            tool_profiles: BTreeMap::new(),
             model_config: None,
             worker_default_model: "mock/test".into(),
             prompt_resolver: crate::prompt::PromptResolver::default(),

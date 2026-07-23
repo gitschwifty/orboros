@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::routing::profile::ToolProfile;
+
 // ---------------------------------------------------------------------------
 // OrbConfig — layered config (global → project → CLI)
 // ---------------------------------------------------------------------------
@@ -16,6 +18,7 @@ pub struct OrbConfig {
     pub worker_binary: Option<String>,
     pub models: ModelConfig,
     pub bench: BenchConfig,
+    pub tool_profiles: BTreeMap<String, ToolProfile>,
     pub prompts: PromptConfig,
     pub review: ReviewConfig,
     pub second_opinion: SecondOpinionConfig,
@@ -30,6 +33,7 @@ impl Default for OrbConfig {
             worker_binary: None,
             models: ModelConfig::default(),
             bench: BenchConfig::default(),
+            tool_profiles: BTreeMap::new(),
             prompts: PromptConfig::default(),
             review: ReviewConfig::default(),
             second_opinion: SecondOpinionConfig::default(),
@@ -704,6 +708,7 @@ mod tests {
         assert_eq!(cfg.max_concurrency, 4);
         assert!(cfg.worker_binary.is_none());
         assert!(cfg.models.options.is_empty());
+        assert!(cfg.tool_profiles.is_empty());
         assert!(!cfg.review.requires_approval_by_default);
         assert!(cfg.review.review_on_completion);
         assert!(cfg.notification.enabled);
@@ -1389,6 +1394,13 @@ system = "project speccing"
                 timeout_s: Some(300),
                 max_iterations: Some(8),
             },
+            tool_profiles: [(
+                "edit".into(),
+                ToolProfile {
+                    allowed_tools: vec!["read".into(), "write".into()],
+                },
+            )]
+            .into(),
             prompts: PromptConfig {
                 workers: [(
                     "edit".into(),

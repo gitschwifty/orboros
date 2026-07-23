@@ -1,10 +1,23 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// A tool profile defining which tools a worker type is allowed to use.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolProfile {
     /// Tools the worker is allowed to use.
     pub allowed_tools: Vec<String>,
+}
+
+/// Returns the tool profile for a worker type, falling back to the
+/// "default" profile when present.
+#[must_use]
+pub fn profile_for<'a>(
+    profiles: &'a BTreeMap<String, ToolProfile>,
+    worker_type: &str,
+) -> Option<&'a ToolProfile> {
+    profiles
+        .get(worker_type)
+        .or_else(|| profiles.get("default"))
 }
 
 /// Result of filtering requested tools against a profile.

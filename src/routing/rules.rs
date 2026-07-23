@@ -1,44 +1,22 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::routing::profile::ToolProfile;
 
-/// Model routing configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Legacy tool profile configuration.
+///
+/// `routing.toml` used to own both model routing rules and tool profiles.
+/// Model routing now lives in `OrbConfig.models`; this type remains only as a
+/// compatibility reader for old profile files.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct RoutingConfig {
-    /// Default model when no rule matches.
-    pub default_model: String,
-    /// Routing rules, checked in order.
-    #[serde(default)]
-    pub rules: Vec<RoutingRule>,
     /// Tool profiles keyed by worker type.
     #[serde(default)]
     pub profiles: HashMap<String, ToolProfile>,
 }
 
-/// A single routing rule mapping a worker type to a model.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RoutingRule {
-    /// Worker type to match (e.g., "research", "edit", "review", "test").
-    pub worker_type: String,
-    /// Model to use for this worker type.
-    pub model: String,
-    /// Optional reason for this routing choice.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
 impl RoutingConfig {
-    /// Returns the model for a given worker type.
-    /// Falls back to `default_model` if no rule matches.
-    pub fn model_for(&self, worker_type: &str) -> &str {
-        self.rules
-            .iter()
-            .find(|r| r.worker_type == worker_type)
-            .map_or(&self.default_model, |r| &r.model)
-    }
-
     /// Returns the tool profile for a worker type.
     /// Falls back to the "default" profile if no exact match exists.
     /// Returns `None` if neither the worker type nor "default" has a profile.
@@ -51,19 +29,9 @@ impl RoutingConfig {
     /// Validates the config and returns a list of warnings.
     ///
     /// Checks for:
-    /// - Rules whose `worker_type` has no matching profile and no "default" fallback
     /// - Profiles with empty `allowed_tools`
     pub fn validate(&self) -> Vec<String> {
         let mut warnings = Vec::new();
-
-        for rule in &self.rules {
-            if self.profile_for(&rule.worker_type).is_none() {
-                warnings.push(format!(
-                    "Rule for worker type '{}' has no matching profile and no 'default' profile",
-                    rule.worker_type
-                ));
-            }
-        }
 
         for (name, profile) in &self.profiles {
             if profile.allowed_tools.is_empty() {
@@ -74,16 +42,6 @@ impl RoutingConfig {
         }
 
         warnings
-    }
-}
-
-impl Default for RoutingConfig {
-    fn default() -> Self {
-        Self {
-            default_model: "openrouter/free".into(),
-            rules: vec![],
-            profiles: HashMap::new(),
-        }
     }
 }
 
@@ -103,91 +61,34 @@ mod tests {
     #[test]
     fn default_config() {
         let config = RoutingConfig::default();
-        assert_eq!(config.model_for("anything"), "openrouter/free");
+        assert!(config.profiles.is_empty());
     }
 
     #[test]
-    fn model_for_matching_type() {
-        let config = RoutingConfig {
-            default_model: "openrouter/auto".into(),
-            rules: vec![
-                RoutingRule {
-                    worker_type: "research".into(),
-                    model: "google/gemini-2.0-flash-001".into(),
-                    reason: Some("cheap".into()),
-                },
-                RoutingRule {
-                    worker_type: "edit".into(),
-                    model: "anthropic/claude-sonnet-4-20250514".into(),
-                    reason: None,
-                },
-            ],
-            ..Default::default()
-        };
+    fn parse_profiles_from_toml() {
+        let toml = r#"
+[profiles.edit]
+allowed_tools = ["read", "write", "execute"]
+"#;
 
-        assert_eq!(config.model_for("research"), "google/gemini-2.0-flash-001");
+        let config = parse_routing_config(toml).unwrap();
         assert_eq!(
-            config.model_for("edit"),
-            "anthropic/claude-sonnet-4-20250514"
+            config.profiles["edit"].allowed_tools,
+            vec!["read", "write", "execute"]
         );
-        assert_eq!(config.model_for("test"), "openrouter/auto"); // falls back
     }
 
     #[test]
-    fn parse_from_toml() {
+    fn legacy_model_rules_are_ignored() {
         let toml = r#"
 default_model = "openrouter/auto"
 
 [[rules]]
-worker_type = "research"
-model = "google/gemini-2.0-flash-001"
-reason = "cheap, fast"
-
-[[rules]]
 worker_type = "edit"
 model = "anthropic/claude-sonnet-4-20250514"
-
-[[rules]]
-worker_type = "review"
-model = "google/gemini-2.0-flash-001"
-reason = "cheap"
 "#;
-
         let config = parse_routing_config(toml).unwrap();
-        assert_eq!(config.default_model, "openrouter/auto");
-        assert_eq!(config.rules.len(), 3);
-        assert_eq!(config.model_for("research"), "google/gemini-2.0-flash-001");
-        assert_eq!(
-            config.model_for("edit"),
-            "anthropic/claude-sonnet-4-20250514"
-        );
-        assert_eq!(config.model_for("review"), "google/gemini-2.0-flash-001");
-        assert_eq!(config.model_for("unknown"), "openrouter/auto");
-    }
-
-    #[test]
-    fn round_trip_toml() {
-        let config = RoutingConfig {
-            default_model: "test/model".into(),
-            rules: vec![RoutingRule {
-                worker_type: "edit".into(),
-                model: "better/model".into(),
-                reason: Some("because".into()),
-            }],
-            ..Default::default()
-        };
-        let serialized = toml::to_string(&config).unwrap();
-        let parsed: RoutingConfig = toml::from_str(&serialized).unwrap();
-        assert_eq!(parsed.default_model, "test/model");
-        assert_eq!(parsed.rules.len(), 1);
-        assert_eq!(parsed.model_for("edit"), "better/model");
-    }
-
-    #[test]
-    fn empty_rules_uses_default() {
-        let toml = r#"default_model = "openrouter/free""#;
-        let config = parse_routing_config(toml).unwrap();
-        assert_eq!(config.model_for("anything"), "openrouter/free");
+        assert!(config.profiles.is_empty());
     }
 
     #[test]
@@ -291,60 +192,8 @@ model = "anthropic/claude-sonnet-4-20250514"
     }
 
     #[test]
-    fn validate_rule_without_profile_warns() {
-        let config = RoutingConfig {
-            rules: vec![RoutingRule {
-                worker_type: "edit".into(),
-                model: "test/model".into(),
-                reason: None,
-            }],
-            ..Default::default()
-        };
-        let warnings = config.validate();
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("edit"));
-        assert!(warnings[0].contains("no matching profile"));
-    }
-
-    #[test]
-    fn validate_matching_profile_clean() {
-        let mut profiles = HashMap::new();
-        profiles.insert(
-            "edit".into(),
-            ToolProfile {
-                allowed_tools: vec!["read".into()],
-            },
-        );
-        let config = RoutingConfig {
-            rules: vec![RoutingRule {
-                worker_type: "edit".into(),
-                model: "test/model".into(),
-                reason: None,
-            }],
-            profiles,
-            ..Default::default()
-        };
-        assert!(config.validate().is_empty());
-    }
-
-    #[test]
-    fn validate_default_fallback_clean() {
-        let mut profiles = HashMap::new();
-        profiles.insert(
-            "default".into(),
-            ToolProfile {
-                allowed_tools: vec!["read".into()],
-            },
-        );
-        let config = RoutingConfig {
-            rules: vec![RoutingRule {
-                worker_type: "edit".into(),
-                model: "test/model".into(),
-                reason: None,
-            }],
-            profiles,
-            ..Default::default()
-        };
+    fn validate_ignores_legacy_model_rules() {
+        let config = RoutingConfig::default();
         assert!(config.validate().is_empty());
     }
 
@@ -382,22 +231,7 @@ model = "anthropic/claude-sonnet-4-20250514"
                 allowed_tools: vec!["read".into(), "web_search".into()],
             },
         );
-        let config = RoutingConfig {
-            rules: vec![
-                RoutingRule {
-                    worker_type: "edit".into(),
-                    model: "test/model".into(),
-                    reason: None,
-                },
-                RoutingRule {
-                    worker_type: "research".into(),
-                    model: "test/model".into(),
-                    reason: None,
-                },
-            ],
-            profiles,
-            ..Default::default()
-        };
+        let config = RoutingConfig { profiles };
         assert!(config.validate().is_empty());
     }
 }

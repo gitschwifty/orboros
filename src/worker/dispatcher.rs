@@ -477,6 +477,37 @@ pub fn worker_config_for(orb: &Orb, base: &WorkerConfig, system_prompt: &str) ->
     wc
 }
 
+/// Like [`worker_config_for`], but validates `orb.preferred_model` through the
+/// model resolver when present. Preferred models can be catalog keys or raw
+/// `provider/model` strings; the worker still receives the resolved model
+/// string.
+///
+/// # Errors
+///
+/// Returns an error when `orb.preferred_model` names no catalog option and is
+/// not a raw model string.
+pub fn worker_config_for_with_model_config(
+    orb: &Orb,
+    base: &WorkerConfig,
+    system_prompt: &str,
+    model_config: &crate::config::OrbConfig,
+) -> anyhow::Result<WorkerConfig> {
+    let mut wc = base.clone();
+    if let Some(selector) = orb.preferred_model.as_deref() {
+        let resolved = model_config
+            .model_resolver()
+            .resolve_selector(selector, "orb.preferred_model".to_string())?;
+        wc.model = resolved.model;
+    }
+    wc.task_id = Some(orb.id.to_string());
+    wc.worker_id = Some(uuid::Uuid::new_v4().to_string());
+    wc.system_prompt = format!(
+        "{system_prompt}{}",
+        crate::worker::process::CONFIDENCE_PROMPT_ADDENDUM
+    );
+    Ok(wc)
+}
+
 fn optional_debug<T: std::fmt::Debug>(value: Option<&T>) -> String {
     value.map_or_else(|| "none".to_string(), |value| format!("{value:?}"))
 }
@@ -664,6 +695,49 @@ mod tests {
         orb.preferred_model = Some("orb/model".into());
         let wc = worker_config_for(&orb, &base_wc(), "x");
         assert_eq!(wc.model, "orb/model");
+    }
+
+    #[test]
+    fn worker_config_for_with_model_config_resolves_preferred_catalog_key() {
+        let mut orb = active_task_orb();
+        orb.preferred_model = Some("fast".into());
+        let cfg: crate::config::OrbConfig = toml::from_str(
+            r#"
+[models.options.fast]
+model = "catalog/fast"
+"#,
+        )
+        .unwrap();
+        let wc = worker_config_for_with_model_config(&orb, &base_wc(), "x", &cfg).unwrap();
+        assert_eq!(wc.model, "catalog/fast");
+    }
+
+    #[test]
+    fn worker_config_for_with_model_config_accepts_raw_preferred_model() {
+        let mut orb = active_task_orb();
+        orb.preferred_model = Some("nvidia/nemotron:free".into());
+        let wc = worker_config_for_with_model_config(
+            &orb,
+            &base_wc(),
+            "x",
+            &crate::config::OrbConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(wc.model, "nvidia/nemotron:free");
+    }
+
+    #[test]
+    fn worker_config_for_with_model_config_rejects_unknown_preferred_key() {
+        let mut orb = active_task_orb();
+        orb.preferred_model = Some("missing".into());
+        let err = worker_config_for_with_model_config(
+            &orb,
+            &base_wc(),
+            "x",
+            &crate::config::OrbConfig::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown model option"));
     }
 
     #[test]

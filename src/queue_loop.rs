@@ -666,7 +666,9 @@ async fn dispatch_one_owned(
     context: DispatchContext<'_>,
     hooks: Option<Arc<crate::hooks::HookSink>>,
 ) -> std::io::Result<bool> {
-    use crate::worker::dispatcher::{apply_dispatch_outcome, dispatch_orb, worker_config_for};
+    use crate::worker::dispatcher::{
+        apply_dispatch_outcome, dispatch_orb, worker_config_for_with_model_config,
+    };
 
     let (built_in_system, user) = match target {
         DispatchTarget::Speccing => crate::phases::speccing::build_prompt(&orb),
@@ -697,7 +699,8 @@ async fn dispatch_one_owned(
     if resolved_model.source != "default_model" {
         target_base_wc.model = resolved_model.model;
     }
-    let wc = worker_config_for(&orb, &target_base_wc, &system);
+    let wc = worker_config_for_with_model_config(&orb, &target_base_wc, &system, model_config)
+        .map_err(std::io::Error::other)?;
     tracing::info!(
         orb = %orb.id,
         title = %orb.title,
