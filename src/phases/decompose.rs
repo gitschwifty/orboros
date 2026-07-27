@@ -182,6 +182,9 @@ fn default_order() -> u32 {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct DecompositionPlan {
     pub subtasks: Vec<DecomposedSubtask>,
+    /// Whether the parent needs a worker pass after all children complete.
+    #[serde(default)]
+    pub has_parent_final_work: bool,
 }
 
 /// Returns `(system, user)` prompts for the decomposition worker.
@@ -195,10 +198,12 @@ no code fences — in this shape:\n\
   {\"subtasks\": [\n\
     {\"title\": \"<short subtask title>\", \"description\": \"<what to do>\", \"order\": 1},\n\
     ...\n\
-  ]}\n\
+  ], \"has_parent_final_work\": false}\n\
 Use the `order` field to express sequencing: subtasks with the same order may \
 run in parallel; lower numbers run first. Aim for 2-6 subtasks. Avoid trivial \
-one-line subtasks; each should be a meaningful unit of work."
+one-line subtasks; each should be a meaningful unit of work. Set \
+`has_parent_final_work` to true only when the parent must perform its own \
+synthesis or verification after the children finish."
         .to_string();
     let mut user = format!(
         "Title: {}\n\nDescription:\n{}\n",

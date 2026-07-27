@@ -321,6 +321,7 @@ fn parse_phase(s: &str) -> anyhow::Result<OrbPhase> {
         "refining" => OrbPhase::Refining,
         "review" => OrbPhase::Review,
         "waiting" => OrbPhase::Waiting,
+        "executing_children" | "executing-children" => OrbPhase::ExecutingChildren,
         "executing" => OrbPhase::Executing,
         "reevaluating" => OrbPhase::Reevaluating,
         "done" => OrbPhase::Done,

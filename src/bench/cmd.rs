@@ -504,7 +504,7 @@ fn print_result_details(result: &BenchResult) {
             .map_or_else(|| "-".to_string(), |tokens| tokens.to_string()),
         cost = result.cost_cents.map_or_else(
             || "-".to_string(),
-            |cents| format!("${:.2}", f64::from(cents) / 100.0),
+            |cents| format!("${:.2}", cents as f64 / 100.0),
         ),
     );
     println!("worker_model={}", result.worker_model);
@@ -587,11 +587,11 @@ fn sum_tokens(results: &[BenchResult], field: impl Fn(&BenchResult) -> Option<u6
     )
 }
 
-fn sum_costs(results: &[BenchResult]) -> Option<u32> {
+fn sum_costs(results: &[BenchResult]) -> Option<u64> {
     results
         .iter()
         .filter_map(|r| r.cost_cents)
-        .fold(None, |sum: Option<u32>, cost| {
+        .fold(None, |sum: Option<u64>, cost| {
             Some(sum.unwrap_or(0).saturating_add(cost))
         })
 }
@@ -633,7 +633,7 @@ fn print_run_summary(r: &BenchRun) {
         total = r.total,
         cost = r.total_cost_cents.map_or_else(
             || "-".to_string(),
-            |cents| format!("${:.2}", f64::from(cents) / 100.0),
+            |cents| format!("${:.2}", cents as f64 / 100.0),
         ),
         tokens = r
             .total_tokens

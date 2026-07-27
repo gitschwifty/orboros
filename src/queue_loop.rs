@@ -83,6 +83,7 @@ pub struct QueueLoop {
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
     hooks: Option<Arc<crate::hooks::HookSink>>,
+    review_config: Option<crate::config::ReviewConfig>,
 }
 
 impl QueueLoop {
@@ -95,7 +96,17 @@ impl QueueLoop {
             running: Arc::new(AtomicBool::new(true)),
             paused: Arc::new(AtomicBool::new(false)),
             hooks: None,
+            review_config: None,
         }
+    }
+
+    /// Overrides review behavior for an embedded queue run, such as a
+    /// benchmark. Normal daemon callers use the project config loaded from
+    /// the queue base directory.
+    #[must_use]
+    pub fn with_review_config(mut self, review_config: crate::config::ReviewConfig) -> Self {
+        self.review_config = Some(review_config);
+        self
     }
 
     /// Attaches a `HookSink` so the queue fires `on-queue-tick` after
@@ -221,6 +232,9 @@ impl QueueLoop {
             }
         }
         let mut updated = orb.clone();
+        if matches!(target, OrbPhase::Executing | OrbPhase::ExecutingChildren) {
+            updated.execution = None;
+        }
         updated.set_phase(target).map_err(std::io::Error::other)?;
         self.orb_store.update(&updated)?;
         if let Some(sink) = &self.hooks {
@@ -251,7 +265,7 @@ impl QueueLoop {
     }
 
     /// Hook-aware version of `execute_ready`. Fires phase hooks only
-    /// for the phase-orb branch (Waiting → Executing); the task-orb
+    /// for the phase-orb branch (Waiting → ExecutingChildren/Executing); the task-orb
     /// status transition uses the un-hooked path.
     async fn execute_ready_with_hooks(&self, orbs: &[Orb]) -> std::io::Result<u32> {
         let ready_ids = self
@@ -263,10 +277,19 @@ impl QueueLoop {
             if !ready_ids.contains(&orb.id) {
                 continue;
             }
+            if blocked_by_parent_review(orb, orbs) {
+                continue;
+            }
             if orb.orb_type.uses_phase() {
-                if orb.phase == Some(OrbPhase::Waiting)
-                    && self.try_phase_transition(orb, OrbPhase::Executing).await?
-                {
+                if orb.phase != Some(OrbPhase::Waiting) {
+                    continue;
+                }
+                let target = if has_children(orb, orbs) {
+                    OrbPhase::ExecutingChildren
+                } else {
+                    OrbPhase::Executing
+                };
+                if self.try_phase_transition(orb, target).await? {
                     count += 1;
                 }
             } else if orb.status == Some(OrbStatus::Pending) {
@@ -297,6 +320,29 @@ impl QueueLoop {
             let Some(children) = children_by_parent.get(&orb.id) else {
                 continue;
             };
+            if let Some(failed_child) = children
+                .iter()
+                .find(|child| child.effective_status() == TaskStatus::Failed)
+            {
+                let mut updated = orb.clone();
+                let reason = failed_child.result.as_deref().unwrap_or("child orb failed");
+                updated.result = Some(format!(
+                    "required child {} failed: {reason}",
+                    failed_child.id
+                ));
+                if orb.orb_type.uses_phase() {
+                    updated
+                        .set_phase(OrbPhase::Failed)
+                        .map_err(std::io::Error::other)?;
+                } else {
+                    updated
+                        .set_status(OrbStatus::Failed)
+                        .map_err(std::io::Error::other)?;
+                }
+                self.orb_store.update(&updated)?;
+                count += 1;
+                continue;
+            }
             let all_children_done = children
                 .iter()
                 .all(|c| c.effective_status() == TaskStatus::Done);
@@ -304,8 +350,27 @@ impl QueueLoop {
                 continue;
             }
             if orb.orb_type.uses_phase() {
-                if self.try_phase_transition(orb, OrbPhase::Done).await? {
-                    count += 1;
+                let mut phase = orb.phase;
+                if phase == Some(OrbPhase::Waiting) {
+                    if !self
+                        .try_phase_transition(orb, OrbPhase::ExecutingChildren)
+                        .await?
+                    {
+                        continue;
+                    }
+                    phase = Some(OrbPhase::ExecutingChildren);
+                }
+                if phase == Some(OrbPhase::ExecutingChildren) {
+                    let target = if orb.has_parent_final_work {
+                        OrbPhase::Executing
+                    } else {
+                        OrbPhase::Done
+                    };
+                    let mut transitioned = orb.clone();
+                    transitioned.phase = phase;
+                    if self.try_phase_transition(&transitioned, target).await? {
+                        count += 1;
+                    }
                 }
             } else {
                 let mut updated = orb.clone();
@@ -379,15 +444,22 @@ impl QueueLoop {
             if !ready_ids.contains(&orb.id) {
                 continue;
             }
+            if blocked_by_parent_review(orb, orbs) {
+                continue;
+            }
 
             // Only advance Pending task-type orbs to Active
             if orb.orb_type.uses_phase() {
                 // Phase-type orbs in Waiting → Executing
                 if orb.phase == Some(OrbPhase::Waiting) {
                     let mut updated = orb.clone();
-                    updated
-                        .set_phase(OrbPhase::Executing)
-                        .map_err(std::io::Error::other)?;
+                    updated.execution = None;
+                    let target = if has_children(orb, orbs) {
+                        OrbPhase::ExecutingChildren
+                    } else {
+                        OrbPhase::Executing
+                    };
+                    updated.set_phase(target).map_err(std::io::Error::other)?;
                     self.orb_store.update(&updated)?;
                     count += 1;
                 }
@@ -423,21 +495,57 @@ impl QueueLoop {
                 continue;
             };
 
+            if let Some(failed_child) = children
+                .iter()
+                .find(|child| child.effective_status() == TaskStatus::Failed)
+            {
+                let mut updated = orb.clone();
+                let reason = failed_child.result.as_deref().unwrap_or("child orb failed");
+                updated.result = Some(format!(
+                    "required child {} failed: {reason}",
+                    failed_child.id
+                ));
+                if orb.orb_type.uses_phase() {
+                    updated
+                        .set_phase(OrbPhase::Failed)
+                        .map_err(std::io::Error::other)?;
+                } else {
+                    updated
+                        .set_status(OrbStatus::Failed)
+                        .map_err(std::io::Error::other)?;
+                }
+                self.orb_store.update(&updated)?;
+                count += 1;
+                continue;
+            }
+
             let all_children_done = children
                 .iter()
                 .all(|c| c.effective_status() == TaskStatus::Done);
 
-            if all_children_done {
+            if all_children_done && orb.orb_type.uses_phase() {
                 let mut updated = orb.clone();
-                if orb.orb_type.uses_phase() {
+                if updated.phase == Some(OrbPhase::Waiting) {
+                    updated.execution = None;
                     updated
-                        .set_phase(OrbPhase::Done)
-                        .map_err(std::io::Error::other)?;
-                } else {
-                    updated
-                        .set_status(OrbStatus::Done)
+                        .set_phase(OrbPhase::ExecutingChildren)
                         .map_err(std::io::Error::other)?;
                 }
+                if updated.phase == Some(OrbPhase::ExecutingChildren) {
+                    let target = if updated.has_parent_final_work {
+                        OrbPhase::Executing
+                    } else {
+                        OrbPhase::Done
+                    };
+                    updated.set_phase(target).map_err(std::io::Error::other)?;
+                    self.orb_store.update(&updated)?;
+                    count += 1;
+                }
+            } else if all_children_done {
+                let mut updated = orb.clone();
+                updated
+                    .set_status(OrbStatus::Done)
+                    .map_err(std::io::Error::other)?;
                 self.orb_store.update(&updated)?;
                 count += 1;
             }
@@ -543,16 +651,21 @@ impl QueueLoop {
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         let mut targets: Vec<(Orb, DispatchTarget)> = Vec::new();
         for orb in &all_orbs {
-            if let Some(t) = dispatch_target_for(orb) {
-                targets.push((orb.clone(), t));
+            if !blocked_by_parent_review(orb, &all_orbs) {
+                if let Some(t) = dispatch_target_for(orb) {
+                    targets.push((orb.clone(), t));
+                }
             }
         }
         if targets.is_empty() {
             return Ok(0);
         }
 
-        let orb_config =
+        let mut orb_config =
             crate::config::load_config(Some(&self.base_dir)).map_err(std::io::Error::other)?;
+        if let Some(review_config) = &self.review_config {
+            orb_config.review = review_config.clone();
+        }
         let prompt_config = orb_config.prompts.clone();
         let prompt_resolver =
             crate::prompt::PromptResolver::from_config(prompt_config, Some(&self.base_dir));
@@ -714,6 +827,23 @@ fn is_terminal(orb: &Orb) -> bool {
 /// parent's `OrbId` to its child orbs. Lets the tick loop look up
 /// children in O(1) instead of paying a full `OrbStore::load_all`
 /// replay per orb.
+/// Returns true when an orb is nested under a parent waiting for review.
+/// Review is a gate for all descendant execution, not merely a label on the
+/// parent; checking the full chain also handles nested feature/task trees.
+fn blocked_by_parent_review(orb: &Orb, orbs: &[Orb]) -> bool {
+    let mut parent_id = orb.parent_id.as_ref();
+    while let Some(id) = parent_id {
+        let Some(parent) = orbs.iter().find(|candidate| &candidate.id == id) else {
+            break;
+        };
+        if parent.phase == Some(OrbPhase::Review) || parent.status == Some(OrbStatus::Review) {
+            return true;
+        }
+        parent_id = parent.parent_id.as_ref();
+    }
+    false
+}
+
 fn index_children_by_parent(orbs: &[Orb]) -> HashMap<&OrbId, Vec<&Orb>> {
     let mut by_parent: HashMap<&OrbId, Vec<&Orb>> = HashMap::new();
     for orb in orbs {
@@ -724,10 +854,15 @@ fn index_children_by_parent(orbs: &[Orb]) -> HashMap<&OrbId, Vec<&Orb>> {
     by_parent
 }
 
+fn has_children(orb: &Orb, orbs: &[Orb]) -> bool {
+    orbs.iter()
+        .any(|candidate| candidate.parent_id.as_ref() == Some(&orb.id))
+}
+
 // ── Dispatch helpers (task 60) ───────────────────────────────────
 
 /// What phase / prompt should drive a worker for this orb.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DispatchTarget {
     /// Task or phase-orb in `Executing` — send the orb's description
     /// as the user prompt. Result becomes `orb.result`.
@@ -809,7 +944,7 @@ async fn dispatch_one_owned(
     hooks: Option<Arc<crate::hooks::HookSink>>,
 ) -> std::io::Result<bool> {
     use crate::worker::dispatcher::{
-        apply_dispatch_outcome, dispatch_orb, worker_config_for_with_model_config,
+        apply_dispatch_outcome_with_review, dispatch_orb, worker_config_for_with_model_config,
     };
 
     let (built_in_system, user) = match target {
@@ -861,7 +996,21 @@ async fn dispatch_one_owned(
         prompt_source,
     );
 
-    apply_dispatch_outcome(&mut orb, &outcome).map_err(std::io::Error::other)?;
+    apply_dispatch_outcome_with_review(
+        &mut orb,
+        &outcome,
+        model_config.review.review_on_completion,
+    )
+    .map_err(std::io::Error::other)?;
+
+    if outcome.status == crate::worker::dispatcher::DispatchStatus::Done
+        && target == DispatchTarget::Refining
+        && orb.phase == Some(OrbPhase::Review)
+        && !crate::phases::review::needs_review(&orb, model_config)
+    {
+        orb.set_phase(OrbPhase::Waiting)
+            .map_err(std::io::Error::other)?;
+    }
 
     // For structured phases, also parse the response into a plan and
     // apply it so the orb's design / decomposition / refinement /
@@ -1096,11 +1245,11 @@ mod tests {
     // ── root completion detection ────────────────────────────────────
 
     #[test]
-    fn tick_completes_root_when_all_children_done() {
+    fn tick_completes_child_only_root_when_all_children_done() {
         let (_tmp, orb_store, dep_store, base) = setup();
 
         let mut parent = Orb::new("Parent epic", "Has children").with_type(OrbType::Epic);
-        parent.phase = Some(OrbPhase::Executing); // test setup; skip pipeline walk
+        parent.phase = Some(OrbPhase::Waiting); // approved, children complete
         orb_store.append(&parent).unwrap();
 
         let mut child1 =
@@ -1119,6 +1268,29 @@ mod tests {
         assert_eq!(result.roots_completed, 1);
         let updated = orb_store.load_by_id(&parent.id).unwrap().unwrap();
         assert_eq!(updated.phase, Some(OrbPhase::Done));
+    }
+
+    #[test]
+    fn tick_starts_parent_final_execution_after_children_done() {
+        let (_tmp, orb_store, dep_store, base) = setup();
+
+        let mut parent = Orb::new("Parent epic", "Has children and final work")
+            .with_type(OrbType::Epic)
+            .with_parent_final_work(true);
+        parent.phase = Some(OrbPhase::Waiting);
+        orb_store.append(&parent).unwrap();
+
+        let mut child =
+            Orb::new("Child", "Done").with_parent(parent.id.clone(), Some(parent.id.clone()));
+        child.status = Some(OrbStatus::Done);
+        orb_store.append(&child).unwrap();
+
+        let ql = QueueLoop::new(orb_store.clone(), dep_store, base);
+        let result = ql.tick().unwrap();
+
+        assert_eq!(result.roots_completed, 1);
+        let updated = orb_store.load_by_id(&parent.id).unwrap().unwrap();
+        assert_eq!(updated.phase, Some(OrbPhase::Executing));
     }
 
     #[test]

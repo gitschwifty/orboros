@@ -341,6 +341,16 @@ pub fn apply_dispatch_outcome(
     orb: &mut Orb,
     outcome: &DispatchOutcome,
 ) -> Result<(), orbs::orb::TransitionError> {
+    apply_dispatch_outcome_with_review(orb, outcome, false)
+}
+
+/// Applies a dispatch outcome, optionally routing successful phase execution
+/// through the post-completion review checkpoint.
+pub fn apply_dispatch_outcome_with_review(
+    orb: &mut Orb,
+    outcome: &DispatchOutcome,
+    review_on_completion: bool,
+) -> Result<(), orbs::orb::TransitionError> {
     if outcome.status == DispatchStatus::Aborted {
         return Ok(());
     }
@@ -373,7 +383,11 @@ pub fn apply_dispatch_outcome(
             orb.result.clone_from(&outcome.response);
             orb.confidence = outcome.confidence;
             if orb.orb_type.uses_phase() {
-                let next = next_phase_on_dispatch_success(orb.phase);
+                let next = if review_on_completion && orb.phase == Some(OrbPhase::Executing) {
+                    OrbPhase::Review
+                } else {
+                    next_phase_on_dispatch_success(orb.phase)
+                };
                 orb.set_phase(next)?;
             } else {
                 orb.set_status(OrbStatus::Done)?;

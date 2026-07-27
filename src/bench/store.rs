@@ -57,7 +57,7 @@ pub struct BenchResult {
     /// the harness can price it accurately. `None` means unknown;
     /// benchmark code must not write placeholder estimates here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cost_cents: Option<u32>,
+    pub cost_cents: Option<u64>,
     pub iterations: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_tokens: Option<u64>,
@@ -149,7 +149,7 @@ pub struct BenchRun {
     /// Total known cost across cases. `None` means no case reported
     /// actual cost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total_cost_cents: Option<u32>,
+    pub total_cost_cents: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

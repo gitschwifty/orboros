@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 
 use orbs::dep_store::DepStore;
 use orbs::id::OrbId;
@@ -433,6 +433,10 @@ enum OrbAction {
         /// harness and manual reviewer scoring.
         #[arg(long)]
         confidence: Option<f32>,
+        /// Set whether a parent has its own final synthesis/verification work.
+        /// Pass `true` or `false`; relevant to phase-type parent orbs.
+        #[arg(long, action = ArgAction::Set)]
+        parent_final_work: Option<bool>,
         /// Add a label to the orb. Repeatable: `--add-label db --add-label external`.
         #[arg(long = "add-label", value_name = "LABEL")]
         add_label: Vec<String>,
@@ -803,6 +807,7 @@ fn main() -> anyhow::Result<()> {
                     priority,
                     status,
                     confidence,
+                    parent_final_work,
                     add_label,
                     remove_label,
                     set_labels,
@@ -813,7 +818,7 @@ fn main() -> anyhow::Result<()> {
                         set: set_labels
                             .map(|csv| csv.split(',').map(|s| s.trim().to_string()).collect()),
                     };
-                    orb_cmd::cmd_orb_update(
+                    let result = orb_cmd::cmd_orb_update(
                         &orb_store,
                         &id,
                         title.as_deref(),
@@ -823,7 +828,12 @@ fn main() -> anyhow::Result<()> {
                         confidence,
                         label_edits,
                         hooks_ref,
-                    )
+                    );
+                    result?;
+                    if let Some(value) = parent_final_work {
+                        orb_cmd::cmd_orb_set_parent_final_work(&orb_store, &id, value)?;
+                    }
+                    Ok(())
                 }
                 OrbAction::Delete { id, reason } => {
                     orb_cmd::cmd_orb_delete(&orb_store, &id, reason.as_deref(), hooks_ref)

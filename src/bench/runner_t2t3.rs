@@ -304,7 +304,11 @@ pub async fn run_t2_case(
             status: BenchStatus::Error,
             score: 0.0,
             latency_ms: elapsed_ms,
-            cost_cents: None,
+            cost_cents: updated
+                .execution
+                .as_ref()
+                .and_then(|e| e.cost_micros)
+                .map(crate::bench::runner::cost_micros_to_cents_ceil),
             iterations: 0,
             prompt_tokens: updated.execution.as_ref().and_then(|e| e.prompt_tokens),
             completion_tokens: updated.execution.as_ref().and_then(|e| e.completion_tokens),
@@ -351,7 +355,9 @@ pub async fn run_t2_case(
             0.0
         },
         latency_ms: elapsed_ms,
-        cost_cents: None,
+        cost_cents: execution
+            .and_then(|e| e.cost_micros)
+            .map(crate::bench::runner::cost_micros_to_cents_ceil),
         iterations: 1,
         prompt_tokens: execution.and_then(|e| e.prompt_tokens),
         completion_tokens: execution.and_then(|e| e.completion_tokens),
@@ -425,7 +431,11 @@ async fn run_t2_decompose_case(
     if let Some(max_iterations) = effective_max_iterations(case, opts) {
         wc.max_iterations = Some(max_iterations);
     }
-    let ql = QueueLoop::new(orb_store.clone(), dep_store.clone(), workdir.clone());
+    let ql = QueueLoop::new(orb_store.clone(), dep_store.clone(), workdir.clone())
+        .with_review_config(crate::config::ReviewConfig {
+            requires_approval_by_default: false,
+            review_on_completion: false,
+        });
     let result_ctx = T2DecomposeResultCtx {
         case,
         run_id,
@@ -453,7 +463,7 @@ async fn run_t2_decompose_case(
                 &all_orbs,
                 tests.as_ref(),
                 artifact_path.as_deref(),
-                BenchStatus::Error,
+                BenchStatus::Fail,
                 Some("decompose runner encountered a failed orb".into()),
             ));
         }
@@ -466,6 +476,10 @@ async fn run_t2_decompose_case(
             && children
                 .iter()
                 .all(|orb| orb.effective_status() == TaskStatus::Done)
+            && all_orbs
+                .iter()
+                .find(|orb| orb.id == root_id)
+                .is_some_and(|orb| orb.effective_status() == TaskStatus::Done)
         {
             let _ = ql.tick()?;
             copy_case_test_overlay(fixtures_root, case, &workdir)?;
@@ -543,8 +557,13 @@ fn materialize_decomposition_if_ready(
         orb_store.update(&root)?;
         return Ok(true);
     };
+    root.has_parent_final_work = plan.has_parent_final_work;
     append_decomposition_plan(&root, &plan, orb_store, dep_store)?;
+    // Benchmarks explicitly bypass human approval; normal queue runs apply
+    // the project review configuration after refinement.
     root.set_phase(OrbPhase::Review)
+        .map_err(|e| HarnessError::Io(std::io::Error::other(e)))?;
+    root.set_phase(OrbPhase::Waiting)
         .map_err(|e| HarnessError::Io(std::io::Error::other(e)))?;
     orb_store.update(&root)?;
     Ok(true)
@@ -646,7 +665,7 @@ impl T2DecomposeResultCtx<'_> {
                 0.0
             },
             latency_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            cost_cents: None,
+            cost_cents: usage.cost_cents,
             iterations: u32::try_from(orbs.iter().filter(|orb| orb.execution.is_some()).count())
                 .unwrap_or(u32::MAX),
             prompt_tokens: usage.prompt,
@@ -668,12 +687,14 @@ struct AggregateUsage {
     prompt: Option<u64>,
     completion: Option<u64>,
     total: Option<u64>,
+    cost_cents: Option<u64>,
 }
 
 fn aggregate_orb_usage(orbs: &[Orb]) -> AggregateUsage {
     let mut prompt_tokens = 0u64;
     let mut completion_tokens = 0u64;
     let mut total_tokens = 0u64;
+    let mut cost_cents: Option<u64> = None;
     for execution in orbs.iter().filter_map(|orb| orb.execution.as_ref()) {
         if let Some(tokens) = execution.prompt_tokens {
             prompt_tokens = prompt_tokens.saturating_add(tokens);
@@ -684,11 +705,16 @@ fn aggregate_orb_usage(orbs: &[Orb]) -> AggregateUsage {
         if let Some(tokens) = execution.total_tokens {
             total_tokens = total_tokens.saturating_add(tokens);
         }
+        if let Some(cost_micros) = execution.cost_micros {
+            let cents = crate::bench::runner::cost_micros_to_cents_ceil(cost_micros);
+            cost_cents = Some(cost_cents.unwrap_or(0).saturating_add(cents));
+        }
     }
     AggregateUsage {
         prompt: nonzero_u64(prompt_tokens),
         completion: nonzero_u64(completion_tokens),
         total: nonzero_u64(total_tokens),
+        cost_cents,
     }
 }
 
@@ -1252,7 +1278,7 @@ done
         assert!(materialize_decomposition_if_ready(&root_id, &orb_store, &dep_store).unwrap());
 
         let updated_root = orb_store.load_by_id(&root_id).unwrap().unwrap();
-        assert_eq!(updated_root.phase, Some(OrbPhase::Review));
+        assert_eq!(updated_root.phase, Some(OrbPhase::Waiting));
         let children = orb_store.load_children(&root_id).unwrap();
         assert_eq!(children.len(), 2);
         assert_eq!(children[0].title, "Model state");

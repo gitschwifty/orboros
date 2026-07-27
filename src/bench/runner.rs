@@ -225,7 +225,7 @@ pub async fn run_t1_case_with_artifacts(
     let mut passes: u32 = 0;
     let mut fails: u32 = 0;
     let mut errors: u32 = 0;
-    let mut accumulated_cost: Option<u32> = None;
+    let mut accumulated_cost: Option<u64> = None;
     let mut last_confidence: Option<f32> = None;
     let mut total_iters: u32 = 0;
     let mut last_error: Option<String> = None;
@@ -237,7 +237,7 @@ pub async fn run_t1_case_with_artifacts(
     for attempt in 0..T1_ATTEMPTS {
         // Budget gate before spawning.
         if let Some(cost) = accumulated_cost {
-            if !opts.no_budget && cost >= case.max_cost_cents {
+            if !opts.no_budget && cost >= u64::from(case.max_cost_cents) {
                 warn!(
                     case = %case.id,
                     attempt,
@@ -468,7 +468,7 @@ fn add_usage(
     prompt_tokens: &mut u64,
     completion_tokens: &mut u64,
     total_tokens: &mut u64,
-    cost_cents: &mut Option<u32>,
+    cost_cents: &mut Option<u64>,
     outcome: &SendOutcome,
 ) {
     if let Some(usage) = &outcome.usage {
@@ -481,12 +481,12 @@ fn add_usage(
     }
 }
 
-fn cost_micros_to_cents_ceil(cost_micros: u64) -> u32 {
+pub(crate) fn cost_micros_to_cents_ceil(cost_micros: u64) -> u64 {
     if cost_micros == 0 {
         return 0;
     }
     let cents = cost_micros.saturating_add(9_999) / 10_000;
-    crate::ipc::types::u64_to_u32_saturating(cents)
+    cents
 }
 
 fn send_outcome_error(outcome: &SendOutcome) -> String {
@@ -542,7 +542,7 @@ pub async fn run_t1(
     let run_id = new_run_id();
     let started_at = Utc::now();
     let mut results = Vec::with_capacity(cases.len());
-    let mut total_cost: Option<u32> = None;
+    let mut total_cost: Option<u64> = None;
 
     for case in cases {
         let timeout_s = effective_timeout_s(case, opts);

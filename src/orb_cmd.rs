@@ -10,6 +10,7 @@ use orbs::id::OrbId;
 use orbs::orb::{Orb, OrbPhase, OrbStatus, OrbType};
 use orbs::orb_store::OrbStore;
 use orbs::review::{ReviewVerdict, ReviseScope};
+use orbs::task::TaskStatus;
 
 use crate::hooks::{FireCtx, HookEvent, HookSink};
 
@@ -226,6 +227,9 @@ pub fn cmd_orb_show(store: &OrbStore, id: &str) -> anyhow::Result<()> {
             }
             if let Some(ref root) = orb.root_id {
                 println!("Root:        {root}");
+            }
+            if orb.orb_type.uses_phase() {
+                println!("Parent final work: {}", orb.has_parent_final_work);
             }
             println!("Created:     {}", orb.created_at);
             println!("Updated:     {}", orb.updated_at);
@@ -502,6 +506,37 @@ pub fn cmd_orb_update(
     Ok(())
 }
 
+/// Sets the parent-final-work marker without changing other orb fields.
+///
+/// # Errors
+///
+/// Returns an error if the orb is not found or the store write fails.
+pub fn cmd_orb_set_parent_final_work(
+    store: &OrbStore,
+    id: &str,
+    has_parent_final_work: bool,
+) -> anyhow::Result<()> {
+    let orb_id = OrbId::from_raw(id);
+    let mut orb = store
+        .load_by_id(&orb_id)
+        .context("failed to load orb")?
+        .ok_or_else(|| anyhow::anyhow!("orb {id} not found"))?;
+    anyhow::ensure!(
+        orb.orb_type.uses_phase(),
+        "parent-final-work only applies to epic/feature orbs"
+    );
+    orb.has_parent_final_work = has_parent_final_work;
+    orb.updated_at = chrono::Utc::now();
+    store
+        .update(&orb)
+        .context("failed to persist parent-final-work marker")?;
+    println!(
+        "Updated orb {} parent final work -> {}",
+        orb.id, has_parent_final_work
+    );
+    Ok(())
+}
+
 /// Tombstones (soft-deletes) an orb.
 ///
 /// # Errors
@@ -649,16 +684,42 @@ pub fn cmd_orb_review(
         bail!("orb {id} is not in review state");
     }
 
+    let children = store
+        .load_children(&orb.id)
+        .context("failed to load orb children")?;
+    let post_completion_review = orb.orb_type.uses_phase()
+        && (orb
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.prompt_category.as_deref())
+            == Some("worker.execute")
+            || (!children.is_empty()
+                && children
+                    .iter()
+                    .all(|child| child.effective_status() == TaskStatus::Done)));
+
     let event = match decision.to_lowercase().as_str() {
         "approve" => {
             if orb.status.is_some() {
                 orb.set_status(OrbStatus::Done)
                     .context("approve: status transition rejected")?;
             } else {
-                orb.set_phase(OrbPhase::Done)
+                let target = if post_completion_review {
+                    OrbPhase::Done
+                } else {
+                    OrbPhase::Waiting
+                };
+                orb.set_phase(target)
                     .context("approve: phase transition rejected")?;
             }
-            println!("Approved orb {id} -> Done");
+            println!(
+                "Approved orb {id} -> {}",
+                if orb.status.is_some() || post_completion_review {
+                    "Done"
+                } else {
+                    "Waiting"
+                }
+            );
             HookEvent::OnReviewApprove
         }
         "reject" => {
@@ -677,10 +738,15 @@ pub fn cmd_orb_review(
                 orb.set_status(OrbStatus::Active)
                     .context("revise: status transition rejected")?;
             } else {
-                orb.set_phase(OrbPhase::Executing)
+                let target = if post_completion_review {
+                    OrbPhase::Executing
+                } else {
+                    OrbPhase::Refining
+                };
+                orb.set_phase(target)
                     .context("revise: phase transition rejected")?;
             }
-            println!("Sent orb {id} back for revision -> Active");
+            println!("Sent orb {id} back for revision");
             HookEvent::OnReviewRevise
         }
         other => bail!("unknown review decision: {other}. Use: approve, reject, revise"),
