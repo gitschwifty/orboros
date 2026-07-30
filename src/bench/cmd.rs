@@ -164,6 +164,8 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
                             prompt_tokens: None,
                             completion_tokens: None,
                             total_tokens: None,
+                            cache_read_tokens: None,
+                            cache_write_tokens: None,
                             worker_model: String::new(),
                             prompt_hash: crate::bench::runner::prompt_hash(&case.prompt),
                             system_prompt_hash: None,
@@ -197,6 +199,8 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
                                 prompt_tokens: None,
                                 completion_tokens: None,
                                 total_tokens: None,
+                                cache_read_tokens: None,
+                                cache_write_tokens: None,
                                 worker_model: String::new(),
                                 prompt_hash: crate::bench::runner::prompt_hash(&case.prompt),
                                 system_prompt_hash: None,
@@ -456,13 +460,16 @@ pub fn cmd_bench_list_runs(store: &BenchStore) -> anyhow::Result<()> {
 fn print_result_table(results: &[crate::bench::store::BenchResult]) {
     let case_width = case_id_width(results.iter().map(|r| r.case_id.as_str()));
     println!(
-        "{case:<case_width$}  {tier:<4}  {status:<8}  {score:>5}  {latency:>8}  {tokens:>8}  {conf:>5}",
+        "{case:<case_width$}  {tier:<4}  {status:<8}  {score:>5}  {latency:>8}  {input:>8}  {output:>8}  {cache_r:>8}  {cache_w:>8}  {conf:>5}",
         case = "case",
         tier = "tier",
         status = "status",
         score = "score",
         latency = "latency",
-        tokens = "tokens",
+        input = "in",
+        output = "out",
+        cache_r = "cache_r",
+        cache_w = "cache_w",
         conf = "conf",
     );
     for r in results {
@@ -472,17 +479,25 @@ fn print_result_table(results: &[crate::bench::store::BenchResult]) {
         let conf = r
             .confidence
             .map_or(String::from("-"), |c| format!("{c:.2}"));
-        let tokens = r
-            .total_tokens
+        let input = r
+            .prompt_tokens
             .map_or(String::from("-"), |tokens| tokens.to_string());
+        let output = r
+            .completion_tokens
+            .map_or(String::from("-"), |tokens| tokens.to_string());
+        let cache_read = r.cache_read_tokens.unwrap_or(0);
+        let cache_write = r.cache_write_tokens.unwrap_or(0);
         println!(
-            "{case:<case_width$}  {tier:<4}  {status:<8}  {score:>5.2}  {latency:>8}  {tokens:>8}  {conf:>5}",
+            "{case:<case_width$}  {tier:<4}  {status:<8}  {score:>5.2}  {latency:>8}  {input:>8}  {output:>8}  {cache_read:>8}  {cache_write:>8}  {conf:>5}",
             case = r.case_id,
             tier = tier,
             status = status,
             score = r.score,
             latency = latency,
-            tokens = tokens,
+            input = input,
+            output = output,
+            cache_read = cache_read,
+            cache_write = cache_write,
             conf = conf,
         );
     }
@@ -496,12 +511,21 @@ fn print_result_details(result: &BenchResult) {
         status = result.status,
     );
     println!(
-        "score={score:.2} latency={latency}ms tokens={tokens} cost={cost}",
+        "score={score:.2} latency={latency}ms tokens_in={input} tokens_out={output} cache_r={cache_read} cache_w={cache_write} cost={cost}",
         score = result.score,
         latency = result.latency_ms,
-        tokens = result
-            .total_tokens
+        input = result
+            .prompt_tokens
             .map_or_else(|| "-".to_string(), |tokens| tokens.to_string()),
+        output = result
+            .completion_tokens
+            .map_or_else(|| "-".to_string(), |tokens| tokens.to_string()),
+        cache_read = result
+            .cache_read_tokens
+            .unwrap_or(0),
+        cache_write = result
+            .cache_write_tokens
+            .unwrap_or(0),
         cost = result.cost_cents.map_or_else(
             || "-".to_string(),
             |cents| format!("${:.2}", cents as f64 / 100.0),
@@ -544,6 +568,8 @@ fn summarize_run(
     let prompt_tokens = sum_tokens(results, |r| r.prompt_tokens);
     let completion_tokens = sum_tokens(results, |r| r.completion_tokens);
     let total_tokens = sum_tokens(results, |r| r.total_tokens);
+    let cache_read_tokens = sum_tokens(results, |r| r.cache_read_tokens);
+    let cache_write_tokens = sum_tokens(results, |r| r.cache_write_tokens);
     BenchRun {
         run_id: run_id.into(),
         started_at: Utc::now(),
@@ -575,6 +601,8 @@ fn summarize_run(
         prompt_tokens,
         completion_tokens,
         total_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
     }
 }
 
@@ -625,7 +653,7 @@ fn print_run_summary(r: &BenchRun) {
         variant = r.variant.as_deref().unwrap_or("-"),
     );
     println!(
-        "  results: pass={passed} fail={failed} error={errored} skipped={skipped} total={total} cost={cost} tokens={tokens}",
+        "  results: pass={passed} fail={failed} error={errored} skipped={skipped} total={total} cost={cost} tokens_in={input} tokens_out={output} cache_r={cache_read} cache_w={cache_write}",
         passed = r.passed,
         failed = r.failed,
         errored = r.errored,
@@ -635,9 +663,18 @@ fn print_run_summary(r: &BenchRun) {
             || "-".to_string(),
             |cents| format!("${:.2}", cents as f64 / 100.0),
         ),
-        tokens = r
-            .total_tokens
+        input = r
+            .prompt_tokens
             .map_or_else(|| "-".to_string(), |tokens| tokens.to_string()),
+        output = r
+            .completion_tokens
+            .map_or_else(|| "-".to_string(), |tokens| tokens.to_string()),
+        cache_read = r
+            .cache_read_tokens
+            .unwrap_or(0),
+        cache_write = r
+            .cache_write_tokens
+            .unwrap_or(0),
     );
     println!(
         "  models: worker={worker} grader={grader} selector={selector} key={key}",
@@ -745,6 +782,8 @@ mod tests {
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
             worker_model: "m".into(),
             prompt_hash: "h1".into(),
             system_prompt_hash: None,
@@ -782,6 +821,8 @@ mod tests {
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
         }
     }
 
@@ -866,6 +907,8 @@ text = "x"
                 prompt_tokens: None,
                 completion_tokens: None,
                 total_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
             })
             .unwrap();
         cmd_bench_show(&store, "run-1").unwrap();

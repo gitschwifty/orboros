@@ -65,6 +65,12 @@ pub struct BenchResult {
     pub completion_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<u64>,
+    /// Provider-reported prompt cache read tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    /// Provider-reported prompt cache write tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
     pub worker_model: String,
     /// SHA-256 of the prompt sent to the worker, hex-encoded —
     /// lets `bench compare` detect when the prompt changed between
@@ -156,6 +162,10 @@ pub struct BenchRun {
     pub completion_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
 }
 
 /// JSONL store at `<bench_dir>/`. Operations are append-only on disk;
@@ -438,6 +448,8 @@ mod tests {
             prompt_tokens: Some(20),
             completion_tokens: Some(10),
             total_tokens: Some(30),
+            cache_read_tokens: Some(4),
+            cache_write_tokens: Some(2),
             worker_model: "mock/test".into(),
             prompt_hash: "deadbeef".into(),
             system_prompt_hash: Some("cafe".into()),
@@ -475,6 +487,8 @@ mod tests {
             prompt_tokens: Some(60),
             completion_tokens: Some(30),
             total_tokens: Some(90),
+            cache_read_tokens: Some(12),
+            cache_write_tokens: Some(6),
         }
     }
 

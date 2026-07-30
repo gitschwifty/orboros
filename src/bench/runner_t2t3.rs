@@ -313,6 +313,11 @@ pub async fn run_t2_case(
             prompt_tokens: updated.execution.as_ref().and_then(|e| e.prompt_tokens),
             completion_tokens: updated.execution.as_ref().and_then(|e| e.completion_tokens),
             total_tokens: updated.execution.as_ref().and_then(|e| e.total_tokens),
+            cache_read_tokens: updated.execution.as_ref().and_then(|e| e.cached_tokens),
+            cache_write_tokens: updated
+                .execution
+                .as_ref()
+                .and_then(|e| e.cache_write_tokens),
             worker_model: base_worker_config.model.clone(),
             prompt_hash: prompt_hash(&case.prompt),
             system_prompt_hash: updated
@@ -362,6 +367,8 @@ pub async fn run_t2_case(
         prompt_tokens: execution.and_then(|e| e.prompt_tokens),
         completion_tokens: execution.and_then(|e| e.completion_tokens),
         total_tokens: execution.and_then(|e| e.total_tokens),
+        cache_read_tokens: execution.and_then(|e| e.cached_tokens),
+        cache_write_tokens: execution.and_then(|e| e.cache_write_tokens),
         worker_model: base_worker_config.model.clone(),
         prompt_hash: prompt_hash(&case.prompt),
         system_prompt_hash: execution.and_then(|e| e.system_prompt_hash.clone()),
@@ -671,6 +678,8 @@ impl T2DecomposeResultCtx<'_> {
             prompt_tokens: usage.prompt,
             completion_tokens: usage.completion,
             total_tokens: usage.total,
+            cache_read_tokens: usage.cache_read,
+            cache_write_tokens: usage.cache_write,
             worker_model: self.base_worker_config.model.clone(),
             prompt_hash: prompt_hash(&self.case.prompt),
             system_prompt_hash: execution.and_then(|e| e.system_prompt_hash.clone()),
@@ -687,6 +696,8 @@ struct AggregateUsage {
     prompt: Option<u64>,
     completion: Option<u64>,
     total: Option<u64>,
+    cache_read: Option<u64>,
+    cache_write: Option<u64>,
     cost_cents: Option<u64>,
 }
 
@@ -694,6 +705,8 @@ fn aggregate_orb_usage(orbs: &[Orb]) -> AggregateUsage {
     let mut prompt_tokens = 0u64;
     let mut completion_tokens = 0u64;
     let mut total_tokens = 0u64;
+    let mut cache_read_tokens = 0u64;
+    let mut cache_write_tokens = 0u64;
     let mut cost_cents: Option<u64> = None;
     for execution in orbs.iter().filter_map(|orb| orb.execution.as_ref()) {
         if let Some(tokens) = execution.prompt_tokens {
@@ -705,6 +718,12 @@ fn aggregate_orb_usage(orbs: &[Orb]) -> AggregateUsage {
         if let Some(tokens) = execution.total_tokens {
             total_tokens = total_tokens.saturating_add(tokens);
         }
+        if let Some(tokens) = execution.cached_tokens {
+            cache_read_tokens = cache_read_tokens.saturating_add(tokens);
+        }
+        if let Some(tokens) = execution.cache_write_tokens {
+            cache_write_tokens = cache_write_tokens.saturating_add(tokens);
+        }
         if let Some(cost_micros) = execution.cost_micros {
             let cents = crate::bench::runner::cost_micros_to_cents_ceil(cost_micros);
             cost_cents = Some(cost_cents.unwrap_or(0).saturating_add(cents));
@@ -714,6 +733,8 @@ fn aggregate_orb_usage(orbs: &[Orb]) -> AggregateUsage {
         prompt: nonzero_u64(prompt_tokens),
         completion: nonzero_u64(completion_tokens),
         total: nonzero_u64(total_tokens),
+        cache_read: nonzero_u64(cache_read_tokens),
+        cache_write: nonzero_u64(cache_write_tokens),
         cost_cents,
     }
 }
@@ -987,6 +1008,8 @@ pub fn run_t3_case_stub(
         prompt_tokens: None,
         completion_tokens: None,
         total_tokens: None,
+        cache_read_tokens: None,
+        cache_write_tokens: None,
         worker_model: String::new(),
         prompt_hash: prompt_hash(&case.prompt),
         system_prompt_hash: None,

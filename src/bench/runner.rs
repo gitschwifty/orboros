@@ -128,6 +128,8 @@ pub fn timeout_bench_result(
         prompt_tokens: None,
         completion_tokens: None,
         total_tokens: None,
+        cache_read_tokens: None,
+        cache_write_tokens: None,
         worker_model: worker_model.into(),
         prompt_hash: prompt_hash(&case.prompt),
         system_prompt_hash: None,
@@ -233,6 +235,8 @@ pub async fn run_t1_case_with_artifacts(
     let mut prompt_tokens: u64 = 0;
     let mut completion_tokens: u64 = 0;
     let mut total_tokens: u64 = 0;
+    let mut cache_read_tokens: u64 = 0;
+    let mut cache_write_tokens: u64 = 0;
 
     for attempt in 0..T1_ATTEMPTS {
         // Budget gate before spawning.
@@ -308,6 +312,8 @@ pub async fn run_t1_case_with_artifacts(
             &mut prompt_tokens,
             &mut completion_tokens,
             &mut total_tokens,
+            &mut cache_read_tokens,
+            &mut cache_write_tokens,
             &mut accumulated_cost,
             &outcome,
         );
@@ -410,6 +416,10 @@ pub async fn run_t1_case_with_artifacts(
         passes,
         fails,
         errors,
+        tokens_in = prompt_tokens,
+        tokens_out = completion_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
         elapsed_ms,
         "T1 case complete",
     );
@@ -426,6 +436,8 @@ pub async fn run_t1_case_with_artifacts(
         prompt_tokens: nonzero_u64(prompt_tokens),
         completion_tokens: nonzero_u64(completion_tokens),
         total_tokens: nonzero_u64(total_tokens),
+        cache_read_tokens: nonzero_u64(cache_read_tokens),
+        cache_write_tokens: nonzero_u64(cache_write_tokens),
         worker_model: base_worker_config.model.clone(),
         prompt_hash: prompt_hash(&case.prompt),
         system_prompt_hash: Some(prompt_hash(&t1_system_prompt())),
@@ -468,6 +480,8 @@ fn add_usage(
     prompt_tokens: &mut u64,
     completion_tokens: &mut u64,
     total_tokens: &mut u64,
+    cache_read_tokens: &mut u64,
+    cache_write_tokens: &mut u64,
     cost_cents: &mut Option<u64>,
     outcome: &SendOutcome,
 ) {
@@ -475,6 +489,12 @@ fn add_usage(
         *prompt_tokens = prompt_tokens.saturating_add(usage.prompt_tokens);
         *completion_tokens = completion_tokens.saturating_add(usage.completion_tokens);
         *total_tokens = total_tokens.saturating_add(usage.total_tokens);
+        if let Some(tokens) = usage.cached_tokens {
+            *cache_read_tokens = cache_read_tokens.saturating_add(tokens);
+        }
+        if let Some(tokens) = usage.cache_write_tokens {
+            *cache_write_tokens = cache_write_tokens.saturating_add(tokens);
+        }
         if let Some(cents) = usage.cost_micros.map(cost_micros_to_cents_ceil) {
             *cost_cents = Some(cost_cents.unwrap_or(0).saturating_add(cents));
         }
@@ -635,6 +655,8 @@ pub async fn run_t1(
         prompt_tokens: sum_result_tokens(&results, |r| r.prompt_tokens),
         completion_tokens: sum_result_tokens(&results, |r| r.completion_tokens),
         total_tokens: sum_result_tokens(&results, |r| r.total_tokens),
+        cache_read_tokens: sum_result_tokens(&results, |r| r.cache_read_tokens),
+        cache_write_tokens: sum_result_tokens(&results, |r| r.cache_write_tokens),
     };
     store.append_run(&summary)?;
 
@@ -697,6 +719,8 @@ mod tests {
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
             worker_model: "mock/model".into(),
             prompt_hash: "hash".into(),
             system_prompt_hash: None,

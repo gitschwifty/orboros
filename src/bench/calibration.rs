@@ -220,6 +220,8 @@ mod tests {
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
             worker_model: "m".into(),
             prompt_hash: "h".into(),
             system_prompt_hash: None,

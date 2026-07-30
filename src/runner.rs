@@ -68,9 +68,11 @@ pub async fn execute_task(
     if let Some(ref usage) = outcome.usage {
         task.worker_model = Some(config.model.clone());
         info!(
-            prompt_tokens = usage.prompt_tokens,
-            completion_tokens = usage.completion_tokens,
+            tokens_in = usage.prompt_tokens,
+            tokens_out = usage.completion_tokens,
             total_tokens = usage.total_tokens,
+            cache_read_tokens = usage.cached_tokens.unwrap_or(0),
+            cache_write_tokens = usage.cache_write_tokens.unwrap_or(0),
             "task completed; token usage recorded"
         );
     }
