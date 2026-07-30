@@ -203,7 +203,29 @@ Use the `order` field to express sequencing: subtasks with the same order may \
 run in parallel; lower numbers run first. Aim for 2-6 subtasks. Avoid trivial \
 one-line subtasks; each should be a meaningful unit of work. Set \
 `has_parent_final_work` to true only when the parent must perform its own \
-synthesis or verification after the children finish."
+synthesis or verification after the children finish.\
+\
+Scope each child for one focused worker. The child `description` must begin \
+with the actual concrete task, not with planning metadata. Add the following \
+sections only when they provide useful information; omit any section that is \
+not needed rather than filling it with boilerplate:\
+- Scope: the exact behavior or files this child owns.\
+- Inputs: existing files, interfaces, or completed sibling work it may rely on.\
+- Outputs: the files, symbols, or observable behavior it must produce.\
+- Deferred work: work intentionally left to later children or the parent; use \
+  this only when the boundary would otherwise be ambiguous.\
+- Verification: how this child can tell its own work is correct, including the \
+  narrowest useful command or inspection.\
+- Expected intermediate failures: tests or checks that may still fail because \
+  later work is not complete; include this only when applicable, explain why, \
+  and do not present those checks as passing.\
+\
+Do not give a child ownership of the entire parent feature merely because it \
+needs the parent requirements for context. Keep shared context brief, make \
+dependencies explicit through ordering, and avoid duplicating work across \
+siblings. A child may leave an intentionally unreferenced or incomplete \
+intermediate artifact when a later child is explicitly responsible for wiring \
+or integration."
         .to_string();
     let mut user = format!(
         "Title: {}\n\nDescription:\n{}\n",
@@ -523,6 +545,9 @@ mod tests {
         let (system, user) = build_prompt(&orb);
         assert!(system.contains("subtasks"));
         assert!(system.contains("order"));
+        assert!(system.contains("actual concrete task"));
+        assert!(system.contains("only when they provide useful information"));
+        assert!(system.contains("Deferred work:"));
         assert!(user.contains("Build auth"));
         assert!(user.contains("Make it work"));
         assert!(user.contains("Use PKCE flow"));
