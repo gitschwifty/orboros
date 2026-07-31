@@ -5,6 +5,7 @@ private
 .env.*
 /bench
 /bench/
+bench-results
 
 
 # Added by cargo
