@@ -15,6 +15,7 @@ use chrono::Utc;
 use tracing::{info, warn};
 
 use crate::bench::case::{BenchCase, BenchExpected, BenchTier, DEFAULT_TIMEOUT_S};
+use crate::bench::prompts::PromptManifest;
 use crate::bench::store::{new_run_id, BenchResult, BenchRun, BenchStatus, BenchStore};
 use crate::ipc::types::{ResultStatus, RuntimeMode, RuntimePlacementConfig};
 use crate::routing::profile::builtin_tools;
@@ -157,6 +158,7 @@ pub struct BenchRunConfig {
     pub worker_model: Option<String>,
     pub grader_model: Option<String>,
     pub prompt_variant: Option<String>,
+    pub prompt_manifest: Option<PromptManifest>,
     pub cases_root: Option<String>,
     pub bench_config_path: Option<String>,
     pub orboros_commit: Option<String>,
@@ -169,13 +171,14 @@ impl BenchRunConfig {
     #[must_use]
     pub fn config_hash_input(&self, base_worker_config: &WorkerConfig) -> String {
         format!(
-            "variant={:?}\nmodel_selector={:?}\nmodel_key={:?}\nworker_model={:?}\ngrader_model={:?}\nprompt_variant={:?}\ncases_root={:?}\nbench_config_path={:?}\norboros_commit={:?}\nbench_commit={:?}\ntimeout_s={:?}\nmax_iterations={:?}\nworker_command={}\nsystem_prompt={}",
+            "variant={:?}\nmodel_selector={:?}\nmodel_key={:?}\nworker_model={:?}\ngrader_model={:?}\nprompt_variant={:?}\nprompt_manifest={:?}\ncases_root={:?}\nbench_config_path={:?}\norboros_commit={:?}\nbench_commit={:?}\ntimeout_s={:?}\nmax_iterations={:?}\nworker_command={}\nsystem_prompt={}",
             self.variant,
             self.model_selector,
             self.model_key,
             self.worker_model,
             self.grader_model,
             self.prompt_variant,
+            self.prompt_manifest,
             self.cases_root,
             self.bench_config_path,
             self.orboros_commit,
@@ -668,6 +671,7 @@ pub async fn run_t1(
             .or_else(|| Some(base_worker_config.model.clone())),
         grader_model: run_config.grader_model.clone(),
         prompt_variant: run_config.prompt_variant.clone(),
+        prompt_manifest: run_config.prompt_manifest.clone(),
         cases_root: run_config.cases_root.clone(),
         bench_config_path: run_config.bench_config_path.clone(),
         orboros_commit: run_config.orboros_commit.clone(),

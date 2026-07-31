@@ -1051,6 +1051,7 @@ fn cmd_bench(
                 worker_model: Some(resolved_model.model.clone()),
                 grader_model: Some(resolved_grader),
                 prompt_variant: prompt_set.as_ref().map(|set| set.name.clone()),
+                prompt_manifest: prompt_set.as_ref().map(|set| set.manifest()),
                 cases_root: Some(cases_root.display().to_string()),
                 bench_config_path: resolved_bench_config
                     .as_ref()
