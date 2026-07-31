@@ -20,6 +20,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::bench::case::BenchTier;
+use crate::bench::prompts::PromptManifest;
 
 /// Outcome of a single case execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +152,10 @@ pub struct BenchRun {
     /// Prompt variant label once prompt candidate loading is wired.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_variant: Option<String>,
+    /// Selected prompt files, composition order, and resulting role hashes.
+    /// Detailed inputs are also copied beneath the run artifact directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_manifest: Option<PromptManifest>,
     /// Corpus root used for the run, for provenance when cases live
     /// in a sibling private repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -462,6 +467,7 @@ pub fn new_run_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bench::prompts::{PromptInputFile, PromptManifest, PromptRoleManifest};
 
     fn sample_result(run_id: &str, case_id: &str) -> BenchResult {
         BenchResult {
@@ -506,7 +512,23 @@ mod tests {
             model_key: Some("fast".into()),
             worker_model: Some("mock/test".into()),
             grader_model: Some("mock/grader".into()),
-            prompt_variant: None,
+            prompt_variant: Some("composable-v1".into()),
+            prompt_manifest: Some(PromptManifest {
+                prompt_set: "composable-v1".into(),
+                composition: Some(PromptInputFile {
+                    path: "composition.toml".into(),
+                    sha256: "definition".into(),
+                }),
+                roles: vec![PromptRoleManifest {
+                    role: "decompose".into(),
+                    assembly: "composed".into(),
+                    assembled_sha256: "assembled".into(),
+                    fragments: vec![PromptInputFile {
+                        path: "base/worker.md".into(),
+                        sha256: "fragment".into(),
+                    }],
+                }],
+            }),
             cases_root: Some("bench/cases".into()),
             bench_config_path: None,
             orboros_commit: None,
