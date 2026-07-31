@@ -123,8 +123,14 @@ pub fn timeout_bench_result(
         status: BenchStatus::Error,
         score: 0.0,
         latency_ms: u64::from(timeout_s).saturating_mul(1000),
+        model_latency_ms: None,
+        tool_latency_ms: None,
+        total_latency_ms: None,
         cost_cents: None,
+        cost_micros: None,
         iterations: 0,
+        assistant_turns: None,
+        tool_calls: None,
         prompt_tokens: None,
         completion_tokens: None,
         total_tokens: None,
@@ -227,9 +233,11 @@ pub async fn run_t1_case_with_artifacts(
     let mut passes: u32 = 0;
     let mut fails: u32 = 0;
     let mut errors: u32 = 0;
-    let mut accumulated_cost: Option<u64> = None;
+    let mut accumulated_cost_micros: Option<u64> = None;
     let mut last_confidence: Option<f32> = None;
     let mut total_iters: u32 = 0;
+    let mut assistant_turns: u32 = 0;
+    let mut tool_calls: u32 = 0;
     let mut last_error: Option<String> = None;
     let mut output = String::new();
     let mut prompt_tokens: u64 = 0;
@@ -237,15 +245,21 @@ pub async fn run_t1_case_with_artifacts(
     let mut total_tokens: u64 = 0;
     let mut cache_read_tokens: u64 = 0;
     let mut cache_write_tokens: u64 = 0;
+    let mut saw_usage = false;
+    let mut model_latency_ms: Option<u64> = None;
+    let mut tool_latency_ms: Option<u64> = None;
+    let mut total_latency_ms: Option<u64> = None;
 
     for attempt in 0..T1_ATTEMPTS {
         // Budget gate before spawning.
-        if let Some(cost) = accumulated_cost {
-            if !opts.no_budget && cost >= u64::from(case.max_cost_cents) {
+        if let Some(cost_micros) = accumulated_cost_micros {
+            if !opts.no_budget
+                && cost_micros >= u64::from(case.max_cost_cents).saturating_mul(10_000)
+            {
                 warn!(
                     case = %case.id,
                     attempt,
-                    accumulated_cost = cost,
+                    accumulated_cost_micros = cost_micros,
                     max = case.max_cost_cents,
                     "skipping remaining attempts: max_cost_cents exceeded"
                 );
@@ -314,9 +328,16 @@ pub async fn run_t1_case_with_artifacts(
             &mut total_tokens,
             &mut cache_read_tokens,
             &mut cache_write_tokens,
-            &mut accumulated_cost,
+            &mut accumulated_cost_micros,
             &outcome,
         );
+        saw_usage |= outcome.usage.is_some();
+        add_optional_ms(&mut model_latency_ms, outcome.model_latency_ms);
+        add_optional_ms(&mut tool_latency_ms, outcome.tool_latency_ms);
+        add_optional_ms(&mut total_latency_ms, outcome.total_latency_ms);
+        assistant_turns = assistant_turns.saturating_add(outcome.iterations);
+        tool_calls = tool_calls
+            .saturating_add(u32::try_from(outcome.tool_calls_made.len()).unwrap_or(u32::MAX));
 
         if outcome.status != ResultStatus::Ok {
             let err = send_outcome_error(&outcome);
@@ -431,13 +452,19 @@ pub async fn run_t1_case_with_artifacts(
         status,
         score,
         latency_ms: elapsed_ms,
-        cost_cents: accumulated_cost,
+        model_latency_ms,
+        tool_latency_ms,
+        total_latency_ms,
+        cost_cents: accumulated_cost_micros.map(cost_micros_to_cents_ceil),
+        cost_micros: accumulated_cost_micros,
         iterations: total_iters,
-        prompt_tokens: nonzero_u64(prompt_tokens),
-        completion_tokens: nonzero_u64(completion_tokens),
-        total_tokens: nonzero_u64(total_tokens),
-        cache_read_tokens: nonzero_u64(cache_read_tokens),
-        cache_write_tokens: nonzero_u64(cache_write_tokens),
+        assistant_turns: nonzero_u32(assistant_turns),
+        tool_calls: (attempts_run > 0).then_some(tool_calls),
+        prompt_tokens: saw_usage.then_some(prompt_tokens),
+        completion_tokens: saw_usage.then_some(completion_tokens),
+        total_tokens: saw_usage.then_some(total_tokens),
+        cache_read_tokens: saw_usage.then_some(cache_read_tokens),
+        cache_write_tokens: saw_usage.then_some(cache_write_tokens),
         worker_model: base_worker_config.model.clone(),
         prompt_hash: prompt_hash(&case.prompt),
         system_prompt_hash: Some(prompt_hash(&t1_system_prompt())),
@@ -482,7 +509,7 @@ fn add_usage(
     total_tokens: &mut u64,
     cache_read_tokens: &mut u64,
     cache_write_tokens: &mut u64,
-    cost_cents: &mut Option<u64>,
+    cost_micros: &mut Option<u64>,
     outcome: &SendOutcome,
 ) {
     if let Some(usage) = &outcome.usage {
@@ -495,8 +522,8 @@ fn add_usage(
         if let Some(tokens) = usage.cache_write_tokens {
             *cache_write_tokens = cache_write_tokens.saturating_add(tokens);
         }
-        if let Some(cents) = usage.cost_micros.map(cost_micros_to_cents_ceil) {
-            *cost_cents = Some(cost_cents.unwrap_or(0).saturating_add(cents));
+        if let Some(micros) = usage.cost_micros {
+            *cost_micros = Some(cost_micros.unwrap_or(0).saturating_add(micros));
         }
     }
 }
@@ -581,8 +608,8 @@ pub async fn run_t1(
             Ok(result) => result?,
             Err(_) => timeout_bench_result(case, &run_id, &base_worker_config.model, timeout_s),
         };
-        if let Some(cost) = r.cost_cents {
-            total_cost = Some(total_cost.unwrap_or(0).saturating_add(cost));
+        if let Some(cost_micros) = r.cost_micros {
+            total_cost = Some(total_cost.unwrap_or(0).saturating_add(cost_micros));
         }
         store.append_result(&r)?;
         let fatal = is_fatal_worker_error(&r);
@@ -651,12 +678,15 @@ pub async fn run_t1(
         errored,
         skipped,
         config_hash: prompt_hash(&run_config.config_hash_input(base_worker_config)),
-        total_cost_cents: total_cost,
+        total_cost_cents: total_cost.map(cost_micros_to_cents_ceil),
+        total_cost_micros: total_cost,
         prompt_tokens: sum_result_tokens(&results, |r| r.prompt_tokens),
         completion_tokens: sum_result_tokens(&results, |r| r.completion_tokens),
         total_tokens: sum_result_tokens(&results, |r| r.total_tokens),
         cache_read_tokens: sum_result_tokens(&results, |r| r.cache_read_tokens),
         cache_write_tokens: sum_result_tokens(&results, |r| r.cache_write_tokens),
+        assistant_turns: sum_result_u32(&results, |r| r.assistant_turns),
+        tool_calls: sum_result_u32(&results, |r| r.tool_calls),
     };
     store.append_run(&summary)?;
 
@@ -671,10 +701,33 @@ fn sum_result_tokens(
     results: &[BenchResult],
     field: impl Fn(&BenchResult) -> Option<u64>,
 ) -> Option<u64> {
+    let mut measured = false;
+    let total = results
+        .iter()
+        .filter_map(|result| {
+            let value = field(result);
+            measured |= value.is_some();
+            value
+        })
+        .fold(0u64, u64::saturating_add);
+    measured.then_some(total)
+}
+
+fn add_optional_ms(total: &mut Option<u64>, value: Option<u64>) {
+    if let Some(value) = value {
+        *total = Some(total.unwrap_or(0).saturating_add(value));
+    }
+}
+
+fn sum_result_u32(
+    results: &[BenchResult],
+    field: impl Fn(&BenchResult) -> Option<u32>,
+) -> Option<u64> {
     nonzero_u64(
         results
             .iter()
             .filter_map(field)
+            .map(u64::from)
             .fold(0u64, u64::saturating_add),
     )
 }
@@ -714,8 +767,14 @@ mod tests {
             status,
             score: 0.0,
             latency_ms: 0,
+            model_latency_ms: None,
+            tool_latency_ms: None,
+            total_latency_ms: None,
             cost_cents: None,
+            cost_micros: None,
             iterations: 0,
+            assistant_turns: None,
+            tool_calls: None,
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: None,
@@ -872,5 +931,14 @@ mod tests {
     fn run_options_default_enforces_budget() {
         let opts = RunOptions::default();
         assert!(!opts.no_budget, "default must enforce budget");
+    }
+
+    #[test]
+    fn cost_rounding_is_only_for_legacy_cents() {
+        assert_eq!(cost_micros_to_cents_ceil(0), 0);
+        assert_eq!(cost_micros_to_cents_ceil(1), 1);
+        assert_eq!(cost_micros_to_cents_ceil(9_999), 1);
+        assert_eq!(cost_micros_to_cents_ceil(10_000), 1);
+        assert_eq!(cost_micros_to_cents_ceil(10_001), 2);
     }
 }

@@ -28,6 +28,7 @@ use orbs::task::TaskStatus;
 use tracing::{debug, warn};
 
 use crate::bench::case::{BenchCase, BenchExpected, BenchRunner, BenchTier};
+use crate::bench::prompts::BenchPromptSet;
 use crate::bench::runner::{effective_max_iterations, nonzero_u64, prompt_hash, RunOptions};
 use crate::bench::store::{BenchResult, BenchStatus};
 use crate::ipc::types::{RuntimeMode, RuntimePlacementConfig};
@@ -233,6 +234,7 @@ pub async fn run_t2_case(
     base_worker_config: &WorkerConfig,
     opts: &RunOptions,
     artifact_dir: Option<&Path>,
+    prompt_set: Option<&BenchPromptSet>,
 ) -> Result<BenchResult, HarnessError> {
     if case.runner == Some(BenchRunner::Decompose) {
         return run_t2_decompose_case(
@@ -242,6 +244,7 @@ pub async fn run_t2_case(
             base_worker_config,
             opts,
             artifact_dir,
+            prompt_set,
         )
         .await;
     }
@@ -286,7 +289,12 @@ pub async fn run_t2_case(
     if let Some(max_iterations) = effective_max_iterations(case, opts) {
         wc.max_iterations = Some(max_iterations);
     }
-    let ql = QueueLoop::new(orb_store.clone(), dep_store, workdir.clone());
+    let ql = if let Some(set) = prompt_set {
+        QueueLoop::new(orb_store.clone(), dep_store, workdir.clone())
+            .with_prompt_config(set.prompt_config())
+    } else {
+        QueueLoop::new(orb_store.clone(), dep_store, workdir.clone())
+    };
     ql.tick()?;
     let completed = ql.dispatch_ready_orbs(&wc, 1).await?;
     let updated = orb_store.load_by_id(&orb_id)?.ok_or_else(|| {
@@ -304,12 +312,18 @@ pub async fn run_t2_case(
             status: BenchStatus::Error,
             score: 0.0,
             latency_ms: elapsed_ms,
+            model_latency_ms: updated.execution.as_ref().and_then(|e| e.model_latency_ms),
+            tool_latency_ms: updated.execution.as_ref().and_then(|e| e.tool_latency_ms),
+            total_latency_ms: updated.execution.as_ref().and_then(|e| e.total_latency_ms),
             cost_cents: updated
                 .execution
                 .as_ref()
                 .and_then(|e| e.cost_micros)
                 .map(crate::bench::runner::cost_micros_to_cents_ceil),
+            cost_micros: updated.execution.as_ref().and_then(|e| e.cost_micros),
             iterations: 0,
+            assistant_turns: updated.execution.as_ref().and_then(|e| e.assistant_turns),
+            tool_calls: updated.execution.as_ref().and_then(|e| e.tool_calls),
             prompt_tokens: updated.execution.as_ref().and_then(|e| e.prompt_tokens),
             completion_tokens: updated.execution.as_ref().and_then(|e| e.completion_tokens),
             total_tokens: updated.execution.as_ref().and_then(|e| e.total_tokens),
@@ -360,10 +374,16 @@ pub async fn run_t2_case(
             0.0
         },
         latency_ms: elapsed_ms,
+        model_latency_ms: execution.and_then(|e| e.model_latency_ms),
+        tool_latency_ms: execution.and_then(|e| e.tool_latency_ms),
+        total_latency_ms: execution.and_then(|e| e.total_latency_ms),
         cost_cents: execution
             .and_then(|e| e.cost_micros)
             .map(crate::bench::runner::cost_micros_to_cents_ceil),
+        cost_micros: execution.and_then(|e| e.cost_micros),
         iterations: 1,
+        assistant_turns: execution.and_then(|e| e.assistant_turns),
+        tool_calls: execution.and_then(|e| e.tool_calls),
         prompt_tokens: execution.and_then(|e| e.prompt_tokens),
         completion_tokens: execution.and_then(|e| e.completion_tokens),
         total_tokens: execution.and_then(|e| e.total_tokens),
@@ -397,6 +417,7 @@ async fn run_t2_decompose_case(
     base_worker_config: &WorkerConfig,
     opts: &RunOptions,
     artifact_dir: Option<&Path>,
+    prompt_set: Option<&BenchPromptSet>,
 ) -> Result<BenchResult, HarnessError> {
     let started = Instant::now();
     if case.tier != BenchTier::T2 {
@@ -438,11 +459,14 @@ async fn run_t2_decompose_case(
     if let Some(max_iterations) = effective_max_iterations(case, opts) {
         wc.max_iterations = Some(max_iterations);
     }
-    let ql = QueueLoop::new(orb_store.clone(), dep_store.clone(), workdir.clone())
+    let mut ql = QueueLoop::new(orb_store.clone(), dep_store.clone(), workdir.clone())
         .with_review_config(crate::config::ReviewConfig {
             requires_approval_by_default: false,
             review_on_completion: false,
         });
+    if let Some(set) = prompt_set {
+        ql = ql.with_prompt_config(set.prompt_config());
+    }
     let result_ctx = T2DecomposeResultCtx {
         case,
         run_id,
@@ -672,9 +696,15 @@ impl T2DecomposeResultCtx<'_> {
                 0.0
             },
             latency_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            model_latency_ms: usage.model_latency,
+            tool_latency_ms: usage.tool_latency,
+            total_latency_ms: usage.total_latency,
             cost_cents: usage.cost_cents,
+            cost_micros: usage.cost_micros,
             iterations: u32::try_from(orbs.iter().filter(|orb| orb.execution.is_some()).count())
                 .unwrap_or(u32::MAX),
+            assistant_turns: usage.assistant_turns,
+            tool_calls: usage.tool_calls,
             prompt_tokens: usage.prompt,
             completion_tokens: usage.completion,
             total_tokens: usage.total,
@@ -699,6 +729,12 @@ struct AggregateUsage {
     cache_read: Option<u64>,
     cache_write: Option<u64>,
     cost_cents: Option<u64>,
+    cost_micros: Option<u64>,
+    model_latency: Option<u64>,
+    tool_latency: Option<u64>,
+    total_latency: Option<u64>,
+    assistant_turns: Option<u32>,
+    tool_calls: Option<u32>,
 }
 
 fn aggregate_orb_usage(orbs: &[Orb]) -> AggregateUsage {
@@ -707,7 +743,12 @@ fn aggregate_orb_usage(orbs: &[Orb]) -> AggregateUsage {
     let mut total_tokens = 0u64;
     let mut cache_read_tokens = 0u64;
     let mut cache_write_tokens = 0u64;
-    let mut cost_cents: Option<u64> = None;
+    let mut cost_micros: Option<u64> = None;
+    let mut model_latency: Option<u64> = None;
+    let mut tool_latency: Option<u64> = None;
+    let mut total_latency: Option<u64> = None;
+    let mut assistant_turns: Option<u32> = None;
+    let mut tool_calls: Option<u32> = None;
     for execution in orbs.iter().filter_map(|orb| orb.execution.as_ref()) {
         if let Some(tokens) = execution.prompt_tokens {
             prompt_tokens = prompt_tokens.saturating_add(tokens);
@@ -724,10 +765,18 @@ fn aggregate_orb_usage(orbs: &[Orb]) -> AggregateUsage {
         if let Some(tokens) = execution.cache_write_tokens {
             cache_write_tokens = cache_write_tokens.saturating_add(tokens);
         }
-        if let Some(cost_micros) = execution.cost_micros {
-            let cents = crate::bench::runner::cost_micros_to_cents_ceil(cost_micros);
-            cost_cents = Some(cost_cents.unwrap_or(0).saturating_add(cents));
+        if let Some(provider_cost_micros) = execution.cost_micros {
+            cost_micros = Some(
+                cost_micros
+                    .unwrap_or(0)
+                    .saturating_add(provider_cost_micros),
+            );
         }
+        add_optional_ms(&mut model_latency, execution.model_latency_ms);
+        add_optional_ms(&mut tool_latency, execution.tool_latency_ms);
+        add_optional_ms(&mut total_latency, execution.total_latency_ms);
+        add_optional_u32(&mut assistant_turns, execution.assistant_turns);
+        add_optional_u32(&mut tool_calls, execution.tool_calls);
     }
     AggregateUsage {
         prompt: nonzero_u64(prompt_tokens),
@@ -735,7 +784,25 @@ fn aggregate_orb_usage(orbs: &[Orb]) -> AggregateUsage {
         total: nonzero_u64(total_tokens),
         cache_read: nonzero_u64(cache_read_tokens),
         cache_write: nonzero_u64(cache_write_tokens),
-        cost_cents,
+        cost_cents: cost_micros.map(crate::bench::runner::cost_micros_to_cents_ceil),
+        cost_micros,
+        model_latency,
+        tool_latency,
+        total_latency,
+        assistant_turns,
+        tool_calls,
+    }
+}
+
+fn add_optional_ms(total: &mut Option<u64>, value: Option<u64>) {
+    if let Some(value) = value {
+        *total = Some(total.unwrap_or(0).saturating_add(value));
+    }
+}
+
+fn add_optional_u32(total: &mut Option<u32>, value: Option<u32>) {
+    if let Some(value) = value {
+        *total = Some(total.unwrap_or(0).saturating_add(value));
     }
 }
 
@@ -1003,8 +1070,14 @@ pub fn run_t3_case_stub(
         status: BenchStatus::Error,
         score: 0.0,
         latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        model_latency_ms: None,
+        tool_latency_ms: None,
+        total_latency_ms: None,
         cost_cents: None,
+        cost_micros: None,
         iterations: 0,
+        assistant_turns: None,
+        tool_calls: None,
         prompt_tokens: None,
         completion_tokens: None,
         total_tokens: None,
@@ -1214,6 +1287,7 @@ done
             &wc,
             &RunOptions::default(),
             Some(&artifact_dir),
+            None,
         )
         .await
         .unwrap();
@@ -1249,9 +1323,17 @@ done
         let script = write_editing_worker(dir.path());
         let wc = worker_config(&script);
         let case = t2_case_with_seed("t2-x", "nope", "true");
-        let err = run_t2_case(&case, "run-x", &fixtures, &wc, &RunOptions::default(), None)
-            .await
-            .unwrap_err();
+        let err = run_t2_case(
+            &case,
+            "run-x",
+            &fixtures,
+            &wc,
+            &RunOptions::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, HarnessError::SeedRepoMissing(_)));
     }
 
@@ -1266,9 +1348,17 @@ done
         wc.args = vec![];
 
         let case = t2_case_with_seed("t2-fail", "small", "true");
-        let r = run_t2_case(&case, "run-x", &fixtures, &wc, &RunOptions::default(), None)
-            .await
-            .unwrap();
+        let r = run_t2_case(
+            &case,
+            "run-x",
+            &fixtures,
+            &wc,
+            &RunOptions::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(r.status, BenchStatus::Error);
         let err = r.error.unwrap();
         assert!(

@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.96"
 
 [dependencies]
-orbs = { git = "https://github.com/gitschwifty/orbs", rev = "c36cd2e5a028d3cdb1c89b8a09976e3ca0edea9c" }
+orbs = { git = "https://github.com/gitschwifty/orbs", rev = "c9ec92c790a308320354867d16bbdde8beb73f93" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

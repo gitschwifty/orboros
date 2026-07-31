@@ -84,6 +84,7 @@ pub struct QueueLoop {
     paused: Arc<AtomicBool>,
     hooks: Option<Arc<crate::hooks::HookSink>>,
     review_config: Option<crate::config::ReviewConfig>,
+    prompt_config: Option<crate::config::PromptConfig>,
 }
 
 impl QueueLoop {
@@ -97,6 +98,7 @@ impl QueueLoop {
             paused: Arc::new(AtomicBool::new(false)),
             hooks: None,
             review_config: None,
+            prompt_config: None,
         }
     }
 
@@ -106,6 +108,14 @@ impl QueueLoop {
     #[must_use]
     pub fn with_review_config(mut self, review_config: crate::config::ReviewConfig) -> Self {
         self.review_config = Some(review_config);
+        self
+    }
+
+    /// Overrides prompt configuration for an embedded run, such as a
+    /// benchmark prompt-set experiment.
+    #[must_use]
+    pub fn with_prompt_config(mut self, prompt_config: crate::config::PromptConfig) -> Self {
+        self.prompt_config = Some(prompt_config);
         self
     }
 
@@ -666,7 +676,10 @@ impl QueueLoop {
         if let Some(review_config) = &self.review_config {
             orb_config.review = review_config.clone();
         }
-        let prompt_config = orb_config.prompts.clone();
+        let prompt_config = self
+            .prompt_config
+            .clone()
+            .unwrap_or_else(|| orb_config.prompts.clone());
         let prompt_resolver =
             crate::prompt::PromptResolver::from_config(prompt_config, Some(&self.base_dir));
 

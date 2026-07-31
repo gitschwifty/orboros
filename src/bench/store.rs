@@ -52,13 +52,34 @@ pub struct BenchResult {
     pub status: BenchStatus,
     /// Pass rate across N=3 (or however many) attempts, in `[0.0, 1.0]`.
     pub score: f32,
+    /// Wall-clock elapsed time; retained as `latency_ms` for schema
+    /// compatibility. This is not provider/model latency.
     pub latency_ms: u64,
+    /// Provider/model latency reported by Heddle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_latency_ms: Option<u64>,
+    /// Tool execution latency reported by Heddle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_latency_ms: Option<u64>,
+    /// Heddle-reported total worker latency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_latency_ms: Option<u64>,
     /// Actual provider cost in cents, when the worker reports it or
     /// the harness can price it accurately. `None` means unknown;
     /// benchmark code must not write placeholder estimates here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_cents: Option<u64>,
+    /// Exact provider cost in micro-dollars. New results use this field for
+    /// aggregation and display; `cost_cents` remains for compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<u64>,
     pub iterations: u32,
+    /// Number of assistant/model turns reported by the worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_turns: Option<u32>,
+    /// Number of tool calls reported by the worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -156,6 +177,9 @@ pub struct BenchRun {
     /// actual cost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_cost_cents: Option<u64>,
+    /// Exact aggregate provider cost in micro-dollars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cost_micros: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -166,6 +190,10 @@ pub struct BenchRun {
     pub cache_read_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_turns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<u64>,
 }
 
 /// JSONL store at `<bench_dir>/`. Operations are append-only on disk;
@@ -443,8 +471,14 @@ mod tests {
             status: BenchStatus::Pass,
             score: 1.0,
             latency_ms: 1234,
+            model_latency_ms: Some(1000),
+            tool_latency_ms: Some(200),
+            total_latency_ms: Some(1200),
             cost_cents: Some(3),
+            cost_micros: Some(25_000),
             iterations: 1,
+            assistant_turns: Some(1),
+            tool_calls: Some(0),
             prompt_tokens: Some(20),
             completion_tokens: Some(10),
             total_tokens: Some(30),
@@ -484,11 +518,14 @@ mod tests {
             skipped: 0,
             config_hash: "feedface".into(),
             total_cost_cents: Some(9),
+            total_cost_micros: Some(90_000),
             prompt_tokens: Some(60),
             completion_tokens: Some(30),
             total_tokens: Some(90),
             cache_read_tokens: Some(12),
             cache_write_tokens: Some(6),
+            assistant_turns: Some(3),
+            tool_calls: Some(2),
         }
     }
 

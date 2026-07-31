@@ -230,6 +230,9 @@ enum BenchAction {
         /// Human-readable variant label stored with the run.
         #[arg(long)]
         variant: Option<String>,
+        /// Named Markdown prompt set under <bench-root>/prompts/.
+        #[arg(long)]
+        prompt_set: Option<String>,
         /// Skip the per-case cost ceiling (`max_cost_cents`).
         #[arg(long)]
         no_budget: bool,
@@ -988,6 +991,7 @@ fn cmd_bench(
             case,
             model,
             variant,
+            prompt_set,
             no_budget,
         } => {
             let tier = match tier.as_deref() {
@@ -1033,6 +1037,10 @@ fn cmd_bench(
             let binary =
                 bench_prereq_check(Some(binary), &resolved_model.model, skip_prereq_check)?;
             let worker_config = make_worker_config(&binary, &resolved_model.model, "");
+            let prompt_set = prompt_set
+                .as_deref()
+                .map(|name| orboros::bench::prompts::BenchPromptSet::load(bench_root, name))
+                .transpose()?;
             let run_config = BenchRunConfig {
                 variant,
                 model_selector: model
@@ -1042,7 +1050,7 @@ fn cmd_bench(
                 model_key: resolved_model.key.clone(),
                 worker_model: Some(resolved_model.model.clone()),
                 grader_model: Some(resolved_grader),
-                prompt_variant: None,
+                prompt_variant: prompt_set.as_ref().map(|set| set.name.clone()),
                 cases_root: Some(cases_root.display().to_string()),
                 bench_config_path: resolved_bench_config
                     .as_ref()
@@ -1064,6 +1072,7 @@ fn cmd_bench(
                 max_iterations: cfg.bench.max_iterations,
                 run_config: &run_config,
                 fixtures_root: &fixtures_root,
+                prompt_set: prompt_set.as_ref(),
             }))
         }
         BenchAction::Show { run_id } => bench_cmd::cmd_bench_show(&store, &run_id),
