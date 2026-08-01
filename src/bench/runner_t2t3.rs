@@ -1,6 +1,6 @@
 //! T2/T3 benchmark runner support.
 //!
-//! - **T2**: copy `seed_repo` (under `bench/fixtures/<name>/`) to a
+//! - **T2**: copy the case-local `fixture/` directory to a
 //!   tempdir, run a targeted Orboros task/decomposition scenario
 //!   against the copy, then evaluate the expectation
 //!   (`TestsPass { command }` runs the command in the copied repo and
@@ -45,9 +45,9 @@ const MAX_DECOMPOSE_STEPS: usize = 32;
 /// unexpected becomes `BenchStatus::Error` with the message attached.
 #[derive(Debug, thiserror::Error)]
 pub enum HarnessError {
-    #[error("seed repo `{0}` not found under bench/fixtures/")]
+    #[error("fixture directory `{0}` is missing")]
     SeedRepoMissing(String),
-    #[error("test overlay `{0}` not found under bench/fixtures/")]
+    #[error("test overlay `{0}` is missing")]
     TestOverlayMissing(String),
     #[error("expected `tests_pass.command` for T2 case `{0}`")]
     MissingTestsCommand(String),
@@ -59,29 +59,19 @@ pub enum HarnessError {
     Io(#[from] std::io::Error),
 }
 
-/// Copies a seed repo from `<fixtures_root>/<name>` into a tempdir.
+/// Copies a case fixture into a tempdir.
 /// Returns the destination path. Uses `cp -r` for simplicity — the
 /// seed repos are intentionally small.
 ///
 /// # Errors
 ///
-/// Returns [`HarnessError::SeedRepoMissing`] when the named seed
-/// doesn't exist, or [`HarnessError::Io`] for filesystem failures.
-pub fn copy_seed_repo(
-    fixtures_root: &Path,
-    seed_name: &Path,
-    dest: &Path,
-) -> Result<PathBuf, HarnessError> {
-    let src = fixtures_root.join(seed_name);
+/// Returns [`HarnessError::SeedRepoMissing`] when the fixture doesn't
+/// exist, or [`HarnessError::Io`] for filesystem failures.
+pub fn copy_fixture(src: &Path, dest: &Path) -> Result<PathBuf, HarnessError> {
     if !src.exists() {
-        return Err(HarnessError::SeedRepoMissing(
-            seed_name.display().to_string(),
-        ));
+        return Err(HarnessError::SeedRepoMissing(src.display().to_string()));
     }
-    let dest_root = dest.join(seed_name.file_name().map_or_else(
-        || std::ffi::OsString::from("seed"),
-        std::ffi::OsStr::to_os_string,
-    ));
+    let dest_root = dest.join("fixture");
     std::fs::create_dir_all(&dest_root)?;
     // Recursive copy. cp -a preserves modes; we use -R for portability
     // (BSD cp doesn't honor -a on macOS the same way).
@@ -106,16 +96,9 @@ pub fn copy_seed_repo(
 ///
 /// Returns [`HarnessError::TestOverlayMissing`] when the named overlay
 /// does not exist, or [`HarnessError::Io`] for filesystem failures.
-pub fn copy_test_overlay(
-    fixtures_root: &Path,
-    overlay_name: &Path,
-    workdir: &Path,
-) -> Result<(), HarnessError> {
-    let src = fixtures_root.join(overlay_name);
+pub fn copy_test_overlay(src: &Path, workdir: &Path) -> Result<(), HarnessError> {
     if !src.exists() {
-        return Err(HarnessError::TestOverlayMissing(
-            overlay_name.display().to_string(),
-        ));
+        return Err(HarnessError::TestOverlayMissing(src.display().to_string()));
     }
     let status = Command::new("cp")
         .arg("-R")
@@ -130,13 +113,9 @@ pub fn copy_test_overlay(
     Ok(())
 }
 
-fn copy_case_test_overlay(
-    fixtures_root: &Path,
-    case: &BenchCase,
-    workdir: &Path,
-) -> Result<(), HarnessError> {
-    if let Some(overlay) = case.test_overlay.as_deref() {
-        copy_test_overlay(fixtures_root, overlay, workdir)?;
+fn copy_case_test_overlay(case: &BenchCase, workdir: &Path) -> Result<(), HarnessError> {
+    if let Some(overlay) = case.test_overlay_dir.as_deref() {
+        copy_test_overlay(overlay, workdir)?;
     }
     Ok(())
 }
@@ -230,7 +209,6 @@ pub fn parse_rubric_verdict(grader_response: &str) -> Option<bool> {
 pub async fn run_t2_case(
     case: &BenchCase,
     run_id: &str,
-    fixtures_root: &Path,
     base_worker_config: &WorkerConfig,
     opts: &RunOptions,
     artifact_dir: Option<&Path>,
@@ -240,7 +218,6 @@ pub async fn run_t2_case(
         return run_t2_decompose_case(
             case,
             run_id,
-            fixtures_root,
             base_worker_config,
             opts,
             artifact_dir,
@@ -257,18 +234,17 @@ pub async fn run_t2_case(
             "run_t2_case called on non-T2 case"
         );
     }
-    let seed = case
-        .seed_repo
+    let seed_dir = case
+        .fixture_dir
         .as_deref()
         .ok_or_else(|| HarnessError::SeedRepoMissing("(none specified)".into()))?;
-    let seed_dir = fixtures_root.join(seed);
     let command = match &case.expected {
         BenchExpected::TestsPass { command } => command.clone(),
         _ => return Err(HarnessError::MissingTestsCommand(case.id.clone())),
     };
 
     let temp = TempWorkDir::new(&case.id)?;
-    let workdir = copy_seed_repo(fixtures_root, seed, temp.path())?;
+    let workdir = copy_fixture(seed_dir, temp.path())?;
     let state_dir = workdir.join(".orbs");
     std::fs::create_dir_all(&state_dir)?;
     let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
@@ -352,7 +328,7 @@ pub async fn run_t2_case(
         });
     }
 
-    copy_case_test_overlay(fixtures_root, case, &workdir)?;
+    copy_case_test_overlay(case, &workdir)?;
     let tests = evaluate_tests_pass_output(&workdir, &command)?;
     let artifact_path = snapshot_workdir(&seed_dir, &workdir, artifact_dir, &case.id)?;
     let status = if updated.status == Some(OrbStatus::Done) && tests.passed {
@@ -413,7 +389,6 @@ pub async fn run_t2_case(
 async fn run_t2_decompose_case(
     case: &BenchCase,
     run_id: &str,
-    fixtures_root: &Path,
     base_worker_config: &WorkerConfig,
     opts: &RunOptions,
     artifact_dir: Option<&Path>,
@@ -427,18 +402,17 @@ async fn run_t2_decompose_case(
             "run_t2_decompose_case called on non-T2 case"
         );
     }
-    let seed = case
-        .seed_repo
+    let seed_dir = case
+        .fixture_dir
         .as_deref()
         .ok_or_else(|| HarnessError::SeedRepoMissing("(none specified)".into()))?;
-    let seed_dir = fixtures_root.join(seed);
     let command = match &case.expected {
         BenchExpected::TestsPass { command } => command.clone(),
         _ => return Err(HarnessError::MissingTestsCommand(case.id.clone())),
     };
 
     let temp = TempWorkDir::new(&case.id)?;
-    let workdir = copy_seed_repo(fixtures_root, seed, temp.path())?;
+    let workdir = copy_fixture(seed_dir, temp.path())?;
     let state_dir = workdir.join(".orbs");
     std::fs::create_dir_all(&state_dir)?;
     let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
@@ -487,7 +461,7 @@ async fn run_t2_decompose_case(
             .iter()
             .any(|orb| orb.effective_status() == TaskStatus::Failed)
         {
-            copy_case_test_overlay(fixtures_root, case, &workdir)?;
+            copy_case_test_overlay(case, &workdir)?;
             let tests = evaluate_tests_pass_output(&workdir, &command).ok();
             let artifact_path = snapshot_workdir(&seed_dir, &workdir, artifact_dir, &case.id)?;
             return Ok(result_ctx.result(
@@ -513,7 +487,7 @@ async fn run_t2_decompose_case(
                 .is_some_and(|orb| orb.effective_status() == TaskStatus::Done)
         {
             let _ = ql.tick()?;
-            copy_case_test_overlay(fixtures_root, case, &workdir)?;
+            copy_case_test_overlay(case, &workdir)?;
             let tests = evaluate_tests_pass_output(&workdir, &command)?;
             let artifact_path = snapshot_workdir(&seed_dir, &workdir, artifact_dir, &case.id)?;
             let final_orbs = orb_store.load_all()?;
@@ -538,7 +512,7 @@ async fn run_t2_decompose_case(
         } else {
             stalled_steps = stalled_steps.saturating_add(1);
             if stalled_steps >= 2 {
-                copy_case_test_overlay(fixtures_root, case, &workdir)?;
+                copy_case_test_overlay(case, &workdir)?;
                 let tests = evaluate_tests_pass_output(&workdir, &command).ok();
                 let artifact_path = snapshot_workdir(&seed_dir, &workdir, artifact_dir, &case.id)?;
                 return Ok(result_ctx.result(
@@ -553,7 +527,7 @@ async fn run_t2_decompose_case(
     }
 
     let all_orbs = orb_store.load_all()?;
-    copy_case_test_overlay(fixtures_root, case, &workdir)?;
+    copy_case_test_overlay(case, &workdir)?;
     let tests = evaluate_tests_pass_output(&workdir, &command).ok();
     let artifact_path = snapshot_workdir(&seed_dir, &workdir, artifact_dir, &case.id)?;
     Ok(result_ctx.result(
@@ -1100,7 +1074,7 @@ pub fn run_t3_case_stub(
 mod tests {
     use super::*;
 
-    fn t2_case_with_seed(id: &str, seed: &str, command: &str) -> BenchCase {
+    fn t2_case_with_seed(id: &str, fixture_dir: PathBuf, command: &str) -> BenchCase {
         BenchCase {
             id: id.into(),
             tier: BenchTier::T2,
@@ -1111,11 +1085,13 @@ mod tests {
                 command: command.into(),
             },
             runner: None,
-            seed_repo: Some(PathBuf::from(seed)),
-            test_overlay: None,
             timeout_s: Some(60),
             max_iterations: None,
             max_cost_cents: 100,
+            selector: id.into(),
+            case_dir: PathBuf::new(),
+            fixture_dir: Some(fixture_dir),
+            test_overlay_dir: None,
         }
     }
 
@@ -1155,47 +1131,43 @@ done
         path
     }
 
-    // ── copy_seed_repo ────────────────────────────────────────
+    // ── copy_fixture ──────────────────────────────────────────
 
     #[test]
-    fn copy_seed_repo_copies_files_recursively() {
+    fn copy_fixture_copies_files_recursively() {
         let dir = tempfile::tempdir().unwrap();
-        let src_root = dir.path().join("fixtures").join("small");
+        let src_root = dir.path().join("small");
         std::fs::create_dir_all(src_root.join("inner")).unwrap();
         std::fs::write(src_root.join("README"), "hi").unwrap();
         std::fs::write(src_root.join("inner").join("a.txt"), "a").unwrap();
 
         let dest = dir.path().join("work");
         std::fs::create_dir_all(&dest).unwrap();
-        let copied =
-            copy_seed_repo(&dir.path().join("fixtures"), Path::new("small"), &dest).unwrap();
+        let copied = copy_fixture(&src_root, &dest).unwrap();
 
         assert!(copied.join("README").exists());
         assert!(copied.join("inner").join("a.txt").exists());
     }
 
     #[test]
-    fn copy_seed_repo_missing_fixture_errors() {
+    fn copy_fixture_missing_fixture_errors() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("fixtures")).unwrap();
         let dest = dir.path().join("work");
         std::fs::create_dir_all(&dest).unwrap();
-        let err =
-            copy_seed_repo(&dir.path().join("fixtures"), Path::new("nope"), &dest).unwrap_err();
+        let err = copy_fixture(&dir.path().join("nope"), &dest).unwrap_err();
         assert!(matches!(err, HarnessError::SeedRepoMissing(_)));
     }
 
     #[test]
     fn copy_test_overlay_merges_files_into_workdir() {
         let dir = tempfile::tempdir().unwrap();
-        let fixtures = dir.path().join("fixtures");
-        let overlay = fixtures.join("tests-overlay");
+        let overlay = dir.path().join("tests-overlay");
         std::fs::create_dir_all(overlay.join("tests")).unwrap();
         std::fs::write(overlay.join("tests").join("api.rs"), "test").unwrap();
         let workdir = dir.path().join("work");
         std::fs::create_dir_all(&workdir).unwrap();
 
-        copy_test_overlay(&fixtures, Path::new("tests-overlay"), &workdir).unwrap();
+        copy_test_overlay(&overlay, &workdir).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(workdir.join("tests").join("api.rs")).unwrap(),
@@ -1272,18 +1244,17 @@ done
     #[tokio::test]
     async fn t2_runner_dispatches_worker_and_grades_seed_repo() {
         let dir = tempfile::tempdir().unwrap();
-        let fixtures = dir.path().join("fixtures");
-        std::fs::create_dir_all(fixtures.join("small")).unwrap();
-        std::fs::write(fixtures.join("small").join("README"), "hi").unwrap();
+        let fixture = dir.path().join("small");
+        std::fs::create_dir_all(&fixture).unwrap();
+        std::fs::write(fixture.join("README"), "hi").unwrap();
         let script = write_editing_worker(dir.path());
         let wc = worker_config(&script);
 
-        let case = t2_case_with_seed("t2-1", "small", "test \"$(cat result.txt)\" = done");
+        let case = t2_case_with_seed("t2-1", fixture, "test \"$(cat result.txt)\" = done");
         let artifact_dir = dir.path().join("artifacts").join("t2-1");
         let r = run_t2_case(
             &case,
             "run-x",
-            &fixtures,
             &wc,
             &RunOptions::default(),
             Some(&artifact_dir),
@@ -1318,47 +1289,29 @@ done
     #[tokio::test]
     async fn t2_runner_errors_when_seed_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let fixtures = dir.path().join("fixtures");
-        std::fs::create_dir_all(&fixtures).unwrap();
         let script = write_editing_worker(dir.path());
         let wc = worker_config(&script);
-        let case = t2_case_with_seed("t2-x", "nope", "true");
-        let err = run_t2_case(
-            &case,
-            "run-x",
-            &fixtures,
-            &wc,
-            &RunOptions::default(),
-            None,
-            None,
-        )
-        .await
-        .unwrap_err();
+        let case = t2_case_with_seed("t2-x", dir.path().join("nope"), "true");
+        let err = run_t2_case(&case, "run-x", &wc, &RunOptions::default(), None, None)
+            .await
+            .unwrap_err();
         assert!(matches!(err, HarnessError::SeedRepoMissing(_)));
     }
 
     #[tokio::test]
     async fn t2_runner_records_worker_failure_message() {
         let dir = tempfile::tempdir().unwrap();
-        let fixtures = dir.path().join("fixtures");
-        std::fs::create_dir_all(fixtures.join("small")).unwrap();
-        std::fs::write(fixtures.join("small").join("README"), "hi").unwrap();
+        let fixture = dir.path().join("small");
+        std::fs::create_dir_all(&fixture).unwrap();
+        std::fs::write(fixture.join("README"), "hi").unwrap();
         let mut wc = worker_config(Path::new("unused"));
         wc.command = "definitely-not-an-orboros-worker".into();
         wc.args = vec![];
 
-        let case = t2_case_with_seed("t2-fail", "small", "true");
-        let r = run_t2_case(
-            &case,
-            "run-x",
-            &fixtures,
-            &wc,
-            &RunOptions::default(),
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let case = t2_case_with_seed("t2-fail", fixture, "true");
+        let r = run_t2_case(&case, "run-x", &wc, &RunOptions::default(), None, None)
+            .await
+            .unwrap();
         assert_eq!(r.status, BenchStatus::Error);
         let err = r.error.unwrap();
         assert!(
@@ -1430,11 +1383,13 @@ done
                 criteria: vec!["builds".into()],
             },
             runner: None,
-            seed_repo: None,
-            test_overlay: None,
             timeout_s: Some(60),
             max_iterations: None,
             max_cost_cents: 100,
+            selector: "t3-1".into(),
+            case_dir: PathBuf::new(),
+            fixture_dir: None,
+            test_overlay_dir: None,
         };
         let r = run_t3_case_stub(&case, "run-x", &RunOptions::default()).unwrap();
         assert_eq!(r.status, BenchStatus::Error);

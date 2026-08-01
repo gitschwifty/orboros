@@ -198,7 +198,7 @@ enum Commands {
     ReviewQueue,
     /// Benchmark corpus + harness (task 59).
     Bench {
-        /// Root containing cases/, fixtures/, prompts/, and results/.
+        /// Root containing t1/, t2/, t3/, prompts/, and results/.
         #[arg(long, env = "ORBOROS_BENCH_ROOT", default_value = "bench")]
         bench_root: PathBuf,
         /// Benchmark config file. Defaults to `<bench-root>/config.toml` when present.
@@ -978,14 +978,12 @@ fn cmd_bench(
     use orboros::bench::runner::BenchRunConfig;
     use orboros::bench::store::BenchStore;
     use orboros::config::ModelRole;
-    let cases_root = bench_root.join("cases");
-    let fixtures_root = bench_root.join("fixtures");
     let bench_dir =
         bench_results_dir.map_or_else(|| bench_root.join("results"), std::path::Path::to_path_buf);
     let store = BenchStore::new(&bench_dir);
 
     match action {
-        BenchAction::List => bench_cmd::cmd_bench_list(&cases_root),
+        BenchAction::List => bench_cmd::cmd_bench_list(bench_root),
         BenchAction::Run {
             tier,
             case,
@@ -1052,7 +1050,7 @@ fn cmd_bench(
                 grader_model: Some(resolved_grader),
                 prompt_variant: prompt_set.as_ref().map(|set| set.name.clone()),
                 prompt_manifest: prompt_set.as_ref().map(|set| set.manifest()),
-                cases_root: Some(cases_root.display().to_string()),
+                cases_root: Some(bench_root.display().to_string()),
                 bench_config_path: resolved_bench_config
                     .as_ref()
                     .map(|path| path.display().to_string()),
@@ -1063,7 +1061,7 @@ fn cmd_bench(
             };
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(bench_cmd::cmd_bench_run(bench_cmd::BenchRunRequest {
-                cases_root: &cases_root,
+                bench_root,
                 store: &store,
                 tier,
                 case_id: case.as_deref(),
@@ -1072,7 +1070,6 @@ fn cmd_bench(
                 timeout_s: cfg.bench.timeout_s,
                 max_iterations: cfg.bench.max_iterations,
                 run_config: &run_config,
-                fixtures_root: &fixtures_root,
                 prompt_set: prompt_set.as_ref(),
             }))
         }

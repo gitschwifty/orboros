@@ -21,7 +21,7 @@ use crate::bench::store::{BenchResult, BenchRun, BenchStatus, BenchStore};
 use crate::worker::process::WorkerConfig;
 
 pub struct BenchRunRequest<'a> {
-    pub cases_root: &'a Path,
+    pub bench_root: &'a Path,
     pub store: &'a BenchStore,
     pub tier: Option<BenchTier>,
     pub case_id: Option<&'a str>,
@@ -30,7 +30,6 @@ pub struct BenchRunRequest<'a> {
     pub timeout_s: Option<u32>,
     pub max_iterations: Option<u32>,
     pub run_config: &'a BenchRunConfig,
-    pub fixtures_root: &'a Path,
     pub prompt_set: Option<&'a BenchPromptSet>,
 }
 
@@ -39,10 +38,10 @@ pub struct BenchRunRequest<'a> {
 /// # Errors
 ///
 /// Returns an error if loading the corpus fails (malformed TOML, etc.).
-pub fn cmd_bench_list(cases_root: &Path) -> anyhow::Result<()> {
-    let cases = load_all(cases_root).context("failed to load benchmark corpus")?;
+pub fn cmd_bench_list(bench_root: &Path) -> anyhow::Result<()> {
+    let cases = load_all(bench_root).context("failed to load benchmark corpus")?;
     if cases.is_empty() {
-        println!("No benchmark cases found under {}", cases_root.display());
+        println!("No benchmark cases found under {}", bench_root.display());
         return Ok(());
     }
     let id_width = cases
@@ -60,7 +59,8 @@ pub fn cmd_bench_list(cases_root: &Path) -> anyhow::Result<()> {
         let cost = case.max_cost_cents;
         let timeout = case.timeout_s.unwrap_or(DEFAULT_TIMEOUT_S);
         println!(
-            "  {id:<id_width$} {name}  (max ${cost_dollars:.2}, {timeout}s)",
+            "  {selector:<id_width$} {name}  ({id}; max ${cost_dollars:.2}, {timeout}s)",
+            selector = case.selector,
             id = case.id,
             name = case.name,
             cost_dollars = f64::from(cost) / 100.0,
@@ -85,13 +85,13 @@ pub fn cmd_bench_list(cases_root: &Path) -> anyhow::Result<()> {
 #[allow(clippy::too_many_lines)]
 pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
     let mut cases = match req.tier {
-        Some(t) => load_tier(req.cases_root, t)?,
-        None => load_all(req.cases_root)?,
+        Some(t) => load_tier(req.bench_root, t)?,
+        None => load_all(req.bench_root)?,
     };
     if let Some(id) = req.case_id {
-        cases.retain(|c| c.id == id);
+        cases.retain(|c| c.id == id || c.selector == id);
         if cases.is_empty() {
-            anyhow::bail!("no case found with id `{id}`");
+            anyhow::bail!("no case found with id or selector `{id}`");
         }
     }
     if cases.is_empty() {
@@ -147,7 +147,6 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
                 crate::bench::runner_t2t3::run_t2_case(
                     case,
                     &run_id,
-                    req.fixtures_root,
                     req.worker_config,
                     &opts,
                     Some(&artifact_dir),

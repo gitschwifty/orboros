@@ -111,11 +111,13 @@ fn t1_case(id: &str, prompt: &str, expected: BenchExpected) -> BenchCase {
         prompt: prompt.into(),
         expected,
         runner: None,
-        seed_repo: None,
-        test_overlay: None,
         timeout_s: Some(60),
         max_iterations: None,
         max_cost_cents: 100,
+        selector: id.into(),
+        case_dir: std::path::PathBuf::new(),
+        fixture_dir: None,
+        test_overlay_dir: None,
     }
 }
 
@@ -365,13 +367,12 @@ async fn run_t1_stops_after_protocol_mismatch_without_retries() {
 
 #[test]
 fn local_t1_corpus_path_is_optional() {
-    // Benchmark cases live under gitignored bench/cases so private
+    // Benchmark cases live under gitignored bench/t1 so private
     // eval prompts and seed repos do not publish with the repo.
     use orboros::bench::case::{load_tier, BenchTier};
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let repo_root = manifest_dir;
-    let cases_root = repo_root.join("bench").join("cases");
-    let cases = load_tier(&cases_root, BenchTier::T1).unwrap();
+    let cases = load_tier(&repo_root.join("bench"), BenchTier::T1).unwrap();
     for c in &cases {
         assert_eq!(c.tier, BenchTier::T1, "case {} has wrong tier", c.id);
         assert!(

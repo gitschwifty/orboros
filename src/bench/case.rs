@@ -1,8 +1,10 @@
 //! Benchmark case schema and loader.
 //!
-//! Cases live as TOML files under `bench/cases/<tier>/<id>.toml`.
+//! Cases live in self-contained directories under
+//! `bench/<tier>/<NNN>-<slug>/case.toml`.
 //! Loaded eagerly at harness startup.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -100,14 +102,6 @@ pub struct BenchCase {
     /// Optional runner override. Defaults to `single_task`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner: Option<BenchRunner>,
-    /// Optional seed repo path (T2). Relative to `bench/fixtures/`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seed_repo: Option<PathBuf>,
-    /// Optional test overlay path (T2). Relative to `bench/fixtures/`.
-    /// Copied into the temp project immediately before grading, after
-    /// the worker has completed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub test_overlay: Option<PathBuf>,
     /// Per-case timeout in seconds. Overrides `[bench].timeout_s`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_s: Option<u32>,
@@ -119,6 +113,19 @@ pub struct BenchCase {
     /// unless invoked with `--no-budget`.
     #[serde(default = "default_max_cost_cents")]
     pub max_cost_cents: u32,
+    /// Stable human-facing selector derived from the case directory,
+    /// for example `t2.001`. It is not part of case.toml.
+    #[serde(skip)]
+    pub selector: String,
+    /// Directory containing `case.toml` and optional local resources.
+    #[serde(skip)]
+    pub case_dir: PathBuf,
+    /// T2 fixture directory, when present at `<case_dir>/fixture`.
+    #[serde(skip)]
+    pub fixture_dir: Option<PathBuf>,
+    /// Optional grading overlay at `<case_dir>/overlay`.
+    #[serde(skip)]
+    pub test_overlay_dir: Option<PathBuf>,
 }
 
 fn default_max_cost_cents() -> u32 {
@@ -149,6 +156,14 @@ pub enum CorpusError {
         file_tier: BenchTier,
         expected_tier: BenchTier,
     },
+    #[error("invalid case directory {path}; expected NNN-slug")]
+    InvalidCaseDirectory { path: PathBuf },
+    #[error("missing case.toml in case directory {path}")]
+    MissingCaseFile { path: PathBuf },
+    #[error("T2 case {path} is missing its fixture/ directory")]
+    MissingFixture { path: PathBuf },
+    #[error("duplicate benchmark selector `{selector}` under {path}")]
+    DuplicateSelector { path: PathBuf, selector: String },
 }
 
 /// Loads a single case from a TOML file. Verifies the embedded `tier`
@@ -163,7 +178,7 @@ pub fn load_case(path: &Path, expected_tier: Option<BenchTier>) -> Result<BenchC
         path: path.to_path_buf(),
         source: e,
     })?;
-    let case: BenchCase = toml::from_str(&raw).map_err(|e| CorpusError::Parse {
+    let mut case: BenchCase = toml::from_str(&raw).map_err(|e| CorpusError::Parse {
         path: path.to_path_buf(),
         source: e,
     })?;
@@ -176,11 +191,15 @@ pub fn load_case(path: &Path, expected_tier: Option<BenchTier>) -> Result<BenchC
             });
         }
     }
+    case.selector = case.id.clone();
+    case.case_dir = path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+    case.fixture_dir = None;
+    case.test_overlay_dir = None;
     Ok(case)
 }
 
-/// Loads all cases under `root/<tier>/`. Skips non-`.toml` files.
-/// Returns cases sorted by id for stable iteration.
+/// Loads all cases under `root/<tier>/<NNN>-<slug>/case.toml`.
+/// Returns cases sorted by their numeric selectors for stable iteration.
 ///
 /// # Errors
 ///
@@ -192,18 +211,56 @@ pub fn load_tier(root: &Path, tier: BenchTier) -> Result<Vec<BenchCase>, CorpusE
     if !dir.exists() {
         return Ok(Vec::new());
     }
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Ok(Vec::new());
-    };
+    let entries = std::fs::read_dir(&dir).map_err(|e| CorpusError::Read {
+        path: dir.clone(),
+        source: e,
+    })?;
     let mut out = Vec::new();
+    let mut selectors = HashSet::new();
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("toml") {
+        let case_dir = entry.path();
+        if !case_dir.is_dir() {
             continue;
         }
-        out.push(load_case(&path, Some(tier))?);
+        let Some(name) = case_dir.file_name().and_then(|name| name.to_str()) else {
+            return Err(CorpusError::InvalidCaseDirectory { path: case_dir });
+        };
+        let Some((number, slug)) = name.split_once('-') else {
+            return Err(CorpusError::InvalidCaseDirectory { path: case_dir });
+        };
+        if number.len() != 3 || !number.chars().all(char::is_numeric) || slug.is_empty() {
+            return Err(CorpusError::InvalidCaseDirectory { path: case_dir });
+        }
+        let path = case_dir.join("case.toml");
+        if !path.is_file() {
+            return Err(CorpusError::MissingCaseFile { path: case_dir });
+        }
+        let mut case = load_case(&path, Some(tier))?;
+        if case.id != slug {
+            return Err(CorpusError::IdMismatch {
+                path,
+                file_id: case.id,
+                expected_id: slug.to_owned(),
+            });
+        }
+        let fixture = case_dir.join("fixture");
+        if tier == BenchTier::T2 && !fixture.is_dir() {
+            return Err(CorpusError::MissingFixture { path: case_dir });
+        }
+        case.selector = format!("{}.{}", tier.as_str(), number);
+        if !selectors.insert(case.selector.clone()) {
+            return Err(CorpusError::DuplicateSelector {
+                path: case_dir,
+                selector: case.selector,
+            });
+        }
+        case.case_dir = case_dir.clone();
+        case.fixture_dir = fixture.is_dir().then_some(fixture);
+        let overlay = case_dir.join("overlay");
+        case.test_overlay_dir = overlay.is_dir().then_some(overlay);
+        out.push(case);
     }
-    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out.sort_by(|a, b| a.selector.cmp(&b.selector));
     Ok(out)
 }
 
@@ -299,7 +356,7 @@ text = "hello"
         assert_eq!(case.tier, BenchTier::T1);
         assert_eq!(case.timeout_s, None, "timeout inherits harness default");
         assert_eq!(case.max_cost_cents, 50, "default cost ceiling applied");
-        assert!(case.seed_repo.is_none());
+        assert!(case.fixture_dir.is_none());
         match case.expected {
             BenchExpected::Exact { text } => assert_eq!(text, "hello"),
             _ => panic!("wrong variant"),
@@ -315,7 +372,6 @@ tier = "t2"
 name = "Add --dry-run flag"
 description = "Modify the CLI to accept --dry-run."
 prompt = "Add a --dry-run flag to the CLI."
-seed_repo = "small-cli"
 timeout_s = 300
 max_cost_cents = 200
 
@@ -328,9 +384,9 @@ command = "cargo test"
         assert_eq!(case.tier, BenchTier::T2);
         assert_eq!(case.timeout_s, Some(300));
         assert_eq!(case.max_cost_cents, 200);
-        assert_eq!(
-            case.seed_repo.as_deref().and_then(Path::to_str),
-            Some("small-cli")
+        assert!(
+            case.fixture_dir.is_none(),
+            "direct loading has no local fixture metadata"
         );
     }
 
@@ -381,14 +437,16 @@ text = "x"
     }
 
     #[test]
-    fn load_tier_returns_sorted_cases() {
+    fn load_tier_returns_numbered_cases_in_selector_order() {
         let dir = tempfile::tempdir().unwrap();
         let t1_dir = dir.path().join("t1");
         std::fs::create_dir_all(&t1_dir).unwrap();
-        for id in ["c", "a", "b"] {
+        for (number, id) in [("003", "c"), ("001", "a"), ("002", "b")] {
+            let case_dir = t1_dir.join(format!("{number}-{id}"));
+            std::fs::create_dir_all(&case_dir).unwrap();
             write_case(
-                &t1_dir,
-                &format!("{id}.toml"),
+                &case_dir,
+                "case.toml",
                 &format!(
                     r#"
 id = "{id}"
@@ -408,17 +466,20 @@ text = "x"
             cases.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
             vec!["a", "b", "c"]
         );
+        assert_eq!(cases[0].selector, "t1.001");
     }
 
     #[test]
-    fn load_tier_skips_non_toml() {
+    fn load_tier_skips_non_case_directories() {
         let dir = tempfile::tempdir().unwrap();
         let t1_dir = dir.path().join("t1");
         std::fs::create_dir_all(&t1_dir).unwrap();
         std::fs::write(t1_dir.join("README.md"), "not a case").unwrap();
+        let case_dir = t1_dir.join("001-only");
+        std::fs::create_dir_all(&case_dir).unwrap();
         write_case(
-            &t1_dir,
-            "only.toml",
+            &case_dir,
+            "case.toml",
             r#"
 id = "only"
 tier = "t1"
@@ -435,6 +496,56 @@ text = "x"
     }
 
     #[test]
+    fn load_tier_rejects_t2_case_without_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let case_dir = dir.path().join("t2").join("001-missing-fixture");
+        std::fs::create_dir_all(&case_dir).unwrap();
+        write_case(
+            &case_dir,
+            "case.toml",
+            r#"
+id = "missing-fixture"
+tier = "t2"
+name = "n"
+description = "d"
+prompt = "p"
+[expected]
+kind = "tests_pass"
+command = "true"
+"#,
+        );
+        assert!(matches!(
+            load_tier(dir.path(), BenchTier::T2),
+            Err(CorpusError::MissingFixture { .. })
+        ));
+    }
+
+    #[test]
+    fn load_tier_rejects_slug_id_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let case_dir = dir.path().join("t1").join("001-directory-slug");
+        std::fs::create_dir_all(&case_dir).unwrap();
+        write_case(
+            &case_dir,
+            "case.toml",
+            r#"
+id = "different-id"
+tier = "t1"
+name = "n"
+description = "d"
+prompt = "p"
+[expected]
+kind = "exact"
+text = "x"
+"#,
+        );
+        assert!(matches!(
+            load_tier(dir.path(), BenchTier::T1),
+            Err(CorpusError::IdMismatch { .. })
+        ));
+    }
+
+    #[test]
     fn load_all_picks_up_all_three_tiers() {
         let dir = tempfile::tempdir().unwrap();
         for (tier, id) in [
@@ -442,11 +553,14 @@ text = "x"
             (BenchTier::T2, "b"),
             (BenchTier::T3, "c"),
         ] {
-            let tdir = dir.path().join(tier.as_str());
+            let tdir = dir.path().join(tier.as_str()).join(format!("001-{id}"));
             std::fs::create_dir_all(&tdir).unwrap();
+            if tier == BenchTier::T2 {
+                std::fs::create_dir(tdir.join("fixture")).unwrap();
+            }
             write_case(
                 &tdir,
-                &format!("{id}.toml"),
+                "case.toml",
                 &format!(
                     r#"
 id = "{id}"

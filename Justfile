@@ -7,14 +7,14 @@ default:
 # Create benchmark corpus directories. Override root with:
 # `just bench-init ../bench`.
 bench-init root="bench":
-    mkdir -p "{{root}}/cases/t1" "{{root}}/cases/t2" "{{root}}/cases/t3" "{{root}}/fixtures" "{{root}}/prompts" "{{root}}/results"
+    mkdir -p "{{root}}/t1" "{{root}}/t2" "{{root}}/t3" "{{root}}/fixtures" "{{root}}/prompts" "{{root}}/results"
 
 # List local benchmark cases.
 bench-list root="bench":
     cargo run -- bench --bench-root "{{root}}" list
 
 # Run all benchmark cases, optionally selecting a prompt set:
-# `just bench-run t2 ../orboros-bench composable-v1`.
+# `just bench-run t2 ../bench composable-v1`.
 bench-run tier="" root="bench" prompt_set="":
     @prompt_arg=""; \
     if [ -n "{{prompt_set}}" ]; then prompt_arg='--prompt-set "{{prompt_set}}"'; fi; \
@@ -63,13 +63,13 @@ bench-run-model model tier="" variant="" root="bench" prompt_set="":
 
 # Run an explicit model with a prompt set:
 # `just bench-run-model-prompt openrouter/free composable-v1 t2`.
-bench-run-model-prompt model prompt_set tier="" variant="" root="bench":
+bench-run-model-prompt model prompt_set tier="" variant="" root="bench": build-release
     @variant_arg=""; \
     if [ -n "{{variant}}" ]; then variant_arg='--variant "{{variant}}"'; fi; \
     if [ -n "{{tier}}" ]; then \
-        cargo run -- bench --bench-root "{{root}}" run --tier "{{tier}}" --model "{{model}}" --prompt-set "{{prompt_set}}" $variant_arg; \
+        ./target/release/orboros bench --bench-root "{{root}}" run --tier "{{tier}}" --model "{{model}}" --prompt-set "{{prompt_set}}" $variant_arg; \
     else \
-        cargo run -- bench --bench-root "{{root}}" run --model "{{model}}" --prompt-set "{{prompt_set}}" $variant_arg; \
+        ./target/release/orboros bench --bench-root "{{root}}" run --model "{{model}}" --prompt-set "{{prompt_set}}" $variant_arg; \
     fi
 
 # Build release, then run benchmark cases with an explicit model.
@@ -89,6 +89,14 @@ bench-case id root="bench" prompt_set="":
     @prompt_arg=""; \
     if [ -n "{{prompt_set}}" ]; then prompt_arg='--prompt-set "{{prompt_set}}"'; fi; \
     cargo run -- bench --bench-root "{{root}}" run --case "{{id}}" $prompt_arg
+
+# Run one case with an explicit model and prompt set. `id` accepts `t2.001`
+# or the canonical case ID. Example:
+# `just bench-case-model-prompt deepseek-v4-flash composable-v1 t2.001`.
+bench-case-model-prompt model prompt_set id variant="" root="bench": build-release
+    @variant_arg=""; \
+    if [ -n "{{variant}}" ]; then variant_arg='--variant "{{variant}}"'; fi; \
+    ./target/release/orboros bench --bench-root "{{root}}" run --case "{{id}}" --model "{{model}}" --prompt-set "{{prompt_set}}" $variant_arg
 
 # Show a saved benchmark run.
 bench-show run_id:
