@@ -265,12 +265,15 @@ pub async fn run_t2_case(
     if let Some(max_iterations) = effective_max_iterations(case, opts) {
         wc.max_iterations = Some(max_iterations);
     }
-    let ql = if let Some(set) = prompt_set {
+    let mut ql = if let Some(set) = prompt_set {
         QueueLoop::new(orb_store.clone(), dep_store, workdir.clone())
             .with_prompt_config(set.prompt_config())
     } else {
         QueueLoop::new(orb_store.clone(), dep_store, workdir.clone())
     };
+    if let Some(policy) = case.tool_policy.clone() {
+        ql = ql.with_tool_policy(policy);
+    }
     ql.tick()?;
     let completed = ql.dispatch_ready_orbs(&wc, 1).await?;
     let updated = orb_store.load_by_id(&orb_id)?.ok_or_else(|| {
@@ -440,6 +443,9 @@ async fn run_t2_decompose_case(
         });
     if let Some(set) = prompt_set {
         ql = ql.with_prompt_config(set.prompt_config());
+    }
+    if let Some(policy) = case.tool_policy.clone() {
+        ql = ql.with_tool_policy(policy);
     }
     let result_ctx = T2DecomposeResultCtx {
         case,
@@ -1088,6 +1094,7 @@ mod tests {
             timeout_s: Some(60),
             max_iterations: None,
             max_cost_cents: 100,
+            tool_policy: None,
             selector: id.into(),
             case_dir: PathBuf::new(),
             fixture_dir: Some(fixture_dir),
@@ -1386,6 +1393,7 @@ done
             timeout_s: Some(60),
             max_iterations: None,
             max_cost_cents: 100,
+            tool_policy: None,
             selector: "t3-1".into(),
             case_dir: PathBuf::new(),
             fixture_dir: None,

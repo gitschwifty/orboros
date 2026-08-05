@@ -85,6 +85,7 @@ pub struct QueueLoop {
     hooks: Option<Arc<crate::hooks::HookSink>>,
     review_config: Option<crate::config::ReviewConfig>,
     prompt_config: Option<crate::config::PromptConfig>,
+    tool_policy: Option<crate::routing::profile::PhaseToolPolicy>,
 }
 
 impl QueueLoop {
@@ -99,6 +100,7 @@ impl QueueLoop {
             hooks: None,
             review_config: None,
             prompt_config: None,
+            tool_policy: None,
         }
     }
 
@@ -116,6 +118,17 @@ impl QueueLoop {
     #[must_use]
     pub fn with_prompt_config(mut self, prompt_config: crate::config::PromptConfig) -> Self {
         self.prompt_config = Some(prompt_config);
+        self
+    }
+
+    /// Overrides phase tool policy for an embedded run, such as a benchmark
+    /// case. The dispatcher's base worker configuration remains a hard ceiling.
+    #[must_use]
+    pub fn with_tool_policy(
+        mut self,
+        tool_policy: crate::routing::profile::PhaseToolPolicy,
+    ) -> Self {
+        self.tool_policy = Some(tool_policy);
         self
     }
 
@@ -694,6 +707,7 @@ impl QueueLoop {
             let base_wc = base_worker_config.clone();
             let orb_config = orb_config.clone();
             let prompt_resolver = prompt_resolver.clone();
+            let tool_policy = self.tool_policy.clone();
             let context_orbs = Arc::clone(&context_orbs);
             let context_edges = Arc::clone(&context_edges);
             let hooks = self.hooks.as_ref().map(Arc::clone);
@@ -712,6 +726,7 @@ impl QueueLoop {
                     &base_wc,
                     &orb_config,
                     &prompt_resolver,
+                    tool_policy.as_ref(),
                     context,
                     hooks,
                 )
@@ -891,6 +906,26 @@ enum DispatchTarget {
 }
 
 impl DispatchTarget {
+    /// Stable key for a case-level phase override.
+    fn tool_policy_key(self) -> &'static str {
+        match self {
+            Self::Execute => "execute",
+            Self::Speccing => "speccing",
+            Self::Decomposing => "decomposing",
+            Self::Refining => "refining",
+            Self::Reevaluating => "reevaluating",
+        }
+    }
+
+    /// Phase profile name. Planning phases stay read-only; execution (including
+    /// parent-final work) receives implementation and verification tools.
+    fn tool_profile(self) -> &'static str {
+        match self {
+            Self::Execute => "execute",
+            Self::Speccing | Self::Decomposing | Self::Refining | Self::Reevaluating => "read_only",
+        }
+    }
+
     fn prompt_kind(self) -> crate::prompt::PromptKind<'static> {
         match self {
             Self::Execute => crate::prompt::PromptKind::Worker("execute"),
@@ -953,6 +988,7 @@ async fn dispatch_one_owned(
     base_wc: &crate::worker::process::WorkerConfig,
     model_config: &crate::config::OrbConfig,
     prompt_resolver: &crate::prompt::PromptResolver,
+    tool_policy: Option<&crate::routing::profile::PhaseToolPolicy>,
     context: DispatchContext<'_>,
     hooks: Option<Arc<crate::hooks::HookSink>>,
 ) -> std::io::Result<bool> {
@@ -989,6 +1025,13 @@ async fn dispatch_one_owned(
     if resolved_model.source != "default_model" {
         target_base_wc.model = resolved_model.model;
     }
+    target_base_wc.tools = crate::routing::profile::resolve_phase_tools(
+        &model_config.tool_profiles,
+        &base_wc.tools,
+        target.tool_policy_key(),
+        target.tool_profile(),
+        tool_policy,
+    );
     let wc = worker_config_for_with_model_config(&orb, &target_base_wc, &system, model_config)
         .map_err(std::io::Error::other)?;
     tracing::info!(
@@ -996,6 +1039,7 @@ async fn dispatch_one_owned(
         title = %orb.title,
         target = ?target,
         phase = %optional_debug(orb.phase),
+        tools = ?wc.tools,
         "dispatching ready orb",
     );
 
@@ -1005,7 +1049,7 @@ async fn dispatch_one_owned(
     let outcome = crate::worker::dispatcher::with_prompt_metadata(
         outcome,
         prompt_category,
-        &system,
+        &crate::worker::process::effective_system_prompt(&wc.system_prompt, &wc.tools),
         prompt_source,
     );
 
@@ -1394,6 +1438,60 @@ mod tests {
 
         // Task-type orbs don't get re-evaluated
         assert_eq!(result.orbs_reevaluated, 0);
+    }
+
+    #[tokio::test]
+    async fn dispatch_enforces_read_only_tools_for_speccing() {
+        let (_tmp, orb_store, dep_store, base) = setup();
+        let tools_path = base.join("received-tools.json");
+        let worker_path = base.join("capture-tools.sh");
+        std::fs::write(
+            &worker_path,
+            format!(
+                r#"while IFS= read -r line; do
+  type=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['type'])")
+  id=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['id'])")
+  case "$type" in
+    init) echo "$line" | python3 -c "import sys,json; print(json.dumps(json.load(sys.stdin)['config']['tools']))" > '{}'; echo "{{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"s\",\"protocol_version\":\"0.3.0\"}}" ;;
+    send) echo "{{\"type\":\"result\",\"id\":\"$id\",\"status\":\"ok\",\"response\":\"done\",\"tool_calls_made\":[],\"iterations\":1}}" ;;
+    shutdown) echo "{{\"type\":\"shutdown_ok\",\"id\":\"$id\"}}"; exit 0 ;;
+  esac
+done
+"#,
+                tools_path.display(),
+            ),
+        )
+        .unwrap();
+
+        let mut feature = Orb::new("Feature", "Design it").with_type(OrbType::Feature);
+        feature.set_phase(OrbPhase::Speccing).unwrap();
+        orb_store.append(&feature).unwrap();
+        let ql = QueueLoop::new(orb_store, dep_store, base.clone());
+        let worker = crate::worker::process::WorkerConfig {
+            command: "bash".into(),
+            args: vec![worker_path.to_string_lossy().into()],
+            cwd: Some(base),
+            env: vec![],
+            model: "mock/tools".into(),
+            system_prompt: String::new(),
+            tools: crate::routing::profile::builtin_tools("execute")
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            max_iterations: Some(1),
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
+            runtime: None,
+            routing: None,
+        };
+
+        assert_eq!(ql.dispatch_ready_orbs(&worker, 1).await.unwrap(), 1);
+        let tools: Vec<String> =
+            serde_json::from_str(&std::fs::read_to_string(tools_path).unwrap()).unwrap();
+        assert_eq!(tools, ["read_file", "glob", "grep"]);
     }
 
     // ── pause/resume ─────────────────────────────────────────────────

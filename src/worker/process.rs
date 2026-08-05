@@ -54,6 +54,33 @@ pub struct WorkerConfig {
     pub routing: Option<RoutingMetadata>,
 }
 
+/// Runtime guidance appended to every Heddle system prompt.
+///
+/// Heddle receives the same allowlist structurally in its init configuration,
+/// but spelling it out prevents a worker from wasting turns probing unavailable
+/// tools. Heddle control tools may still be visible; this instruction makes
+/// clear that they cannot be used to escape the Orboros capability boundary.
+#[must_use]
+pub fn effective_system_prompt(system_prompt: &str, tools: &[String]) -> String {
+    let tools = if tools.is_empty() {
+        "none".to_string()
+    } else {
+        tools
+            .iter()
+            .map(|tool| format!("`{tool}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!(
+        "{system_prompt}\n\n## Runtime capabilities\n\
+This is a non-interactive worker session: do not call `ask_user` or wait for \
+user input. Your Orboros-permitted repository tools are: {tools}. Do not \
+attempt tools outside that inventory. Do not use subagents or other control \
+tools to obtain capabilities that are not listed; complete the assigned role \
+with the available tools and return the required result."
+    )
+}
+
 /// A running worker process communicating over JSON-line IPC.
 #[allow(clippy::struct_field_names)]
 pub struct Worker {
@@ -215,7 +242,7 @@ impl Worker {
             protocol_version: Some(PROTOCOL_VERSION.into()),
             config: InitConfig {
                 model: config.model.clone(),
-                system_prompt: config.system_prompt.clone(),
+                system_prompt: effective_system_prompt(&config.system_prompt, &config.tools),
                 tools: config.tools.clone(),
                 max_iterations: config.max_iterations,
                 task_id: config.task_id.clone(),
@@ -764,6 +791,18 @@ mod tests {
         let resolved = resolve_confidence(None, &mut response);
         assert_eq!(resolved, None);
         assert_eq!(response.as_deref(), Some("plain response"));
+    }
+
+    #[test]
+    fn effective_system_prompt_lists_tools_and_non_interactive_constraint() {
+        let prompt = effective_system_prompt(
+            "Base role instructions.",
+            &["read_file".into(), "glob".into()],
+        );
+        assert!(prompt.contains("`read_file`, `glob`"));
+        assert!(prompt.contains("non-interactive"));
+        assert!(prompt.contains("`ask_user`"));
+        assert!(prompt.contains("subagents"));
     }
 
     fn mock_worker_config() -> WorkerConfig {

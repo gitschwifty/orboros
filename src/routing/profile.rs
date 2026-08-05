@@ -1,11 +1,38 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A tool profile defining which tools a worker type is allowed to use.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolProfile {
     /// Tools the worker is allowed to use.
     pub allowed_tools: Vec<String>,
+}
+
+/// Optional tool-policy override for a benchmark case or other bounded run.
+///
+/// `profile` selects either a configured `tool_profiles.<name>` profile or a
+/// built-in profile. `allowed_tools` is an exact list. A phase-specific entry
+/// takes precedence over the top-level default. The final list is always
+/// intersected with the caller's base worker tools, which remains the ceiling.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhaseToolPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub phases: BTreeMap<String, ToolPolicyOverride>,
+}
+
+/// A single phase's override within [`PhaseToolPolicy`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolPolicyOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
 }
 
 const NONE: &[&str] = &[];
@@ -24,14 +51,18 @@ const EDIT: &[&str] = &[
 /// Returns the canonical Heddle tool names for an Orboros worker role.
 #[must_use]
 pub fn builtin_tools(worker_type: &str) -> &'static [&'static str] {
+    known_builtin_tools(worker_type).unwrap_or(EDIT)
+}
+
+fn known_builtin_tools(worker_type: &str) -> Option<&'static [&'static str]> {
     match worker_type {
-        "none" | "bench_t1" => NONE,
-        "coordinator" | "review" | "read_only" => READ_ONLY,
-        "test" => TEST,
-        "research" => RESEARCH,
-        "edit" | "execute" | "bench_t2" => EDIT,
+        "none" | "bench_t1" => Some(NONE),
+        "coordinator" | "review" | "read_only" => Some(READ_ONLY),
+        "test" => Some(TEST),
+        "research" => Some(RESEARCH),
+        "edit" | "execute" | "bench_t2" => Some(EDIT),
         // Unknown execution roles must never silently become no-tool workers.
-        _ => EDIT,
+        _ => None,
     }
 }
 
@@ -48,6 +79,50 @@ pub fn resolve_tools(profiles: &BTreeMap<String, ToolProfile>, worker_type: &str
         },
         |profile| profile.allowed_tools.clone(),
     )
+}
+
+/// Resolves a phase's effective tools while preserving `base_tools` as a hard
+/// capability ceiling. This is used at dispatch time: phase defaults are safe
+/// by default, config profiles can tune those defaults, and an optional
+/// benchmark policy can replace the requested set without gaining capabilities
+/// the caller did not already grant.
+#[must_use]
+pub fn resolve_phase_tools(
+    profiles: &BTreeMap<String, ToolProfile>,
+    base_tools: &[String],
+    phase: &str,
+    default_profile: &str,
+    policy: Option<&PhaseToolPolicy>,
+) -> Vec<String> {
+    let phase_override = policy.and_then(|policy| policy.phases.get(phase));
+    let explicit_tools = phase_override
+        .and_then(|override_| override_.allowed_tools.as_ref())
+        .or_else(|| policy.and_then(|policy| policy.allowed_tools.as_ref()));
+    let profile = phase_override
+        .and_then(|override_| override_.profile.as_deref())
+        .or_else(|| policy.and_then(|policy| policy.profile.as_deref()))
+        .unwrap_or(default_profile);
+    // Unlike general worker-role resolution, phase policies deliberately do
+    // not fall through to `tool_profiles.default`: a broad global default
+    // must not turn a planning phase into an edit-capable worker. Selecting
+    // `profile = "default"` remains available as an explicit override.
+    let requested = explicit_tools.cloned().unwrap_or_else(|| {
+        profiles.get(profile).map_or_else(
+            || {
+                known_builtin_tools(profile)
+                    .unwrap_or(NONE)
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect()
+            },
+            |configured| configured.allowed_tools.clone(),
+        )
+    });
+    let base: BTreeSet<&str> = base_tools.iter().map(String::as_str).collect();
+    requested
+        .into_iter()
+        .filter(|tool| base.contains(tool.as_str()))
+        .collect()
 }
 
 /// Validates that a config profile only names concrete Heddle tools.
@@ -212,6 +287,69 @@ mod tests {
             },
         )]);
         assert_eq!(resolve_tools(&profiles, "edit"), vec!["read_file"]);
+    }
+
+    #[test]
+    fn phase_defaults_are_intersected_with_the_base_ceiling() {
+        let base = EDIT.iter().map(|tool| (*tool).into()).collect::<Vec<_>>();
+        assert_eq!(
+            resolve_phase_tools(&BTreeMap::new(), &base, "speccing", "read_only", None),
+            READ_ONLY
+        );
+
+        let no_bash = base
+            .into_iter()
+            .filter(|tool| tool != "bash")
+            .collect::<Vec<_>>();
+        assert!(
+            !resolve_phase_tools(&BTreeMap::new(), &no_bash, "execute", "execute", None,)
+                .contains(&"bash".into())
+        );
+    }
+
+    #[test]
+    fn phase_policy_allows_overall_and_phase_specific_overrides() {
+        let base = EDIT.iter().map(|tool| (*tool).into()).collect::<Vec<_>>();
+        let policy = PhaseToolPolicy {
+            allowed_tools: Some(vec!["read_file".into(), "glob".into()]),
+            phases: BTreeMap::from([(
+                "execute".into(),
+                ToolPolicyOverride {
+                    allowed_tools: Some(vec!["bash".into(), "edit_file".into()]),
+                    ..ToolPolicyOverride::default()
+                },
+            )]),
+            ..PhaseToolPolicy::default()
+        };
+        assert_eq!(
+            resolve_phase_tools(
+                &BTreeMap::new(),
+                &base,
+                "speccing",
+                "read_only",
+                Some(&policy),
+            ),
+            ["read_file", "glob"]
+        );
+        assert_eq!(
+            resolve_phase_tools(&BTreeMap::new(), &base, "execute", "execute", Some(&policy),),
+            ["bash", "edit_file"]
+        );
+    }
+
+    #[test]
+    fn phase_defaults_ignore_a_broad_global_default_profile() {
+        let base = EDIT.iter().map(|tool| (*tool).into()).collect::<Vec<_>>();
+        let profiles = BTreeMap::from([(
+            "default".into(),
+            ToolProfile {
+                allowed_tools: EDIT.iter().map(|tool| (*tool).into()).collect(),
+            },
+        )]);
+        assert_eq!(
+            resolve_phase_tools(&profiles, &base, "speccing", "read_only", None),
+            READ_ONLY
+        );
     }
 
     #[test]

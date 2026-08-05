@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::routing::profile::PhaseToolPolicy;
+
 /// Default case timeout when neither benchmark config nor the case
 /// provides one.
 pub const DEFAULT_TIMEOUT_S: u32 = 120;
@@ -113,6 +115,11 @@ pub struct BenchCase {
     /// unless invoked with `--no-budget`.
     #[serde(default = "default_max_cost_cents")]
     pub max_cost_cents: u32,
+    /// Optional benchmark-only phase tool policy. It can select a profile or
+    /// exact tools for every phase, then refine individual phases. The runner's
+    /// base tool list remains a hard ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_policy: Option<PhaseToolPolicy>,
     /// Stable human-facing selector derived from the case directory,
     /// for example `t2.001`. It is not part of case.toml.
     #[serde(skip)]
@@ -375,6 +382,12 @@ prompt = "Add a --dry-run flag to the CLI."
 timeout_s = 300
 max_cost_cents = 200
 
+[tool_policy]
+profile = "execute"
+
+[tool_policy.phases.speccing]
+allowed_tools = ["read_file", "glob"]
+
 [expected]
 kind = "tests_pass"
 command = "cargo test"
@@ -387,6 +400,12 @@ command = "cargo test"
         assert!(
             case.fixture_dir.is_none(),
             "direct loading has no local fixture metadata"
+        );
+        let policy = case.tool_policy.as_ref().unwrap();
+        assert_eq!(policy.profile.as_deref(), Some("execute"));
+        assert_eq!(
+            policy.phases["speccing"].allowed_tools,
+            Some(vec!["read_file".into(), "glob".into()])
         );
     }
 
