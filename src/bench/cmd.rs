@@ -5,6 +5,7 @@
 //! style mirrors the rest of the CLI surface in `orb_cmd` and
 //! `hooks::cmd`.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -98,6 +99,10 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
         println!("No matching cases.");
         return Ok(());
     }
+    let case_labels: HashMap<String, (String, String)> = cases
+        .iter()
+        .map(|case| (case.id.clone(), (case.selector.clone(), case.name.clone())))
+        .collect();
 
     // Split by tier and dispatch. Today only T1 actually runs the
     // pipeline; T2/T3 fall through to scaffolded error rows.
@@ -124,7 +129,7 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
         }
         if all_results.iter().any(is_fatal_worker_error) {
             eprintln!("stopping benchmark run after fatal worker/provider error");
-            print_result_table(&all_results);
+            print_result_table(&all_results, Some(&case_labels));
             if let Some(ref id) = summary_run_id {
                 if let Some(prompt_set) = req.prompt_set {
                     prompt_set.copy_to_run(&req.store.run_dir(id))?;
@@ -275,7 +280,7 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
         }
     }
 
-    print_result_table(&all_results);
+    print_result_table(&all_results, Some(&case_labels));
     if let Some(ref id) = summary_run_id {
         println!("\nRun id: {id}");
     }
@@ -292,7 +297,7 @@ pub fn cmd_bench_show(store: &BenchStore, run_id: &str) -> anyhow::Result<()> {
     if results.is_empty() {
         anyhow::bail!("no results found for run `{run_id}`");
     }
-    print_result_table(&results);
+    print_result_table(&results, None);
     if let Some(run) = store.read_runs()?.into_iter().find(|r| r.run_id == run_id) {
         println!("\n== summary ==");
         print_run_summary(&run);
@@ -478,12 +483,26 @@ pub fn cmd_bench_list_runs(store: &BenchStore) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_result_table(results: &[crate::bench::store::BenchResult]) {
-    let case_width = case_id_width(results.iter().map(|r| r.case_id.as_str()));
+fn print_result_table(
+    results: &[crate::bench::store::BenchResult],
+    case_labels: Option<&HashMap<String, (String, String)>>,
+) {
+    let selector_width = case_labels
+        .into_iter()
+        .flat_map(|labels| labels.values().map(|(selector, _)| selector.len()))
+        .max()
+        .unwrap_or(4)
+        .max(8);
+    let name_width = case_labels
+        .into_iter()
+        .flat_map(|labels| labels.values().map(|(_, name)| name.len()))
+        .max()
+        .unwrap_or(4)
+        .max(20);
     println!(
-        "{case:<case_width$}  {tier:<4}  {status:<8}  {score:>5}  {elapsed:>9}  {cost:>8}  {turns:>5}  {tools:>5}  {input:>8}  {output:>8}  {cache_r:>8}  {cache_w:>8}  {conf:>5}",
-        case = "case",
-        tier = "tier",
+        "{selector:<selector_width$}  {name:<name_width$}  {status:<8}  {score:>5}  {elapsed:>9}  {cost:>8}  {turns:>5}  {tools:>5}  {input:>8}  {output:>8}  {cache_r:>8}  {cache_w:>8}  {conf:>5}",
+        selector = "case",
+        name = "name",
         status = "status",
         score = "score",
         elapsed = "elapsed",
@@ -495,9 +514,13 @@ fn print_result_table(results: &[crate::bench::store::BenchResult]) {
         cache_r = "cache_r",
         cache_w = "cache_w",
         conf = "conf",
+        selector_width = selector_width,
+        name_width = name_width,
     );
     for r in results {
-        let tier = r.tier.to_string();
+        let (selector, name) = case_labels
+            .and_then(|labels| labels.get(&r.case_id))
+            .map_or_else(|| (r.tier.to_string(), "-".to_string()), Clone::clone);
         let status = format!("{:?}", r.status);
         let latency = format!("{}ms", r.latency_ms);
         let cost = format_cost(r.cost_micros, r.cost_cents);
@@ -523,9 +546,9 @@ fn print_result_table(results: &[crate::bench::store::BenchResult]) {
             .cache_write_tokens
             .map_or(String::from("-"), |tokens| tokens.to_string());
         println!(
-            "{case:<case_width$}  {tier:<4}  {status:<8}  {score:>5.2}  {elapsed:>9}  {cost:>8}  {turns:>5}  {tools:>5}  {input:>8}  {output:>8}  {cache_read:>8}  {cache_write:>8}  {conf:>5}",
-            case = r.case_id,
-            tier = tier,
+            "{selector:<selector_width$}  {name:<name_width$}  {status:<8}  {score:>5.2}  {elapsed:>9}  {cost:>8}  {turns:>5}  {tools:>5}  {input:>8}  {output:>8}  {cache_read:>8}  {cache_write:>8}  {conf:>5}",
+            selector = selector,
+            name = name,
             status = status,
             score = r.score,
             elapsed = latency,
@@ -537,6 +560,8 @@ fn print_result_table(results: &[crate::bench::store::BenchResult]) {
             cache_read = cache_read,
             cache_write = cache_write,
             conf = conf,
+            selector_width = selector_width,
+            name_width = name_width,
         );
     }
 }
