@@ -218,6 +218,8 @@ pub async fn dispatch_orb(
         total_tokens = %optional_display(outcome.total_tokens),
         cache_read_tokens = outcome.cached_tokens.unwrap_or(0),
         cache_write_tokens = outcome.cache_write_tokens.unwrap_or(0),
+        assistant_turns = %optional_display(outcome.assistant_turns),
+        tool_calls = %optional_display(outcome.tool_calls),
         cost_micros = %optional_display(outcome.cost_micros),
         cost_currency = %outcome.cost_currency.as_deref().unwrap_or("none"),
         "dispatch_orb complete",

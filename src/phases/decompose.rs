@@ -585,4 +585,13 @@ mod tests {
         let plan = parse_response(text).unwrap();
         assert_eq!(plan.subtasks.len(), 1);
     }
+
+    #[test]
+    fn parse_response_accepts_prose_wrapped_plan_and_confidence_line() {
+        let text = "Based on the repository inspection, here is the plan:\n\n{\"subtasks\": [{\"title\":\"Add todo model\",\"description\":\"Implement the Todo struct.\",\"order\":1}], \"has_parent_final_work\": true}\n\nCONFIDENCE: 0.95";
+        let plan = parse_response(text).unwrap();
+        assert_eq!(plan.subtasks.len(), 1);
+        assert_eq!(plan.subtasks[0].title, "Add todo model");
+        assert!(plan.has_parent_final_work);
+    }
 }

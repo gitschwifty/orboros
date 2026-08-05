@@ -937,10 +937,13 @@ mod tests {
     }
 
     fn write_case(dir: &Path, tier: BenchTier, id: &str) {
-        let tdir = dir.join(tier.as_str());
-        std::fs::create_dir_all(&tdir).unwrap();
+        let case_dir = dir.join(tier.as_str()).join(format!("001-{id}"));
+        std::fs::create_dir_all(&case_dir).unwrap();
+        if tier == BenchTier::T2 {
+            std::fs::create_dir(case_dir.join("fixture")).unwrap();
+        }
         std::fs::write(
-            tdir.join(format!("{id}.toml")),
+            case_dir.join("case.toml"),
             format!(
                 r#"
 id = "{id}"

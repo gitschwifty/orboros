@@ -639,37 +639,41 @@ fn clamp_confidence(value: Option<f32>) -> Option<f32> {
 
 /// Resolves the final confidence value for a `SendOutcome`.
 ///
-/// Prefers the structured IPC field when present. Otherwise scans the
-/// response for a trailing `CONFIDENCE: 0.NN` line (case-insensitive)
-/// and, if found, removes the line from `response`. Mirrors the same
-/// out-of-range handling as [`clamp_confidence`].
+/// Uses the structured IPC field when present, otherwise scans the response
+/// for a trailing `CONFIDENCE: 0.NN` line (case-insensitive). A validly
+/// formatted trailing line is always removed from `response`, including when
+/// an IPC value is present, so downstream phase parsers see only the payload.
+/// Mirrors the same out-of-range handling as [`clamp_confidence`].
 ///
-/// Older heddle workers won't include the IPC field, so the line
-/// parser is the forward-compatibility path until the protocol bump
-/// makes it required.
+/// The current Heddle worker does not include the IPC field, so the line
+/// parser is the active path. The optional IPC branch is retained only for a
+/// future protocol revision that demonstrably emits it.
 pub(crate) fn resolve_confidence(
     ipc_value: Option<f32>,
     response: &mut Option<String>,
 ) -> Option<f32> {
-    if let Some(v) = clamp_confidence(ipc_value) {
-        return Some(v);
-    }
-    let body = response.as_mut()?;
-    let (value, rewritten) = extract_confidence_line(body)?;
-    *body = rewritten;
-    clamp_confidence(Some(value))
+    let response_value = response.as_mut().and_then(|body| {
+        let (value, rewritten) = extract_confidence_line(body)?;
+        *body = rewritten;
+        Some(value)
+    });
+
+    clamp_confidence(ipc_value).or_else(|| clamp_confidence(response_value))
 }
 
-/// Finds the last `CONFIDENCE: N.NN` line in `text` (case-insensitive
-/// on the label, lenient on whitespace) and returns the parsed value
-/// plus the text with that line removed. Trailing whitespace is also
-/// trimmed off the result.
+/// Finds a trailing `CONFIDENCE: N.NN` line in `text` (case-insensitive on
+/// the label, lenient on whitespace) and returns the parsed value plus the
+/// text with that line removed. Trailing whitespace is also trimmed off the
+/// result. Confidence-like text in the body is deliberately left alone.
 fn extract_confidence_line(text: &str) -> Option<(f32, String)> {
     let lines: Vec<&str> = text.lines().collect();
     let idx = lines.iter().rposition(|line| {
         let trimmed = line.trim_start();
         trimmed.len() >= 11 && trimmed.as_bytes()[..11].eq_ignore_ascii_case(b"confidence:")
     })?;
+    if lines[idx + 1..].iter().any(|line| !line.trim().is_empty()) {
+        return None;
+    }
     let value_str = lines[idx].trim_start()[11..].trim();
     let value: f32 = value_str.parse().ok()?;
     let mut kept: Vec<&str> = Vec::with_capacity(lines.len() - 1);
@@ -759,12 +763,17 @@ mod tests {
     }
 
     #[test]
-    fn resolve_confidence_prefers_ipc_value() {
+    fn resolve_confidence_prefers_ipc_value_and_strips_trailing_line() {
         let mut response = Some("body\nCONFIDENCE: 0.1".to_string());
         let resolved = resolve_confidence(Some(0.9), &mut response);
         assert_eq!(resolved, Some(0.9));
-        // Response is NOT modified when IPC field wins.
-        assert_eq!(response.as_deref(), Some("body\nCONFIDENCE: 0.1"));
+        assert_eq!(response.as_deref(), Some("body"));
+    }
+
+    #[test]
+    fn extract_confidence_line_leaves_non_trailing_text_alone() {
+        let text = "CONFIDENCE: 0.1\nThis is ordinary response text.";
+        assert!(extract_confidence_line(text).is_none());
     }
 
     #[test]
