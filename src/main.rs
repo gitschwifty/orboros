@@ -253,6 +253,25 @@ enum BenchAction {
         #[arg(long)]
         all: bool,
     },
+    /// Summarize persisted per-dispatch telemetry for one benchmark run.
+    Report {
+        /// Run id, as printed by `bench run` or `bench list-runs`.
+        run_id: String,
+        /// Limit the report to one canonical case id.
+        #[arg(long)]
+        case: Option<String>,
+    },
+    /// Inspect durable worker prompt snapshots from one benchmark run.
+    Prompts {
+        /// Run id, as printed by `bench run` or `bench list-runs`.
+        run_id: String,
+        /// Canonical case id to inspect. Required to avoid dumping a whole run.
+        #[arg(long)]
+        case: String,
+        /// Limit output to one orb id.
+        #[arg(long)]
+        orb: Option<String>,
+    },
     /// Diff two saved runs by case outcome.
     Compare { run_a: String, run_b: String },
     /// List every recorded run.
@@ -1101,6 +1120,12 @@ fn cmd_bench(
         BenchAction::Show { run_id } => bench_cmd::cmd_bench_show(&store, &run_id),
         BenchAction::Details { run_id, case, all } => {
             bench_cmd::cmd_bench_details(&store, &run_id, case.as_deref(), all)
+        }
+        BenchAction::Report { run_id, case } => {
+            bench_cmd::cmd_bench_report(&store, &run_id, case.as_deref())
+        }
+        BenchAction::Prompts { run_id, case, orb } => {
+            bench_cmd::cmd_bench_prompts(&store, &run_id, &case, orb.as_deref())
         }
         BenchAction::Compare { run_a, run_b } => {
             bench_cmd::cmd_bench_compare(&store, &run_a, &run_b)

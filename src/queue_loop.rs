@@ -87,6 +87,7 @@ pub struct QueueLoop {
     prompt_config: Option<crate::config::PromptConfig>,
     tool_policy: Option<crate::routing::profile::PhaseToolPolicy>,
     execution_store: crate::execution::ExecutionStore,
+    prompt_store: Option<crate::execution::PromptStore>,
 }
 
 impl QueueLoop {
@@ -108,7 +109,25 @@ impl QueueLoop {
             prompt_config: None,
             tool_policy: None,
             execution_store: crate::execution::ExecutionStore::new(execution_path),
+            prompt_store: None,
         }
+    }
+
+    /// Enables durable resolved-prompt capture for an isolated embedded run.
+    ///
+    /// Benchmark runners opt in so their snapshots survive artifact pruning.
+    /// Normal project runs retain compact execution telemetry but do not save
+    /// full prompt text by default.
+    #[must_use]
+    pub fn with_prompt_capture(mut self) -> Self {
+        let prompt_path = self
+            .orb_store
+            .path()
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("prompts.jsonl");
+        self.prompt_store = Some(crate::execution::PromptStore::new(prompt_path));
+        self
     }
 
     /// Overrides review behavior for an embedded queue run, such as a
@@ -719,6 +738,7 @@ impl QueueLoop {
             let context_edges = Arc::clone(&context_edges);
             let hooks = self.hooks.as_ref().map(Arc::clone);
             let execution_store = self.execution_store.clone();
+            let prompt_store = self.prompt_store.clone();
             join_set.spawn(async move {
                 let Ok(_permit) = sem.acquire_owned().await else {
                     return Ok(false);
@@ -738,6 +758,7 @@ impl QueueLoop {
                     context,
                     hooks,
                     execution_store,
+                    prompt_store,
                 )
                 .await
             });
@@ -1001,6 +1022,7 @@ async fn dispatch_one_owned(
     context: DispatchContext<'_>,
     hooks: Option<Arc<crate::hooks::HookSink>>,
     execution_store: crate::execution::ExecutionStore,
+    prompt_store: Option<crate::execution::PromptStore>,
 ) -> std::io::Result<bool> {
     use crate::worker::dispatcher::{
         apply_dispatch_outcome_with_review, dispatch_orb, worker_config_for_with_model_config,
@@ -1016,9 +1038,16 @@ async fn dispatch_one_owned(
             orb.description.clone(),
         ),
     };
-    let task_context =
-        crate::prompt_context::build_orb_task_context(&orb, context.orbs, context.edges);
-    let user = crate::prompt_context::append_task_context(&user, &task_context);
+    let task_context = crate::prompt_context::build_orb_task_context_with_metrics(
+        &orb,
+        context.orbs,
+        context.edges,
+    );
+    let mut prompt_context = task_context.metrics;
+    prompt_context.base_user_chars = u32::try_from(user.chars().count()).unwrap_or(u32::MAX);
+    let user = crate::prompt_context::append_task_context(&user, &task_context.text);
+    prompt_context.final_user_prompt_chars =
+        u32::try_from(user.chars().count()).unwrap_or(u32::MAX);
 
     let prompt_kind = target.prompt_kind();
     let prompt_category = prompt_kind.category();
@@ -1044,6 +1073,10 @@ async fn dispatch_one_owned(
     );
     let wc = worker_config_for_with_model_config(&orb, &target_base_wc, &system, model_config)
         .map_err(std::io::Error::other)?;
+    let effective_system_prompt =
+        crate::worker::process::effective_system_prompt(&wc.system_prompt, &wc.tools);
+    prompt_context.effective_system_prompt_chars =
+        u32::try_from(effective_system_prompt.chars().count()).unwrap_or(u32::MAX);
     tracing::info!(
         orb = %orb.id,
         title = %orb.title,
@@ -1059,15 +1092,27 @@ async fn dispatch_one_owned(
     let outcome = crate::worker::dispatcher::with_prompt_metadata(
         outcome,
         prompt_category.clone(),
-        &crate::worker::process::effective_system_prompt(&wc.system_prompt, &wc.tools),
+        &effective_system_prompt,
         prompt_source,
     );
+    if let Some(prompt_store) = prompt_store {
+        prompt_store.append(&crate::execution::PromptRecord::new(
+            &orb,
+            prompt_category.clone(),
+            outcome.dispatched_at,
+            effective_system_prompt,
+            user,
+            outcome.prompt_tokens,
+            prompt_context.clone(),
+        ))?;
+    }
     execution_store.append(&crate::execution::ExecutionRecord::from_outcome(
         &orb,
         prompt_category,
         target.tool_policy_key(),
         wc.tools.clone(),
         &outcome,
+        Some(prompt_context),
     ))?;
 
     apply_dispatch_outcome_with_review(
@@ -1487,7 +1532,7 @@ done
         let worker = crate::worker::process::WorkerConfig {
             command: "bash".into(),
             args: vec![worker_path.to_string_lossy().into()],
-            cwd: Some(base),
+            cwd: Some(base.clone()),
             env: vec![],
             model: "mock/tools".into(),
             system_prompt: String::new(),
@@ -1509,6 +1554,10 @@ done
         let tools: Vec<String> =
             serde_json::from_str(&std::fs::read_to_string(tools_path).unwrap()).unwrap();
         assert_eq!(tools, ["read_file", "glob", "grep"]);
+        assert!(
+            !base.join("prompts.jsonl").exists(),
+            "normal queue runs must not retain full prompt text by default"
+        );
     }
 
     // ── pause/resume ─────────────────────────────────────────────────

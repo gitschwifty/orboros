@@ -13,6 +13,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::worker::dispatcher::{DispatchOutcome, DispatchStatus};
 
+/// Character-level attribution for Orboros-owned prompt construction.
+///
+/// This deliberately measures only text Orboros injects or constructs. It
+/// cannot account for opaque provider/runtime context managed by Heddle.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PromptContextMetrics {
+    pub base_user_chars: u32,
+    pub task_context_chars: u32,
+    pub task_context_overhead_chars: u32,
+    pub current_orb_chars: u32,
+    pub parent_and_root_chars: u32,
+    pub sibling_orbs_chars: u32,
+    pub child_orbs_chars: u32,
+    pub upstream_dependency_chars: u32,
+    pub final_user_prompt_chars: u32,
+    pub effective_system_prompt_chars: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionRecord {
     pub orb_id: String,
@@ -49,6 +67,10 @@ pub struct ExecutionRecord {
     pub cache_write_tokens: Option<u64>,
     #[serde(default)]
     pub retries: u32,
+    /// Orboros-owned user/system prompt construction. Missing for historical
+    /// records and deliberately excludes opaque Heddle/provider context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_context: Option<PromptContextMetrics>,
 }
 
 impl ExecutionRecord {
@@ -58,6 +80,7 @@ impl ExecutionRecord {
         tool_policy: impl Into<String>,
         allowed_tools: Vec<String>,
         outcome: &DispatchOutcome,
+        prompt_context: Option<PromptContextMetrics>,
     ) -> Self {
         Self {
             orb_id: orb.id.to_string(),
@@ -88,6 +111,56 @@ impl ExecutionRecord {
             cache_read_tokens: outcome.cached_tokens,
             cache_write_tokens: outcome.cache_write_tokens,
             retries: outcome.retries,
+            prompt_context,
+        }
+    }
+}
+
+/// Durable snapshot of one worker's resolved initial prompts.
+///
+/// This is deliberately separate from execution outcomes: it remains useful
+/// when a worker fails before returning telemetry, and it prevents prompt text
+/// from inflating append-only orb snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptRecord {
+    pub orb_id: String,
+    pub parent_id: Option<String>,
+    pub dispatch_kind: String,
+    pub dispatched_at: DateTime<Utc>,
+    pub system_prompt: String,
+    pub user_prompt: String,
+    pub system_prompt_hash: String,
+    pub user_prompt_hash: String,
+    /// Provider-reported input tokens for this dispatch, when available.
+    /// This may include runtime/provider context not represented in the saved
+    /// Orboros prompt snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    pub prompt_context: PromptContextMetrics,
+}
+
+impl PromptRecord {
+    #[must_use]
+    pub fn new(
+        orb: &orbs::orb::Orb,
+        dispatch_kind: impl Into<String>,
+        dispatched_at: DateTime<Utc>,
+        system_prompt: String,
+        user_prompt: String,
+        input_tokens: Option<u64>,
+        prompt_context: PromptContextMetrics,
+    ) -> Self {
+        Self {
+            orb_id: orb.id.to_string(),
+            parent_id: orb.parent_id.as_ref().map(ToString::to_string),
+            dispatch_kind: dispatch_kind.into(),
+            system_prompt_hash: crate::prompt::prompt_hash(&system_prompt),
+            user_prompt_hash: crate::prompt::prompt_hash(&user_prompt),
+            system_prompt,
+            user_prompt,
+            dispatched_at,
+            input_tokens,
+            prompt_context,
         }
     }
 }
@@ -117,6 +190,41 @@ impl ExecutionStore {
         file.write_all(b"\n")
     }
     pub fn read_all(&self) -> std::io::Result<Vec<ExecutionRecord>> {
+        let Ok(file) = std::fs::File::open(&self.path) else {
+            return Ok(vec![]);
+        };
+        Ok(BufReader::new(file)
+            .lines()
+            .filter_map(|line| line.ok().and_then(|line| serde_json::from_str(&line).ok()))
+            .collect())
+    }
+}
+
+/// Append-only prompt ledger colocated with the execution ledger.
+#[derive(Clone)]
+pub struct PromptStore {
+    path: PathBuf,
+}
+
+impl PromptStore {
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn append(&self, record: &PromptRecord) -> std::io::Result<()> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        serde_json::to_writer(&mut file, record).map_err(std::io::Error::other)?;
+        file.write_all(b"\n")
+    }
+
+    pub fn read_all(&self) -> std::io::Result<Vec<PromptRecord>> {
         let Ok(file) = std::fs::File::open(&self.path) else {
             return Ok(vec![]);
         };

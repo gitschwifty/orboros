@@ -33,6 +33,16 @@ pub struct BenchDispatchRecord {
     pub execution: crate::execution::ExecutionRecord,
 }
 
+/// A prompt snapshot retained at benchmark run scope. Kept separate from
+/// dispatch outcomes so callers can inspect comparable worker inputs after
+/// artifacts and transcripts have been pruned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchPromptRecord {
+    pub case_id: String,
+    #[serde(flatten)]
+    pub prompt: crate::execution::PromptRecord,
+}
+
 /// Outcome of a single case execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -285,6 +295,12 @@ impl BenchStore {
         self.run_dir(run_id).join("dispatches.jsonl")
     }
 
+    /// Path to durable per-dispatch prompt snapshots for one run.
+    #[must_use]
+    pub fn prompts_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("prompts.jsonl")
+    }
+
     /// Directory containing retained compact orb state, grouped by case.
     #[must_use]
     pub fn case_orbs_dir(&self, run_id: &str, case_id: &str) -> PathBuf {
@@ -327,6 +343,28 @@ impl BenchStore {
                 &BenchDispatchRecord {
                     case_id: case_id.into(),
                     execution: execution.clone(),
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Copies prompt snapshots into durable run-level evidence, tagged by
+    /// benchmark case so the workdir may be pruned later.
+    pub fn append_prompts(
+        &self,
+        run_id: &str,
+        case_id: &str,
+        records: &[crate::execution::PromptRecord],
+    ) -> Result<(), StoreError> {
+        ensure_dir(&self.run_dir(run_id))?;
+        let path = self.prompts_path(run_id);
+        for prompt in records {
+            append_jsonl(
+                &path,
+                &BenchPromptRecord {
+                    case_id: case_id.into(),
+                    prompt: prompt.clone(),
                 },
             )?;
         }
@@ -395,6 +433,25 @@ impl BenchStore {
     /// As [`Self::read_runs`].
     pub fn read_results(&self, run_id: &str) -> Result<Vec<BenchResult>, StoreError> {
         read_jsonl(&self.results_path(run_id))
+    }
+
+    /// Reads durable per-dispatch telemetry for one run. Historical runs that
+    /// predate the ledger simply return an empty collection.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_runs`].
+    pub fn read_dispatches(&self, run_id: &str) -> Result<Vec<BenchDispatchRecord>, StoreError> {
+        read_jsonl(&self.dispatches_path(run_id))
+    }
+
+    /// Reads durable prompt snapshots for one run.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_runs`].
+    pub fn read_prompts(&self, run_id: &str) -> Result<Vec<BenchPromptRecord>, StoreError> {
+        read_jsonl(&self.prompts_path(run_id))
     }
 }
 
@@ -554,6 +611,7 @@ pub fn new_run_id() -> String {
 mod tests {
     use super::*;
     use crate::bench::prompts::{PromptInputFile, PromptManifest, PromptRoleManifest};
+    use crate::execution::{PromptContextMetrics, PromptRecord};
 
     fn sample_result(run_id: &str, case_id: &str) -> BenchResult {
         BenchResult {
@@ -765,6 +823,37 @@ mod tests {
         let runs = store.read_runs().unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].run_id, "run-after-bad");
+    }
+
+    #[test]
+    fn prompt_snapshots_round_trip_with_provider_input_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BenchStore::new(dir.path().join("bench"));
+        let prompt = PromptRecord {
+            orb_id: "orb-1".into(),
+            parent_id: None,
+            dispatch_kind: "worker.execute".into(),
+            dispatched_at: Utc::now(),
+            system_prompt: "system".into(),
+            user_prompt: "user".into(),
+            system_prompt_hash: "system-hash".into(),
+            user_prompt_hash: "user-hash".into(),
+            input_tokens: Some(123),
+            prompt_context: PromptContextMetrics {
+                final_user_prompt_chars: 4,
+                ..PromptContextMetrics::default()
+            },
+        };
+
+        store
+            .append_prompts(DATED_RUN_ID, "t2.001", std::slice::from_ref(&prompt))
+            .unwrap();
+
+        let retained = store.read_prompts(DATED_RUN_ID).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].case_id, "t2.001");
+        assert_eq!(retained[0].prompt.input_tokens, Some(123));
+        assert_eq!(retained[0].prompt.user_prompt, prompt.user_prompt);
     }
 
     // ── BenchStatus helpers ───────────────────────────────────

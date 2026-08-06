@@ -5,7 +5,7 @@
 //! style mirrors the rest of the CLI surface in `orb_cmd` and
 //! `hooks::cmd`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::time::Duration;
 
@@ -18,7 +18,9 @@ use crate::bench::runner::{
     BenchRunConfig, RunOptions, effective_timeout_s, is_fatal_worker_error, run_t1_with_run_id,
     timeout_bench_result,
 };
-use crate::bench::store::{BenchResult, BenchRun, BenchStatus, BenchStore};
+use crate::bench::store::{
+    BenchDispatchRecord, BenchPromptRecord, BenchResult, BenchRun, BenchStatus, BenchStore,
+};
 use crate::worker::process::WorkerConfig;
 
 pub struct BenchRunRequest<'a> {
@@ -277,6 +279,14 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
         );
         req.store
             .append_dispatches(&run_id, &case.id, &ledger.read_all()?)?;
+        let prompt_ledger = crate::execution::PromptStore::new(
+            artifact_dir
+                .join("workdir")
+                .join(".orbs")
+                .join("prompts.jsonl"),
+        );
+        req.store
+            .append_prompts(&run_id, &case.id, &prompt_ledger.read_all()?)?;
         req.store.retain_orb_state(
             &run_id,
             &case.id,
@@ -389,6 +399,286 @@ pub fn cmd_bench_details(
     Ok(())
 }
 
+/// Prints persisted dispatch telemetry grouped by case and dispatch kind.
+///
+/// # Errors
+///
+/// Returns an error when the run is unknown or its dispatch ledger cannot be
+/// read.
+pub fn cmd_bench_report(
+    store: &BenchStore,
+    run_id: &str,
+    case_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let run = store
+        .read_runs()?
+        .into_iter()
+        .find(|run| run.run_id == run_id)
+        .context("no saved benchmark run with that id")?;
+    let mut records = store.read_dispatches(run_id)?;
+    if let Some(case_id) = case_id {
+        records.retain(|record| record.case_id == case_id);
+    }
+    if records.is_empty() {
+        if case_id.is_some() {
+            anyhow::bail!("no persisted dispatch telemetry for that case in `{run_id}`");
+        }
+        anyhow::bail!("run `{run_id}` has no persisted dispatch telemetry");
+    }
+
+    println!("== dispatch report ==");
+    println!(
+        "run={run_id}  model={model}  dispatches={}",
+        records.len(),
+        model = run.worker_model.as_deref().unwrap_or("-")
+    );
+    let summaries = summarize_dispatches(&records);
+    println!(
+        "{case:<24} {kind:<18} {done:>4} {failed:>6} {error:>5} {retry:>5} {turns:>6} {tools:>6} {input:>9} {output:>8} {cache:>8} {cost:>10} {wall:>9}",
+        case = "case",
+        kind = "dispatch",
+        done = "done",
+        failed = "failed",
+        error = "error",
+        retry = "retry",
+        turns = "turns",
+        tools = "tools",
+        input = "in",
+        output = "out",
+        cache = "cache_r",
+        cost = "cost",
+        wall = "wall",
+    );
+    for ((case_id, kind), summary) in summaries {
+        println!(
+            "{case_id:<24} {kind:<18} {done:>4} {failed:>6} {error:>5} {retries:>5} {turns:>6} {tools:>6} {input:>9} {output:>8} {cache_read:>8} {cost:>10} {wall:>9}",
+            done = summary.done,
+            failed = summary.failed,
+            error = summary.errors,
+            retries = summary.retries,
+            turns = display_count(summary.assistant_turns),
+            tools = display_count(summary.tool_calls),
+            input = display_count(summary.prompt_tokens),
+            output = display_count(summary.completion_tokens),
+            cache_read = display_count(summary.cache_read_tokens),
+            cost = format_cost(summary.cost_micros, None),
+            wall = format_elapsed_ms(summary.wall_ms),
+        );
+    }
+    print_prompt_context_report(store, run_id, case_id)?;
+    Ok(())
+}
+
+/// Prints resolved system/user prompt snapshots for a single benchmark case.
+///
+/// # Errors
+///
+/// Returns an error when no retained snapshots match the requested case/orb.
+pub fn cmd_bench_prompts(
+    store: &BenchStore,
+    run_id: &str,
+    case_id: &str,
+    orb_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut prompts = store.read_prompts(run_id)?;
+    prompts.retain(|record| {
+        record.case_id == case_id && orb_id.is_none_or(|orb_id| record.prompt.orb_id == orb_id)
+    });
+    if prompts.is_empty() {
+        anyhow::bail!("no retained prompt snapshots match that run, case, and orb");
+    }
+    for record in prompts {
+        println!(
+            "== {} {} [{}] ==",
+            record.case_id, record.prompt.orb_id, record.prompt.dispatch_kind
+        );
+        println!(
+            "input_tokens={} system_hash={} user_hash={}",
+            display_count(record.prompt.input_tokens),
+            record.prompt.system_prompt_hash,
+            record.prompt.user_prompt_hash,
+        );
+        println!("\n-- system prompt --\n{}", record.prompt.system_prompt);
+        println!("\n-- user prompt --\n{}", record.prompt.user_prompt);
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct DispatchSummary {
+    done: u32,
+    failed: u32,
+    errors: u32,
+    retries: u32,
+    assistant_turns: Option<u64>,
+    tool_calls: Option<u64>,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cost_micros: Option<u64>,
+    wall_ms: u64,
+}
+
+fn summarize_dispatches(
+    records: &[BenchDispatchRecord],
+) -> BTreeMap<(String, String), DispatchSummary> {
+    let mut summaries = BTreeMap::new();
+    for record in records {
+        let summary = summaries
+            .entry((
+                record.case_id.clone(),
+                record.execution.dispatch_kind.clone(),
+            ))
+            .or_insert_with(DispatchSummary::default);
+        match record.execution.status.as_str() {
+            "done" => summary.done = summary.done.saturating_add(1),
+            "failed" => summary.failed = summary.failed.saturating_add(1),
+            "error" => summary.errors = summary.errors.saturating_add(1),
+            _ => {}
+        }
+        summary.retries = summary.retries.saturating_add(record.execution.retries);
+        add_optional_u32(
+            &mut summary.assistant_turns,
+            record.execution.assistant_turns,
+        );
+        add_optional_u32(&mut summary.tool_calls, record.execution.tool_calls);
+        add_optional_u64(&mut summary.prompt_tokens, record.execution.prompt_tokens);
+        add_optional_u64(
+            &mut summary.completion_tokens,
+            record.execution.completion_tokens,
+        );
+        add_optional_u64(
+            &mut summary.cache_read_tokens,
+            record.execution.cache_read_tokens,
+        );
+        add_optional_u64(&mut summary.cost_micros, record.execution.cost_micros);
+        let duration = (record.execution.completed_at - record.execution.dispatched_at)
+            .num_milliseconds()
+            .max(0);
+        summary.wall_ms = summary
+            .wall_ms
+            .saturating_add(u64::try_from(duration).unwrap_or(u64::MAX));
+    }
+    summaries
+}
+
+fn add_optional_u32(total: &mut Option<u64>, value: Option<u32>) {
+    add_optional_u64(total, value.map(u64::from));
+}
+
+fn add_optional_u64(total: &mut Option<u64>, value: Option<u64>) {
+    if let Some(value) = value {
+        *total = Some(total.unwrap_or(0).saturating_add(value));
+    }
+}
+
+#[derive(Default)]
+struct PromptSummary {
+    count: u32,
+    input_tokens: Option<u64>,
+    system_prompt_chars: u64,
+    final_user_prompt_chars: u64,
+    task_context_chars: u64,
+    task_context_overhead_chars: u64,
+    current_orb_chars: u64,
+    parent_and_root_chars: u64,
+    sibling_orbs_chars: u64,
+    child_orbs_chars: u64,
+    upstream_dependency_chars: u64,
+}
+
+fn print_prompt_context_report(
+    store: &BenchStore,
+    run_id: &str,
+    case_id: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut prompts = store.read_prompts(run_id)?;
+    if let Some(case_id) = case_id {
+        prompts.retain(|record| record.case_id == case_id);
+    }
+    if prompts.is_empty() {
+        println!("\n== prompt context ==\nno retained prompt snapshots (historical run)");
+        return Ok(());
+    }
+    println!("\n== prompt context (Orboros-owned chars) ==");
+    println!(
+        "{case:<24} {kind:<18} {count:>5} {tokens:>9} {system:>7} {user:>7} {context:>7} {overhead:>8} {current:>7} {parent:>7} {siblings:>8} {children:>8} {deps:>7}",
+        case = "case",
+        kind = "dispatch",
+        count = "count",
+        tokens = "in_tok",
+        system = "system",
+        user = "user",
+        context = "context",
+        overhead = "overhead",
+        current = "current",
+        parent = "parent",
+        siblings = "siblings",
+        children = "children",
+        deps = "deps",
+    );
+    for ((case_id, kind), summary) in summarize_prompts(&prompts) {
+        println!(
+            "{case_id:<24} {kind:<18} {count:>5} {tokens:>9} {system:>7} {user:>7} {context:>7} {overhead:>8} {current:>7} {parent:>7} {siblings:>8} {children:>8} {deps:>7}",
+            count = summary.count,
+            tokens = display_count(summary.input_tokens),
+            system = summary.system_prompt_chars,
+            user = summary.final_user_prompt_chars,
+            context = summary.task_context_chars,
+            overhead = summary.task_context_overhead_chars,
+            current = summary.current_orb_chars,
+            parent = summary.parent_and_root_chars,
+            siblings = summary.sibling_orbs_chars,
+            children = summary.child_orbs_chars,
+            deps = summary.upstream_dependency_chars,
+        );
+    }
+    println!(
+        "input tokens are provider-reported; opaque Heddle/provider context is not measured here."
+    );
+    Ok(())
+}
+
+fn summarize_prompts(records: &[BenchPromptRecord]) -> BTreeMap<(String, String), PromptSummary> {
+    let mut summaries = BTreeMap::new();
+    for record in records {
+        let summary = summaries
+            .entry((record.case_id.clone(), record.prompt.dispatch_kind.clone()))
+            .or_insert_with(PromptSummary::default);
+        summary.count = summary.count.saturating_add(1);
+        add_optional_u64(&mut summary.input_tokens, record.prompt.input_tokens);
+        let metrics = &record.prompt.prompt_context;
+        summary.system_prompt_chars = summary
+            .system_prompt_chars
+            .saturating_add(u64::from(metrics.effective_system_prompt_chars));
+        summary.final_user_prompt_chars = summary
+            .final_user_prompt_chars
+            .saturating_add(u64::from(metrics.final_user_prompt_chars));
+        summary.task_context_chars = summary
+            .task_context_chars
+            .saturating_add(u64::from(metrics.task_context_chars));
+        summary.task_context_overhead_chars = summary
+            .task_context_overhead_chars
+            .saturating_add(u64::from(metrics.task_context_overhead_chars));
+        summary.current_orb_chars = summary
+            .current_orb_chars
+            .saturating_add(u64::from(metrics.current_orb_chars));
+        summary.parent_and_root_chars = summary
+            .parent_and_root_chars
+            .saturating_add(u64::from(metrics.parent_and_root_chars));
+        summary.sibling_orbs_chars = summary
+            .sibling_orbs_chars
+            .saturating_add(u64::from(metrics.sibling_orbs_chars));
+        summary.child_orbs_chars = summary
+            .child_orbs_chars
+            .saturating_add(u64::from(metrics.child_orbs_chars));
+        summary.upstream_dependency_chars = summary
+            .upstream_dependency_chars
+            .saturating_add(u64::from(metrics.upstream_dependency_chars));
+    }
+    summaries
+}
+
 /// Compares two saved runs side by side. Highlights cases whose
 /// status changed and warns when the case or resolved system prompt
 /// hash differs (direct comparison may be misleading).
@@ -448,13 +738,18 @@ pub fn cmd_bench_compare(store: &BenchStore, run_a: &str, run_b: &str) -> anyhow
                 }
                 _ => "changed",
             };
-            let prompt_note = if r.prompt_hash == rb.prompt_hash
-                && r.system_prompt_hash == rb.system_prompt_hash
-            {
-                ""
-            } else {
+            let prompt_note = if r.prompt_hash != rb.prompt_hash {
                 prompt_changed += 1;
-                "  ⚠ prompt changed"
+                "  ⚠ case prompt changed"
+            } else if r.system_prompt_hash.as_ref().zip(rb.system_prompt_hash.as_ref()).is_some_and(
+                |(a, b)| a != b,
+            ) {
+                prompt_changed += 1;
+                "  ⚠ system prompt changed"
+            } else if r.system_prompt_hash.is_some() != rb.system_prompt_hash.is_some() {
+                "  (system prompt hash unavailable in one run)"
+            } else {
+                ""
             };
             println!(
                 "{case:<case_width$} {a:<a_width$?} {b:<b_width$?} {change}{prompt_note}",
@@ -634,6 +929,7 @@ fn print_run_completion(run: &BenchRun, results: &[BenchResult]) {
         .or_else(|| results.first().map(|result| result.worker_model.as_str()))
         .unwrap_or("-");
     println!("\n== run complete ==");
+    println!("run: {}", run.run_id);
     println!("model: {model}");
     println!(
         "{} passed, {} failed, {} errored, {} skipped of {} total",

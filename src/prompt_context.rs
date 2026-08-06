@@ -4,6 +4,8 @@ use orbs::dep::{DepEdge, EdgeType};
 use orbs::id::OrbId;
 use orbs::orb::Orb;
 
+use crate::execution::PromptContextMetrics;
+
 const FIELD_MAX_CHARS: usize = 1_200;
 const RESULT_MAX_CHARS: usize = 800;
 const LIST_MAX_ITEMS: usize = 8;
@@ -15,13 +17,60 @@ const LIST_MAX_ITEMS: usize = 8;
 /// relationships, and dependency status/results.
 #[must_use]
 pub fn build_orb_task_context(orb: &Orb, all_orbs: &[Orb], edges: &[DepEdge]) -> String {
+    build_orb_task_context_with_metrics(orb, all_orbs, edges).text
+}
+
+/// Task context plus a character-level attribution for each injected source.
+#[derive(Debug, Clone)]
+pub struct BuiltTaskContext {
+    pub text: String,
+    pub metrics: PromptContextMetrics,
+}
+
+/// Builds task context and records the exact character contribution of each
+/// Orboros-owned source. Provider/runtime context is intentionally outside
+/// this measurement.
+#[must_use]
+pub fn build_orb_task_context_with_metrics(
+    orb: &Orb,
+    all_orbs: &[Orb],
+    edges: &[DepEdge],
+) -> BuiltTaskContext {
     let mut out = String::from("## Orboros Task Context\n\n");
-    push_current_orb(&mut out, orb);
-    push_parent_and_root(&mut out, orb, all_orbs);
-    push_siblings(&mut out, orb, all_orbs);
-    push_children(&mut out, orb, all_orbs);
-    push_upstream_dependencies(&mut out, orb, all_orbs, edges);
-    out
+    let task_context_overhead_chars = char_count(&out);
+    let current_orb_chars = appended_chars(&mut out, |out| push_current_orb(out, orb));
+    let parent_and_root_chars = appended_chars(&mut out, |out| {
+        push_parent_and_root(out, orb, all_orbs);
+    });
+    let sibling_orbs_chars = appended_chars(&mut out, |out| push_siblings(out, orb, all_orbs));
+    let child_orbs_chars = appended_chars(&mut out, |out| push_children(out, orb, all_orbs));
+    let upstream_dependency_chars = appended_chars(&mut out, |out| {
+        push_upstream_dependencies(out, orb, all_orbs, edges);
+    });
+    let task_context_chars = char_count(&out);
+    BuiltTaskContext {
+        text: out,
+        metrics: PromptContextMetrics {
+            task_context_chars,
+            task_context_overhead_chars,
+            current_orb_chars,
+            parent_and_root_chars,
+            sibling_orbs_chars,
+            child_orbs_chars,
+            upstream_dependency_chars,
+            ..PromptContextMetrics::default()
+        },
+    }
+}
+
+fn appended_chars(out: &mut String, append: impl FnOnce(&mut String)) -> u32 {
+    let before = out.chars().count();
+    append(out);
+    u32::try_from(out.chars().count().saturating_sub(before)).unwrap_or(u32::MAX)
+}
+
+fn char_count(value: &str) -> u32 {
+    u32::try_from(value.chars().count()).unwrap_or(u32::MAX)
 }
 
 /// Appends a task-context block after the base user prompt.
@@ -253,6 +302,41 @@ mod tests {
         assert!(context.contains("### Upstream Dependencies"));
         assert!(context.contains("Blocker finished"));
         assert!(context.contains("acceptance_criteria"));
+    }
+
+    #[test]
+    fn context_metrics_attribute_each_injected_source() {
+        let root = Orb::new("Root", "Root work").with_type(OrbType::Feature);
+        let mut current = Orb::new("Current", "Current work").with_type(OrbType::Task);
+        current.parent_id = Some(root.id.clone());
+        current.root_id = Some(root.id.clone());
+        let mut sibling = Orb::new("Sibling", "Sibling work").with_type(OrbType::Task);
+        sibling.parent_id = Some(root.id.clone());
+        let mut child = Orb::new("Child", "Child work").with_type(OrbType::Task);
+        child.parent_id = Some(current.id.clone());
+        child.result = Some("Child result".into());
+        let dependency = Orb::new("Dependency", "Dependency work").with_type(OrbType::Task);
+        let edge = DepEdge::new(
+            current.id.clone(),
+            dependency.id.clone(),
+            EdgeType::DependsOn,
+        );
+
+        let context = build_orb_task_context_with_metrics(
+            &current,
+            &[root, current.clone(), sibling, child, dependency],
+            &[edge],
+        );
+
+        assert!(context.metrics.current_orb_chars > 0);
+        assert!(context.metrics.parent_and_root_chars > 0);
+        assert!(context.metrics.sibling_orbs_chars > 0);
+        assert!(context.metrics.child_orbs_chars > 0);
+        assert!(context.metrics.upstream_dependency_chars > 0);
+        assert_eq!(
+            context.metrics.task_context_chars,
+            u32::try_from(context.text.chars().count()).unwrap()
+        );
     }
 
     #[test]

@@ -99,20 +99,39 @@ bench-case-model-prompt model prompt_set id variant="" root="bench": build-relea
     ./target/release/orboros bench --bench-root "{{root}}" run --case "{{id}}" --model "{{model}}" --prompt-set "{{prompt_set}}" $variant_arg
 
 # Show a saved benchmark run.
-bench-show run_id:
-    cargo run -- bench show "{{run_id}}"
+bench-show run_id root="bench":
+    cargo run -- bench --bench-root "{{root}}" show "{{run_id}}"
 
-# Compare two saved benchmark runs.
-bench-compare run_a run_b:
-    cargo run -- bench compare "{{run_a}}" "{{run_b}}"
+# Compare two saved benchmark runs. Optional root selects the benchmark
+# results store, e.g. `just bench-compare RUN_A RUN_B ../bench`.
+bench-compare run_a run_b root="bench":
+    cargo run -- bench --bench-root "{{root}}" compare "{{run_a}}" "{{run_b}}"
+
+# Show dispatch and retained prompt-context totals for a saved run.
+# Optionally scope to one case: `just bench-report RUN t2.001 ../bench`.
+bench-report run_id case="" root="bench":
+    @if [ -n "{{case}}" ]; then \
+        cargo run -- bench --bench-root "{{root}}" report "{{run_id}}" --case "{{case}}"; \
+    else \
+        cargo run -- bench --bench-root "{{root}}" report "{{run_id}}"; \
+    fi
+
+# Print exact saved prompts for one benchmark case; optionally narrow to an orb.
+# Example: `just bench-prompts RUN t2.001 ORB_ID ../bench`.
+bench-prompts run_id case orb="" root="bench":
+    @if [ -n "{{orb}}" ]; then \
+        cargo run -- bench --bench-root "{{root}}" prompts "{{run_id}}" --case "{{case}}" --orb "{{orb}}"; \
+    else \
+        cargo run -- bench --bench-root "{{root}}" prompts "{{run_id}}" --case "{{case}}"; \
+    fi
 
 # List saved benchmark runs.
-bench-runs:
-    cargo run -- bench list-runs
+bench-runs root="bench":
+    cargo run -- bench --bench-root "{{root}}" list-runs
 
 # Show confidence calibration for a saved benchmark run.
-bench-calibration run_id buckets="10":
-    cargo run -- bench calibration "{{run_id}}" --buckets "{{buckets}}"
+bench-calibration run_id buckets="10" root="bench":
+    cargo run -- bench --bench-root "{{root}}" calibration "{{run_id}}" --buckets "{{buckets}}"
 
 # Fast compile check.
 check:

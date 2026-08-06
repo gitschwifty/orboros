@@ -267,9 +267,10 @@ pub async fn run_t2_case(
     }
     let mut ql = if let Some(set) = prompt_set {
         QueueLoop::new(orb_store.clone(), dep_store, workdir.clone())
+            .with_prompt_capture()
             .with_prompt_config(set.prompt_config())
     } else {
-        QueueLoop::new(orb_store.clone(), dep_store, workdir.clone())
+        QueueLoop::new(orb_store.clone(), dep_store, workdir.clone()).with_prompt_capture()
     };
     if let Some(policy) = case.tool_policy.clone() {
         ql = ql.with_tool_policy(policy);
@@ -442,6 +443,7 @@ async fn run_t2_decompose_case(
         wc.max_iterations = Some(max_iterations);
     }
     let mut ql = QueueLoop::new(orb_store.clone(), dep_store.clone(), workdir.clone())
+        .with_prompt_capture()
         .with_review_config(crate::config::ReviewConfig {
             requires_approval_by_default: false,
             review_on_completion: false,
@@ -1480,6 +1482,14 @@ done
         assert!(patch.contains("result.txt"), "{patch}");
         assert!(patch.contains("+done"), "{patch}");
         assert!(!artifact_dir.join("workdir").join("target").exists());
+        assert!(
+            artifact_dir
+                .join("workdir")
+                .join(".orbs")
+                .join("prompts.jsonl")
+                .exists(),
+            "benchmark workdirs retain prompt snapshots for the run-level ledger"
+        );
     }
 
     #[tokio::test]
