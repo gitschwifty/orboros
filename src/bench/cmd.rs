@@ -841,6 +841,8 @@ fn summarize_run(
         bench_config_path: run_config.bench_config_path.clone(),
         orboros_commit: run_config.orboros_commit.clone(),
         bench_commit: run_config.bench_commit.clone(),
+        orboros_dirty: run_config.orboros_dirty,
+        bench_dirty: run_config.bench_dirty,
         total,
         passed,
         failed,
@@ -987,12 +989,18 @@ fn print_run_summary(r: &BenchRun) {
         || r.bench_commit.is_some()
     {
         println!(
-            "  metadata: prompt={prompt} cases={cases} bench_config={bench_config} orboros_commit={orboros_commit} bench_commit={bench_commit} config={config}",
+            "  metadata: prompt={prompt} cases={cases} bench_config={bench_config} orboros_commit={orboros_commit} bench_commit={bench_commit} orboros_dirty={orboros_dirty} bench_dirty={bench_dirty} config={config}",
             prompt = r.prompt_variant.as_deref().unwrap_or("-"),
             cases = r.cases_root.as_deref().unwrap_or("-"),
             bench_config = r.bench_config_path.as_deref().unwrap_or("-"),
             orboros_commit = short_commit(r.orboros_commit.as_deref()),
             bench_commit = short_commit(r.bench_commit.as_deref()),
+            orboros_dirty = r
+                .orboros_dirty
+                .map_or_else(|| "-".to_string(), |value| value.to_string()),
+            bench_dirty = r
+                .bench_dirty
+                .map_or_else(|| "-".to_string(), |value| value.to_string()),
             config = r.config_hash,
         );
     }
@@ -1115,6 +1123,8 @@ mod tests {
             bench_config_path: None,
             orboros_commit: None,
             bench_commit: None,
+            orboros_dirty: None,
+            bench_dirty: None,
             total: 3,
             passed: 2,
             failed: 1,
@@ -1229,6 +1239,8 @@ text = "x"
                 bench_config_path: None,
                 orboros_commit: None,
                 bench_commit: None,
+                orboros_dirty: None,
+                bench_dirty: None,
                 total: 1,
                 passed: 1,
                 failed: 0,

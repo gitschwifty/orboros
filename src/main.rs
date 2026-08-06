@@ -15,10 +15,10 @@ use orboros::config;
 use orboros::coordinator::decompose::decompose_with_prompt_resolver;
 use orboros::daemon::DaemonConfig;
 use orboros::orb_cmd;
-use orboros::orchestrator::{orchestrate, OrchestrateConfig, CONTEXT_RESULT_MAX_CHARS};
+use orboros::orchestrator::{CONTEXT_RESULT_MAX_CHARS, OrchestrateConfig, orchestrate};
 use orboros::plan::{self, PlanConfig};
 use orboros::queue_loop::{DrainResult, QueueLoop};
-use orboros::routing::profile::{builtin_tools, ToolProfile};
+use orboros::routing::profile::{ToolProfile, builtin_tools};
 use orboros::runner::execute_task;
 use orboros::state::store::TaskStore;
 use orboros::state::task::{Task, TaskStatus};
@@ -1025,7 +1025,11 @@ fn cmd_bench(
             let orboros_commit = project_dir
                 .as_deref()
                 .and_then(orboros::bench::git_head_commit);
+            let orboros_dirty = project_dir
+                .as_deref()
+                .and_then(orboros::bench::git_is_dirty);
             let bench_commit = orboros::bench::git_head_commit(bench_root);
+            let bench_dirty = orboros::bench::git_is_dirty(bench_root);
             let resolver = cfg.model_resolver();
             let resolved_model = if let Some(selector) = model.as_deref() {
                 resolver.resolve_selector(selector, "bench --model".to_string())?
@@ -1075,6 +1079,8 @@ fn cmd_bench(
                     .map(|path| path.display().to_string()),
                 orboros_commit,
                 bench_commit,
+                orboros_dirty,
+                bench_dirty,
                 timeout_s: cfg.bench.timeout_s,
                 max_iterations: cfg.bench.max_iterations,
             };

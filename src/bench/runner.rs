@@ -16,7 +16,7 @@ use tracing::{info, warn};
 
 use crate::bench::case::{BenchCase, BenchExpected, BenchTier, DEFAULT_TIMEOUT_S};
 use crate::bench::prompts::PromptManifest;
-use crate::bench::store::{new_run_id, BenchResult, BenchRun, BenchStatus, BenchStore};
+use crate::bench::store::{BenchResult, BenchRun, BenchStatus, BenchStore, new_run_id};
 use crate::ipc::types::{ResultStatus, RuntimeMode, RuntimePlacementConfig};
 use crate::routing::profile::builtin_tools;
 use crate::worker::process::{SendOutcome, Worker, WorkerConfig};
@@ -165,6 +165,10 @@ pub struct BenchRunConfig {
     pub bench_config_path: Option<String>,
     pub orboros_commit: Option<String>,
     pub bench_commit: Option<String>,
+    /// Git worktree state captured before the benchmark begins.
+    pub orboros_dirty: Option<bool>,
+    /// Git worktree state captured before the benchmark begins.
+    pub bench_dirty: Option<bool>,
     pub timeout_s: Option<u32>,
     pub max_iterations: Option<u32>,
 }
@@ -173,7 +177,7 @@ impl BenchRunConfig {
     #[must_use]
     pub fn config_hash_input(&self, base_worker_config: &WorkerConfig) -> String {
         format!(
-            "variant={:?}\nmodel_selector={:?}\nmodel_key={:?}\nworker_model={:?}\ngrader_model={:?}\nprompt_variant={:?}\nprompt_manifest={:?}\ncases_root={:?}\nbench_config_path={:?}\norboros_commit={:?}\nbench_commit={:?}\ntimeout_s={:?}\nmax_iterations={:?}\nworker_command={}\nsystem_prompt={}",
+            "variant={:?}\nmodel_selector={:?}\nmodel_key={:?}\nworker_model={:?}\ngrader_model={:?}\nprompt_variant={:?}\nprompt_manifest={:?}\ncases_root={:?}\nbench_config_path={:?}\norboros_commit={:?}\nbench_commit={:?}\norboros_dirty={:?}\nbench_dirty={:?}\ntimeout_s={:?}\nmax_iterations={:?}\nworker_command={}\nsystem_prompt={}",
             self.variant,
             self.model_selector,
             self.model_key,
@@ -185,6 +189,8 @@ impl BenchRunConfig {
             self.bench_config_path,
             self.orboros_commit,
             self.bench_commit,
+            self.orboros_dirty,
+            self.bench_dirty,
             self.timeout_s,
             self.max_iterations,
             base_worker_config.command,
@@ -698,6 +704,8 @@ pub async fn run_t1_with_run_id(
         bench_config_path: run_config.bench_config_path.clone(),
         orboros_commit: run_config.orboros_commit.clone(),
         bench_commit: run_config.bench_commit.clone(),
+        orboros_dirty: run_config.orboros_dirty,
+        bench_dirty: run_config.bench_dirty,
         total,
         passed,
         failed,

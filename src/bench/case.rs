@@ -182,7 +182,9 @@ pub enum CorpusError {
         file_id: String,
         expected_id: String,
     },
-    #[error("case tier mismatch: file {path} has tier={file_tier} but is under {expected_tier} directory")]
+    #[error(
+        "case tier mismatch: file {path} has tier={file_tier} but is under {expected_tier} directory"
+    )]
     TierMismatch {
         path: PathBuf,
         file_tier: BenchTier,

@@ -343,8 +343,8 @@ mod tests {
 
     #[test]
     fn composable_decompose_prompt_keeps_contracts_description_first() {
-        let bench_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/bench-prompts");
+        let bench_root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bench-prompts");
         let prompts = BenchPromptSet::load(&bench_root, "composable-v1").unwrap();
         let config = prompts.prompt_config();
         let prompt = config.phases["decomposing"].system.as_deref().unwrap();
@@ -354,7 +354,9 @@ mod tests {
         assert!(prompt.contains("This is guidance, not an Orboros-executed contract."));
         assert!(prompt.contains("Do not create an inspection-only child"));
         assert!(prompt.contains("when they edit the same file"));
-        assert!(prompt.contains("do not require\n  a later-owner label or a detailed handoff plan"));
+        assert!(
+            prompt.contains("do not require\n  a later-owner label or a detailed handoff plan")
+        );
         assert!(prompt.contains("focused scope is guidance, not an artificial\nceiling"));
     }
 

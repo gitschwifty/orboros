@@ -29,7 +29,7 @@ use tracing::{debug, warn};
 
 use crate::bench::case::{BenchCase, BenchExpected, BenchProcess, BenchRunner, BenchTier};
 use crate::bench::prompts::BenchPromptSet;
-use crate::bench::runner::{effective_max_iterations, nonzero_u64, prompt_hash, RunOptions};
+use crate::bench::runner::{RunOptions, effective_max_iterations, nonzero_u64, prompt_hash};
 use crate::bench::store::{BenchResult, BenchStatus};
 use crate::ipc::types::{RuntimeMode, RuntimePlacementConfig};
 use crate::phases::decompose::{self, DecompositionPlan};
@@ -1514,10 +1514,11 @@ done
             err.contains("worker spawn failed"),
             "expected worker failure details, got {err}"
         );
-        assert!(r
-            .output
-            .as_deref()
-            .is_some_and(|out| out.contains("worker spawn failed")));
+        assert!(
+            r.output
+                .as_deref()
+                .is_some_and(|out| out.contains("worker spawn failed"))
+        );
     }
 
     #[test]
@@ -1548,11 +1549,13 @@ done
 
         let edges = dep_store.all_edges().unwrap();
         assert!(edges.iter().any(|edge| edge.edge_type == EdgeType::Parent));
-        assert!(edges
-            .iter()
-            .any(|edge| edge.edge_type == EdgeType::DependsOn
-                && edge.from == children[1].id
-                && edge.to == children[0].id));
+        assert!(
+            edges
+                .iter()
+                .any(|edge| edge.edge_type == EdgeType::DependsOn
+                    && edge.from == children[1].id
+                    && edge.to == children[0].id)
+        );
 
         let ready = dep_store.ready(&children).unwrap();
         assert!(ready.contains(&children[0].id));

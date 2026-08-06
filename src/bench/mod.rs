@@ -42,6 +42,19 @@ pub fn git_head_commit(path: &Path) -> Option<String> {
     (!commit.is_empty()).then(|| commit.to_string())
 }
 
+/// Returns whether a Git worktree has tracked or untracked changes.
+/// `None` means the path is not a readable Git worktree.
+#[must_use]
+pub fn git_is_dirty(path: &Path) -> Option<bool> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["status", "--porcelain", "--untracked-files=normal"])
+        .output()
+        .ok()?;
+    output.status.success().then_some(!output.stdout.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,5 +64,11 @@ mod tests {
     fn git_head_commit_returns_none_for_non_git_dir() {
         let dir = tempdir().unwrap();
         assert_eq!(git_head_commit(dir.path()), None);
+    }
+
+    #[test]
+    fn git_is_dirty_returns_none_for_non_git_dir() {
+        let dir = tempdir().unwrap();
+        assert_eq!(git_is_dirty(dir.path()), None);
     }
 }

@@ -189,6 +189,12 @@ pub struct BenchRun {
     /// Git commit for the benchmark corpus repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bench_commit: Option<String>,
+    /// Whether the Orboros worktree was dirty at benchmark startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orboros_dirty: Option<bool>,
+    /// Whether the benchmark corpus worktree was dirty at benchmark startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bench_dirty: Option<bool>,
     pub total: u32,
     pub passed: u32,
     pub failed: u32,
@@ -615,6 +621,8 @@ mod tests {
             bench_config_path: None,
             orboros_commit: None,
             bench_commit: None,
+            orboros_dirty: None,
+            bench_dirty: None,
             total: 3,
             passed: 2,
             failed: 1,
@@ -663,9 +671,11 @@ mod tests {
         let store = BenchStore::new(dir.path().join("bench"));
         let r = sample_result(DATED_RUN_ID, "case-a");
         store.append_result(&r).unwrap();
-        assert!(store
-            .results_path(DATED_RUN_ID)
-            .ends_with("2026-07-21/bench-20260721200204-16b98c28/results.jsonl"));
+        assert!(
+            store
+                .results_path(DATED_RUN_ID)
+                .ends_with("2026-07-21/bench-20260721200204-16b98c28/results.jsonl")
+        );
         let read = store.read_results(DATED_RUN_ID).unwrap();
         assert_eq!(read.len(), 1);
         assert_eq!(read[0], r);
