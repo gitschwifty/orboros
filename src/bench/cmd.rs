@@ -105,6 +105,14 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
         .iter()
         .map(|case| (case.id.clone(), (case.selector.clone(), case.name.clone())))
         .collect();
+    let resource_guidance: HashMap<String, crate::bench::case::BenchResourceGuidance> = cases
+        .iter()
+        .filter_map(|case| {
+            case.resource_guidance
+                .clone()
+                .map(|guidance| (case.id.clone(), guidance))
+        })
+        .collect();
 
     // Split by tier and dispatch. Today only T1 actually runs the
     // pipeline; T2/T3 fall through to scaffolded error rows.
@@ -123,9 +131,7 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
     tracing::info!(run_id = %run_id, "benchmark run logging started");
     let mut summary_run_id = Some(run_id.clone());
 
-    let had_t1 = !t1.is_empty();
-    let had_other = !other.is_empty();
-    if had_t1 {
+    if !t1.is_empty() {
         let summary = run_t1_with_run_id(
             &t1,
             req.worker_config,
@@ -137,13 +143,9 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
         .await?;
         summary_run_id = Some(summary.run_id);
         all_results.extend(summary.results);
-        if !had_other {
-            println!("\n== summary ==");
-            print_run_summary(&summary.summary);
-        }
         if all_results.iter().any(is_fatal_worker_error) {
             eprintln!("stopping benchmark run after fatal worker/provider error");
-            print_result_table(&all_results, Some(&case_labels));
+            print_result_table(&all_results, Some(&case_labels), Some(&resource_guidance));
             if let Some(ref id) = summary_run_id {
                 if let Some(prompt_set) = req.prompt_set {
                     prompt_set.copy_to_run(&req.store.run_dir(id))?;
@@ -316,15 +318,17 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
         );
         req.store.append_run(&run)?;
         completed_run = Some(run.clone());
-        if !had_t1 || had_other {
-            println!("\n== summary ==");
-            print_run_summary(&run);
-        }
     }
 
-    print_result_table(&all_results, Some(&case_labels));
     if let Some(run) = completed_run.as_ref() {
-        print_run_completion(run, &all_results);
+        print_completed_run(
+            run,
+            &all_results,
+            &case_labels,
+            &resource_guidance,
+        );
+    } else {
+        print_result_table(&all_results, Some(&case_labels), Some(&resource_guidance));
     }
     if let Some(ref id) = summary_run_id {
         println!("\nRun id: {id}");
@@ -342,10 +346,17 @@ pub fn cmd_bench_show(store: &BenchStore, run_id: &str) -> anyhow::Result<()> {
     if results.is_empty() {
         anyhow::bail!("no results found for run `{run_id}`");
     }
-    print_result_table(&results, None);
     if let Some(run) = store.read_runs()?.into_iter().find(|r| r.run_id == run_id) {
-        println!("\n== summary ==");
-        print_run_summary(&run);
+        let case_labels = case_labels_for_run(&run);
+        let resource_guidance = resource_guidance_for_run(&run);
+        print_completed_run(
+            &run,
+            &results,
+            &case_labels,
+            &resource_guidance,
+        );
+    } else {
+        print_result_table(&results, None, None);
     }
     Ok(())
 }
@@ -432,10 +443,23 @@ pub fn cmd_bench_report(
         records.len(),
         model = run.worker_model.as_deref().unwrap_or("-")
     );
+    let case_labels = case_labels_for_run(&run);
     let summaries = summarize_dispatches(&records);
+    let mut summary_rows: Vec<_> = summaries.into_iter().collect();
+    summary_rows.sort_by(|((case_a, kind_a), _), ((case_b, kind_b), _)| {
+        display_case_label(&case_labels, case_a)
+            .0
+            .cmp(&display_case_label(&case_labels, case_b).0)
+            .then_with(|| kind_a.cmp(kind_b))
+    });
+    let (selector_width, name_width) = report_case_widths(
+        summary_rows.iter().map(|((case_id, _), _)| case_id.as_str()),
+        &case_labels,
+    );
     println!(
-        "{case:<24} {kind:<18} {done:>4} {failed:>6} {error:>5} {retry:>5} {turns:>6} {tools:>6} {input:>9} {output:>8} {cache:>8} {cost:>10} {wall:>9}",
-        case = "case",
+        "{selector:<selector_width$}  {name:<name_width$}  {kind:<18} {done:>4} {failed:>6} {error:>5} {retry:>5} {turns:>6} {tools:>6} {input:>9} {output:>8} {cache:>8} {cost:>10} {wall:>9}",
+        selector = "case",
+        name = "name",
         kind = "dispatch",
         done = "done",
         failed = "failed",
@@ -448,10 +472,15 @@ pub fn cmd_bench_report(
         cache = "cache_r",
         cost = "cost",
         wall = "wall",
+        selector_width = selector_width,
+        name_width = name_width,
     );
-    for ((case_id, kind), summary) in summaries {
+    for ((case_id, kind), summary) in summary_rows {
+        let (selector, name) = display_case_label(&case_labels, &case_id);
         println!(
-            "{case_id:<24} {kind:<18} {done:>4} {failed:>6} {error:>5} {retries:>5} {turns:>6} {tools:>6} {input:>9} {output:>8} {cache_read:>8} {cost:>10} {wall:>9}",
+            "{selector:<selector_width$}  {name:<name_width$}  {kind:<18} {done:>4} {failed:>6} {error:>5} {retries:>5} {turns:>6} {tools:>6} {input:>9} {output:>8} {cache_read:>8} {cost:>10} {wall:>9}",
+            selector = selector,
+            name = name,
             done = summary.done,
             failed = summary.failed,
             error = summary.errors,
@@ -463,9 +492,11 @@ pub fn cmd_bench_report(
             cache_read = display_count(summary.cache_read_tokens),
             cost = format_cost(summary.cost_micros, None),
             wall = format_elapsed_ms(summary.wall_ms),
+            selector_width = selector_width,
+            name_width = name_width,
         );
     }
-    print_prompt_context_report(store, run_id, case_id)?;
+    print_prompt_context_report(store, run_id, case_id, &case_labels)?;
     Ok(())
 }
 
@@ -487,10 +518,17 @@ pub fn cmd_bench_prompts(
     if prompts.is_empty() {
         anyhow::bail!("no retained prompt snapshots match that run, case, and orb");
     }
+    let run = store
+        .read_runs()?
+        .into_iter()
+        .find(|run| run.run_id == run_id)
+        .context("no saved benchmark run with that id")?;
+    let case_labels = case_labels_for_run(&run);
     for record in prompts {
+        let (selector, name) = display_case_label(&case_labels, &record.case_id);
         println!(
-            "== {} {} [{}] ==",
-            record.case_id, record.prompt.orb_id, record.prompt.dispatch_kind
+            "== {selector} {name} · {} [{}] ==",
+            record.prompt.orb_id, record.prompt.dispatch_kind,
         );
         println!(
             "input_tokens={} system_hash={} user_hash={}",
@@ -591,6 +629,7 @@ fn print_prompt_context_report(
     store: &BenchStore,
     run_id: &str,
     case_id: Option<&str>,
+    case_labels: &HashMap<String, (String, String)>,
 ) -> anyhow::Result<()> {
     let mut prompts = store.read_prompts(run_id)?;
     if let Some(case_id) = case_id {
@@ -601,9 +640,22 @@ fn print_prompt_context_report(
         return Ok(());
     }
     println!("\n== prompt context (Orboros-owned chars) ==");
+    let summaries = summarize_prompts(&prompts);
+    let mut summary_rows: Vec<_> = summaries.into_iter().collect();
+    summary_rows.sort_by(|((case_a, kind_a), _), ((case_b, kind_b), _)| {
+        display_case_label(case_labels, case_a)
+            .0
+            .cmp(&display_case_label(case_labels, case_b).0)
+            .then_with(|| kind_a.cmp(kind_b))
+    });
+    let (selector_width, name_width) = report_case_widths(
+        summary_rows.iter().map(|((case_id, _), _)| case_id.as_str()),
+        case_labels,
+    );
     println!(
-        "{case:<24} {kind:<18} {count:>5} {tokens:>9} {system:>7} {user:>7} {context:>7} {overhead:>8} {current:>7} {parent:>7} {siblings:>8} {children:>8} {deps:>7}",
-        case = "case",
+        "{selector:<selector_width$}  {name:<name_width$}  {kind:<18} {count:>5} {tokens:>9} {system:>7} {user:>7} {context:>7} {overhead:>8} {current:>7} {parent:>7} {siblings:>8} {children:>8} {deps:>7}",
+        selector = "case",
+        name = "name",
         kind = "dispatch",
         count = "count",
         tokens = "in_tok",
@@ -616,10 +668,15 @@ fn print_prompt_context_report(
         siblings = "siblings",
         children = "children",
         deps = "deps",
+        selector_width = selector_width,
+        name_width = name_width,
     );
-    for ((case_id, kind), summary) in summarize_prompts(&prompts) {
+    for ((case_id, kind), summary) in summary_rows {
+        let (selector, name) = display_case_label(case_labels, &case_id);
         println!(
-            "{case_id:<24} {kind:<18} {count:>5} {tokens:>9} {system:>7} {user:>7} {context:>7} {overhead:>8} {current:>7} {parent:>7} {siblings:>8} {children:>8} {deps:>7}",
+            "{selector:<selector_width$}  {name:<name_width$}  {kind:<18} {count:>5} {tokens:>9} {system:>7} {user:>7} {context:>7} {overhead:>8} {current:>7} {parent:>7} {siblings:>8} {children:>8} {deps:>7}",
+            selector = selector,
+            name = name,
             count = summary.count,
             tokens = display_count(summary.input_tokens),
             system = summary.system_prompt_chars,
@@ -631,6 +688,8 @@ fn print_prompt_context_report(
             siblings = summary.sibling_orbs_chars,
             children = summary.child_orbs_chars,
             deps = summary.upstream_dependency_chars,
+            selector_width = selector_width,
+            name_width = name_width,
         );
     }
     println!(
@@ -679,9 +738,8 @@ fn summarize_prompts(records: &[BenchPromptRecord]) -> BTreeMap<(String, String)
     summaries
 }
 
-/// Compares two saved runs side by side. Highlights cases whose
-/// status changed and warns when the case or resolved system prompt
-/// hash differs (direct comparison may be misleading).
+/// Compares two saved runs side by side. Highlights case status changes and
+/// reports prompt-set provenance at the run level.
 ///
 /// # Errors
 ///
@@ -709,17 +767,28 @@ pub fn cmd_bench_compare(store: &BenchStore, run_a: &str, run_b: &str) -> anyhow
         print_run_summary(run);
     }
     warn_on_run_metadata_drift(run_meta_a, run_meta_b);
+    report_prompt_manifest_difference(run_meta_a, run_meta_b);
 
-    let case_width = case_id_width(a.iter().chain(&b).map(|r| r.case_id.as_str()));
-    let a_width = run_a.len().max(10);
-    let b_width = run_b.len().max(10);
-    println!(
-        "{case:<case_width$} {a_status:<a_width$} {b_status:<b_width$} change",
-        case = "case",
-        a_status = run_a,
-        b_status = run_b,
+    let case_labels = run_meta_a
+        .or(run_meta_b)
+        .map_or_else(HashMap::new, case_labels_for_run);
+    let (selector_width, name_width) = report_case_widths(
+        a.iter().chain(&b).map(|result| result.case_id.as_str()),
+        &case_labels,
     );
-    let mut prompt_changed = 0;
+    let a_label = run_display_label(run_a);
+    let b_label = run_display_label(run_b);
+    let a_width = a_label.len().max(8);
+    let b_width = b_label.len().max(8);
+    println!(
+        "{selector:<selector_width$}  {name:<name_width$}  {a_status:<a_width$}  {b_status:<b_width$}  change",
+        selector = "case",
+        name = "name",
+        a_status = a_label,
+        b_status = b_label,
+        selector_width = selector_width,
+        name_width = name_width,
+    );
     let mut improved = 0;
     let mut regressed = 0;
     let mut only_in_a = 0;
@@ -738,54 +807,47 @@ pub fn cmd_bench_compare(store: &BenchStore, run_a: &str, run_b: &str) -> anyhow
                 }
                 _ => "changed",
             };
-            let prompt_note = if r.prompt_hash != rb.prompt_hash {
-                prompt_changed += 1;
-                "  ⚠ case prompt changed"
-            } else if r.system_prompt_hash.as_ref().zip(rb.system_prompt_hash.as_ref()).is_some_and(
-                |(a, b)| a != b,
-            ) {
-                prompt_changed += 1;
-                "  ⚠ system prompt changed"
-            } else if r.system_prompt_hash.is_some() != rb.system_prompt_hash.is_some() {
-                "  (system prompt hash unavailable in one run)"
-            } else {
-                ""
-            };
+            let (selector, name) = display_case_label(&case_labels, &r.case_id);
             println!(
-                "{case:<case_width$} {a:<a_width$?} {b:<b_width$?} {change}{prompt_note}",
-                case = r.case_id,
+                "{selector:<selector_width$}  {name:<name_width$}  {a:<a_width$?}  {b:<b_width$?}  {change}",
+                selector = selector,
+                name = name,
                 a = r.status,
                 b = rb.status,
+                selector_width = selector_width,
+                name_width = name_width,
             );
         } else {
             only_in_a += 1;
+            let (selector, name) = display_case_label(&case_labels, &r.case_id);
             println!(
-                "{case:<case_width$} {a:<a_width$?} {b:<b_width$} only in {run_a}",
-                case = r.case_id,
+                "{selector:<selector_width$}  {name:<name_width$}  {a:<a_width$?}  {b:<b_width$}  only in {a_label}",
+                selector = selector,
+                name = name,
                 a = r.status,
                 b = "-",
+                selector_width = selector_width,
+                name_width = name_width,
             );
         }
     }
     for rb in &b {
         if !a.iter().any(|ra| ra.case_id == rb.case_id) {
             only_in_b += 1;
+            let (selector, name) = display_case_label(&case_labels, &rb.case_id);
             println!(
-                "{case:<case_width$} {a:<a_width$} {b:<b_width$?} only in {run_b}",
-                case = rb.case_id,
+                "{selector:<selector_width$}  {name:<name_width$}  {a:<a_width$}  {b:<b_width$?}  only in {b_label}",
+                selector = selector,
+                name = name,
                 a = "-",
                 b = rb.status,
+                selector_width = selector_width,
+                name_width = name_width,
             );
         }
     }
 
-    println!("\nimproved: {improved}, regressed: {regressed}, prompt-changed: {prompt_changed}");
-    if prompt_changed > 0 {
-        eprintln!(
-            "warning: {prompt_changed} case(s) had a different prompt between runs - \
-             direct status comparison may be misleading."
-        );
-    }
+    println!("\nimproved: {improved}, regressed: {regressed}");
     if only_in_a > 0 || only_in_b > 0 {
         eprintln!(
             "warning: case sets differ ({only_in_a} only in {run_a}, {only_in_b} only in {run_b})"
@@ -813,9 +875,22 @@ pub fn cmd_bench_list_runs(store: &BenchStore) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn print_completed_run(
+    run: &BenchRun,
+    results: &[BenchResult],
+    case_labels: &HashMap<String, (String, String)>,
+    resource_guidance: &HashMap<String, crate::bench::case::BenchResourceGuidance>,
+) {
+    println!("\n== summary ==");
+    print_run_summary(run);
+    print_result_table(results, Some(case_labels), Some(resource_guidance));
+    print_run_completion(run, results, resource_guidance);
+}
+
 fn print_result_table(
     results: &[crate::bench::store::BenchResult],
     case_labels: Option<&HashMap<String, (String, String)>>,
+    resource_guidance: Option<&HashMap<String, crate::bench::case::BenchResourceGuidance>>,
 ) {
     let selector_width = case_labels
         .into_iter()
@@ -830,7 +905,7 @@ fn print_result_table(
         .unwrap_or(4)
         .max(20);
     println!(
-        "{selector:<selector_width$}  {name:<name_width$}  {status:<8}  {score:>5}  {process:>7}  {elapsed:>9}  {cost:>8}  {turns:>5}  {tools:>5}  {input:>8}  {output:>8}  {cache_r:>8}  {cache_w:>8}  {conf:>5}",
+        "{selector:<selector_width$}  {name:<name_width$}  {status:<8}  {score:>5}  {process:>7}  {elapsed:>9}  {cost:>10}  {turns:>5}  {tools:>5}  {input:>8}  {output:>8}  {cache_r:>8}  {cache_w:>8}  {conf:>5}  {target:>11}",
         selector = "case",
         name = "name",
         status = "status",
@@ -845,6 +920,7 @@ fn print_result_table(
         cache_r = "cache_r",
         cache_w = "cache_w",
         conf = "conf",
+        target = "target",
         selector_width = selector_width,
         name_width = name_width,
     );
@@ -879,8 +955,12 @@ fn print_result_table(
         let cache_write = r
             .cache_write_tokens
             .map_or(String::from("-"), |tokens| tokens.to_string());
+        let target = resource_guidance
+            .and_then(|guidance| guidance.get(&r.case_id))
+            .and_then(|guidance| resource_target_status(r, guidance))
+            .map_or("-", ResourceTargetStatus::label);
         println!(
-            "{selector:<selector_width$}  {name:<name_width$}  {status:<8}  {score:>5.2}  {process:>7}  {elapsed:>9}  {cost:>8}  {turns:>5}  {tools:>5}  {input:>8}  {output:>8}  {cache_read:>8}  {cache_write:>8}  {conf:>5}",
+            "{selector:<selector_width$}  {name:<name_width$}  {status:<8}  {score:>5.2}  {process:>7}  {elapsed:>9}  {cost:>10}  {turns:>5}  {tools:>5}  {input:>8}  {output:>8}  {cache_read:>8}  {cache_write:>8}  {conf:>5}  {target:>11}",
             selector = selector,
             name = name,
             status = status,
@@ -895,6 +975,7 @@ fn print_result_table(
             cache_read = cache_read,
             cache_write = cache_write,
             conf = conf,
+            target = target,
             selector_width = selector_width,
             name_width = name_width,
         );
@@ -922,7 +1003,11 @@ fn format_elapsed_ms(elapsed_ms: u64) -> String {
     )
 }
 
-fn print_run_completion(run: &BenchRun, results: &[BenchResult]) {
+fn print_run_completion(
+    run: &BenchRun,
+    results: &[BenchResult],
+    resource_guidance: &HashMap<String, crate::bench::case::BenchResourceGuidance>,
+) {
     let model = run
         .worker_model
         .as_deref()
@@ -953,6 +1038,33 @@ fn print_run_completion(run: &BenchRun, results: &[BenchResult]) {
             "process: {fully_met}/{} cases fully met their contract ({earned:.2}/{} points)",
             process_results.len(),
             process_results.len()
+        );
+    }
+
+    let target_statuses: Vec<_> = results
+        .iter()
+        .filter_map(|result| {
+            resource_guidance
+                .get(&result.case_id)
+                .and_then(|guidance| resource_target_status(result, guidance))
+        })
+        .collect();
+    if !target_statuses.is_empty() {
+        let under = target_statuses
+            .iter()
+            .filter(|status| **status == ResourceTargetStatus::Under)
+            .count();
+        let over = target_statuses
+            .iter()
+            .filter(|status| **status == ResourceTargetStatus::Over)
+            .count();
+        let investigate = target_statuses
+            .iter()
+            .filter(|status| **status == ResourceTargetStatus::Investigate)
+            .count();
+        println!(
+            "targets: {under} UNDER, {over} OVER, {investigate} INVESTIGATE of {} guided cases",
+            target_statuses.len()
         );
     }
 
@@ -1089,8 +1201,122 @@ fn print_result_details(result: &BenchResult) {
     }
 }
 
-fn case_id_width<'a>(ids: impl Iterator<Item = &'a str>) -> usize {
-    ids.map(str::len).max().unwrap_or(4).max(24)
+fn case_labels_for_run(run: &BenchRun) -> HashMap<String, (String, String)> {
+    run.cases_root
+        .as_deref()
+        .and_then(|root| load_all(Path::new(root)).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|case| (case.id, (case.selector, case.name)))
+        .collect()
+}
+
+fn resource_guidance_for_run(
+    run: &BenchRun,
+) -> HashMap<String, crate::bench::case::BenchResourceGuidance> {
+    run.cases_root
+        .as_deref()
+        .and_then(|root| load_all(Path::new(root)).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|case| case.resource_guidance.map(|guidance| (case.id, guidance)))
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceTargetStatus {
+    Under,
+    Over,
+    Investigate,
+}
+
+impl ResourceTargetStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Under => "UNDER",
+            Self::Over => "OVER",
+            Self::Investigate => "INVESTIGATE",
+        }
+    }
+}
+
+fn resource_target_status(
+    result: &BenchResult,
+    guidance: &crate::bench::case::BenchResourceGuidance,
+) -> Option<ResourceTargetStatus> {
+    let measurements = [
+        (guidance.input_tokens.as_ref(), result.prompt_tokens),
+        (guidance.cache_read_tokens.as_ref(), result.cache_read_tokens),
+        (
+            guidance.tool_calls.as_ref(),
+            result.tool_calls.map(u64::from),
+        ),
+    ];
+    let mut over = false;
+    let mut measured = false;
+    for (threshold, value) in measurements {
+        let Some(threshold) = threshold else {
+            continue;
+        };
+        let value = value?;
+        measured = true;
+        if value > threshold.investigate {
+            return Some(ResourceTargetStatus::Investigate);
+        }
+        if value > threshold.target {
+            over = true;
+        }
+    }
+    measured.then_some(if over {
+        ResourceTargetStatus::Over
+    } else {
+        ResourceTargetStatus::Under
+    })
+}
+
+fn display_case_label(
+    case_labels: &HashMap<String, (String, String)>,
+    case_id: &str,
+) -> (String, String) {
+    case_labels
+        .get(case_id)
+        .cloned()
+        .unwrap_or_else(|| (case_id.into(), "-".into()))
+}
+
+fn report_case_widths<'a>(
+    ids: impl Iterator<Item = &'a str>,
+    case_labels: &HashMap<String, (String, String)>,
+) -> (usize, usize) {
+    ids.map(|id| display_case_label(case_labels, id))
+        .fold((4, 4), |(selector_width, name_width), (selector, name)| {
+            (selector_width.max(selector.len()), name_width.max(name.len()))
+        })
+}
+
+fn run_display_label(run_id: &str) -> &str {
+    run_id.rsplit_once('-').map_or(run_id, |(_, suffix)| suffix)
+}
+
+fn report_prompt_manifest_difference(a: Option<&BenchRun>, b: Option<&BenchRun>) {
+    match (
+        a.and_then(|run| run.prompt_manifest.as_ref()),
+        b.and_then(|run| run.prompt_manifest.as_ref()),
+    ) {
+        (Some(a), Some(b)) if a == b => {
+            println!("prompt set: {} (matching manifest)", a.prompt_set);
+        }
+        (Some(a), Some(b)) => {
+            eprintln!(
+                "warning: prompt manifests differ ({} vs {}); direct comparison may be misleading",
+                a.prompt_set, b.prompt_set
+            );
+        }
+        (None, None) => {}
+        _ => eprintln!(
+            "note: prompt manifest is unavailable for one run; prompt-set compatibility cannot be verified"
+        ),
+    }
 }
 
 fn summarize_run(
@@ -1360,7 +1586,7 @@ fn warn_on_run_metadata_drift(a: Option<&BenchRun>, b: Option<&BenchRun>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bench::case::BenchExpected;
+    use crate::bench::case::{BenchExpected, BenchResourceGuidance, BenchResourceThreshold};
     use crate::bench::store::BenchResult;
     use chrono::Utc;
 
@@ -1437,6 +1663,47 @@ mod tests {
             assistant_turns: None,
             tool_calls: None,
         }
+    }
+
+    #[test]
+    fn resource_target_status_uses_the_highest_exceeded_threshold() {
+        let guidance = BenchResourceGuidance {
+            input_tokens: Some(BenchResourceThreshold {
+                target: 30,
+                investigate: 50,
+            }),
+            cache_read_tokens: Some(BenchResourceThreshold {
+                target: 20,
+                investigate: 40,
+            }),
+            tool_calls: Some(BenchResourceThreshold {
+                target: 10,
+                investigate: 20,
+            }),
+        };
+        let mut result = sample_result("case", "run", BenchStatus::Pass);
+        result.prompt_tokens = Some(30);
+        result.cache_read_tokens = Some(20);
+        result.tool_calls = Some(10);
+        assert_eq!(
+            resource_target_status(&result, &guidance),
+            Some(ResourceTargetStatus::Under)
+        );
+
+        result.tool_calls = Some(11);
+        assert_eq!(
+            resource_target_status(&result, &guidance),
+            Some(ResourceTargetStatus::Over)
+        );
+
+        result.cache_read_tokens = Some(41);
+        assert_eq!(
+            resource_target_status(&result, &guidance),
+            Some(ResourceTargetStatus::Investigate)
+        );
+
+        result.cache_read_tokens = None;
+        assert_eq!(resource_target_status(&result, &guidance), None);
     }
 
     fn write_case(dir: &Path, tier: BenchTier, id: &str) {
@@ -1585,7 +1852,7 @@ text = "x"
     }
 
     #[test]
-    fn compare_detects_prompt_hash_drift() {
+    fn compare_ignores_case_prompt_hash_drift() {
         let dir = tempfile::tempdir().unwrap();
         let store = BenchStore::new(dir.path().join("bench"));
         let mut a = sample_result("c1", "run-a", BenchStatus::Pass);

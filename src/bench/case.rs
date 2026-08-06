@@ -108,6 +108,29 @@ pub struct BenchProcess {
     pub required_child_dependencies: Vec<[u32; 2]>,
 }
 
+/// Non-failing resource guidance for one benchmark case.
+///
+/// A value above `target` is reported as `OVER`; a value above
+/// `investigate` is reported as `INVESTIGATE`. Neither changes the benchmark
+/// pass/fail verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchResourceGuidance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<BenchResourceThreshold>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<BenchResourceThreshold>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<BenchResourceThreshold>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchResourceThreshold {
+    pub target: u64,
+    pub investigate: u64,
+}
+
 /// A single benchmark case.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -145,6 +168,9 @@ pub struct BenchCase {
     /// case. Cases without this field do not contribute a process score.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process: Option<BenchProcess>,
+    /// Optional non-failing resource guidance used for reporting only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_guidance: Option<BenchResourceGuidance>,
     /// Stable human-facing selector derived from the case directory,
     /// for example `t2.001`. It is not part of case.toml.
     #[serde(skip)]
