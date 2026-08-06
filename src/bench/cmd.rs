@@ -272,6 +272,11 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
         );
         req.store
             .append_dispatches(&run_id, &case.id, &ledger.read_all()?)?;
+        req.store.retain_orb_state(
+            &run_id,
+            &case.id,
+            &artifact_dir.join("workdir").join(".orbs"),
+        )?;
         req.store.append_result(&result)?;
         let fatal = is_fatal_worker_error(&result);
         all_results.push(result);

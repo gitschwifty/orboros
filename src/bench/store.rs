@@ -270,6 +270,14 @@ impl BenchStore {
         self.run_dir(run_id).join("dispatches.jsonl")
     }
 
+    /// Directory containing retained compact orb state, grouped by case.
+    #[must_use]
+    pub fn case_orbs_dir(&self, run_id: &str, case_id: &str) -> PathBuf {
+        self.run_dir(run_id)
+            .join("orbs")
+            .join(sanitize_path_component(case_id))
+    }
+
     /// Directory for artifacts captured from one case within a run.
     #[must_use]
     pub fn case_artifact_dir(&self, run_id: &str, case_id: &str) -> PathBuf {
@@ -306,6 +314,31 @@ impl BenchStore {
                     execution: execution.clone(),
                 },
             )?;
+        }
+        Ok(())
+    }
+
+    /// Retains the compact graph/lifecycle evidence from a case workdir.
+    /// Dispatch telemetry is deliberately excluded because it is retained in
+    /// the run-level `dispatches.jsonl` with a case identifier.
+    pub fn retain_orb_state(
+        &self,
+        run_id: &str,
+        case_id: &str,
+        source_orbs_dir: &Path,
+    ) -> Result<(), StoreError> {
+        let destination = self.case_orbs_dir(run_id, case_id);
+        for name in ["orbs.jsonl", "deps.jsonl"] {
+            let source = source_orbs_dir.join(name);
+            if source.exists() {
+                ensure_dir(&destination)?;
+                std::fs::copy(&source, destination.join(name)).map_err(|source_err| {
+                    StoreError::Io {
+                        path: source,
+                        source: source_err,
+                    }
+                })?;
+            }
         }
         Ok(())
     }

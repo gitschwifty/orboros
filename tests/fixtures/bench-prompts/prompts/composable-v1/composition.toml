@@ -1,0 +1,2 @@
+[roles.decompose]
+fragments = ["base/worker.md", "roles/decompose.md"]

@@ -367,13 +367,13 @@ async fn run_t1_stops_after_protocol_mismatch_without_retries() {
 }
 
 #[test]
-fn local_t1_corpus_path_is_optional() {
-    // Benchmark cases live under gitignored bench/t1 so private
-    // eval prompts and seed repos do not publish with the repo.
+fn private_t1_corpus_is_opt_in() {
+    let Some(root) = std::env::var_os("ORBOROS_BENCH_ROOT") else {
+        eprintln!("skipping private corpus integration; set ORBOROS_BENCH_ROOT to enable it");
+        return;
+    };
     use orboros::bench::case::{load_tier, BenchTier};
-    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repo_root = manifest_dir;
-    let cases = load_tier(&repo_root.join("bench"), BenchTier::T1).unwrap();
+    let cases = load_tier(&std::path::PathBuf::from(root), BenchTier::T1).unwrap();
     for c in &cases {
         assert_eq!(c.tier, BenchTier::T1, "case {} has wrong tier", c.id);
         assert!(

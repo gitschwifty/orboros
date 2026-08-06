@@ -343,7 +343,8 @@ mod tests {
 
     #[test]
     fn composable_decompose_prompt_keeps_contracts_description_first() {
-        let bench_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bench");
+        let bench_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/bench-prompts");
         let prompts = BenchPromptSet::load(&bench_root, "composable-v1").unwrap();
         let config = prompts.prompt_config();
         let prompt = config.phases["decomposing"].system.as_deref().unwrap();
