@@ -16,6 +16,7 @@
 pub mod calibration;
 pub mod case;
 pub mod cmd;
+pub mod log;
 pub mod prompts;
 pub mod runner;
 pub mod runner_t2t3;

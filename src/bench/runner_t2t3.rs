@@ -420,6 +420,7 @@ async fn run_t2_decompose_case(
     std::fs::create_dir_all(&state_dir)?;
     let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
     let dep_store = DepStore::new(state_dir.join("deps.jsonl"));
+    let execution_store = crate::execution::ExecutionStore::new(state_dir.join("executions.jsonl"));
 
     let root = Orb::new(case.name.clone(), case.prompt.clone()).with_type(OrbType::Feature);
     let root_id = root.id.clone();
@@ -453,6 +454,7 @@ async fn run_t2_decompose_case(
         started,
         base_worker_config,
         dep_store: &dep_store,
+        execution_store: &execution_store,
     };
 
     let mut stalled_steps = 0usize;
@@ -461,21 +463,38 @@ async fn run_t2_decompose_case(
         let dispatched = ql.dispatch_ready_orbs(&wc, 4).await?;
         let materialized = materialize_decomposition_if_ready(&root_id, &orb_store, &dep_store)?;
         let cleared = clear_completed_phase_for_next_prompt(&root_id, &orb_store)?;
-        let all_orbs = orb_store.load_all()?;
+        let mut all_orbs = orb_store.load_all()?;
 
         if all_orbs
             .iter()
             .any(|orb| orb.effective_status() == TaskStatus::Failed)
         {
+            // Let the normal queue lifecycle propagate a terminal child state
+            // to its parent before we snapshot benchmark evidence.
+            let _ = ql.tick()?;
+            all_orbs = orb_store.load_all()?;
             copy_case_test_overlay(case, &workdir)?;
             let tests = evaluate_tests_pass_output(&workdir, &command).ok();
             let artifact_path = snapshot_workdir(&seed_dir, &workdir, artifact_dir, &case.id)?;
+            let worker_error = all_orbs.iter().any(|orb| {
+                orb.result
+                    .as_deref()
+                    .is_some_and(|result| result.starts_with("[worker_error] "))
+            });
             return Ok(result_ctx.result(
                 &all_orbs,
                 tests.as_ref(),
                 artifact_path.as_deref(),
-                BenchStatus::Fail,
-                Some("decompose runner encountered a failed orb".into()),
+                if worker_error {
+                    BenchStatus::Error
+                } else {
+                    BenchStatus::Fail
+                },
+                Some(if worker_error {
+                    "decompose runner encountered an unrecovered worker error".into()
+                } else {
+                    "decompose runner encountered a failed orb".into()
+                }),
             ));
         }
 
@@ -651,6 +670,7 @@ struct T2DecomposeResultCtx<'a> {
     started: Instant,
     base_worker_config: &'a WorkerConfig,
     dep_store: &'a DepStore,
+    execution_store: &'a crate::execution::ExecutionStore,
 }
 
 impl T2DecomposeResultCtx<'_> {
@@ -664,7 +684,12 @@ impl T2DecomposeResultCtx<'_> {
     ) -> BenchResult {
         let root = orbs.iter().find(|orb| orb.parent_id.is_none());
         let execution = root.and_then(|orb| orb.execution.as_ref());
-        let usage = aggregate_orb_usage(orbs);
+        let records = self.execution_store.read_all().unwrap_or_default();
+        let usage = if records.is_empty() {
+            aggregate_orb_usage(orbs)
+        } else {
+            aggregate_execution_usage(&records)
+        };
         BenchResult {
             case_id: self.case.id.clone(),
             run_id: self.run_id.into(),
@@ -681,8 +706,12 @@ impl T2DecomposeResultCtx<'_> {
             total_latency_ms: usage.total_latency,
             cost_cents: usage.cost_cents,
             cost_micros: usage.cost_micros,
-            iterations: u32::try_from(orbs.iter().filter(|orb| orb.execution.is_some()).count())
-                .unwrap_or(u32::MAX),
+            iterations: u32::try_from(if records.is_empty() {
+                orbs.iter().filter(|orb| orb.execution.is_some()).count()
+            } else {
+                records.len()
+            })
+            .unwrap_or(u32::MAX),
             assistant_turns: usage.assistant_turns,
             tool_calls: usage.tool_calls,
             prompt_tokens: usage.prompt,
@@ -771,6 +800,39 @@ fn aggregate_orb_usage(orbs: &[Orb]) -> AggregateUsage {
         total_latency,
         assistant_turns,
         tool_calls,
+    }
+}
+
+fn aggregate_execution_usage(records: &[crate::execution::ExecutionRecord]) -> AggregateUsage {
+    let mut usage = AggregateUsage::default();
+    for record in records {
+        add_optional_u64(&mut usage.prompt, record.prompt_tokens);
+        add_optional_u64(&mut usage.completion, record.completion_tokens);
+        add_optional_u64(&mut usage.total, record.total_tokens);
+        add_optional_u64(&mut usage.cache_read, record.cache_read_tokens);
+        add_optional_u64(&mut usage.cache_write, record.cache_write_tokens);
+        add_optional_u64(&mut usage.cost_micros, None);
+        add_optional_ms(&mut usage.model_latency, record.model_latency_ms);
+        add_optional_ms(&mut usage.tool_latency, record.tool_latency_ms);
+        add_optional_ms(&mut usage.total_latency, record.total_latency_ms);
+        add_optional_u32(&mut usage.assistant_turns, record.assistant_turns);
+        add_optional_u32(&mut usage.tool_calls, record.tool_calls);
+    }
+    // Cost is intentionally kept separate so missing values remain unknown.
+    let cost = records
+        .iter()
+        .filter_map(|r| r.cost_micros)
+        .fold(None, |sum, value| {
+            Some(sum.unwrap_or(0u64).saturating_add(value))
+        });
+    usage.cost_cents = cost.map(crate::bench::runner::cost_micros_to_cents_ceil);
+    usage.cost_micros = cost;
+    usage
+}
+
+fn add_optional_u64(total: &mut Option<u64>, value: Option<u64>) {
+    if let Some(value) = value {
+        *total = Some(total.unwrap_or(0).saturating_add(value));
     }
 }
 

@@ -86,11 +86,17 @@ pub struct QueueLoop {
     review_config: Option<crate::config::ReviewConfig>,
     prompt_config: Option<crate::config::PromptConfig>,
     tool_policy: Option<crate::routing::profile::PhaseToolPolicy>,
+    execution_store: crate::execution::ExecutionStore,
 }
 
 impl QueueLoop {
     /// Creates a new `QueueLoop`.
     pub fn new(orb_store: OrbStore, dep_store: DepStore, base_dir: PathBuf) -> Self {
+        let execution_path = orb_store
+            .path()
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("executions.jsonl");
         Self {
             orb_store,
             dep_store,
@@ -101,6 +107,7 @@ impl QueueLoop {
             review_config: None,
             prompt_config: None,
             tool_policy: None,
+            execution_store: crate::execution::ExecutionStore::new(execution_path),
         }
     }
 
@@ -711,6 +718,7 @@ impl QueueLoop {
             let context_orbs = Arc::clone(&context_orbs);
             let context_edges = Arc::clone(&context_edges);
             let hooks = self.hooks.as_ref().map(Arc::clone);
+            let execution_store = self.execution_store.clone();
             join_set.spawn(async move {
                 let Ok(_permit) = sem.acquire_owned().await else {
                     return Ok(false);
@@ -729,6 +737,7 @@ impl QueueLoop {
                     tool_policy.as_ref(),
                     context,
                     hooks,
+                    execution_store,
                 )
                 .await
             });
@@ -991,6 +1000,7 @@ async fn dispatch_one_owned(
     tool_policy: Option<&crate::routing::profile::PhaseToolPolicy>,
     context: DispatchContext<'_>,
     hooks: Option<Arc<crate::hooks::HookSink>>,
+    execution_store: crate::execution::ExecutionStore,
 ) -> std::io::Result<bool> {
     use crate::worker::dispatcher::{
         apply_dispatch_outcome_with_review, dispatch_orb, worker_config_for_with_model_config,
@@ -1048,10 +1058,17 @@ async fn dispatch_one_owned(
         .map_err(std::io::Error::other)?;
     let outcome = crate::worker::dispatcher::with_prompt_metadata(
         outcome,
-        prompt_category,
+        prompt_category.clone(),
         &crate::worker::process::effective_system_prompt(&wc.system_prompt, &wc.tools),
         prompt_source,
     );
+    execution_store.append(&crate::execution::ExecutionRecord::from_outcome(
+        &orb,
+        prompt_category,
+        target.tool_policy_key(),
+        wc.tools.clone(),
+        &outcome,
+    ))?;
 
     apply_dispatch_outcome_with_review(
         &mut orb,

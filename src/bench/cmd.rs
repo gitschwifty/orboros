@@ -15,8 +15,8 @@ use chrono::Utc;
 use crate::bench::case::{load_all, load_tier, BenchCase, BenchTier, DEFAULT_TIMEOUT_S};
 use crate::bench::prompts::BenchPromptSet;
 use crate::bench::runner::{
-    effective_timeout_s, is_fatal_worker_error, run_t1, timeout_bench_result, BenchRunConfig,
-    RunOptions,
+    effective_timeout_s, is_fatal_worker_error, run_t1_with_run_id, timeout_bench_result,
+    BenchRunConfig, RunOptions,
 };
 use crate::bench::store::{BenchResult, BenchRun, BenchStatus, BenchStore};
 use crate::worker::process::WorkerConfig;
@@ -115,12 +115,23 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
         max_iterations: req.max_iterations,
     };
     let mut all_results = Vec::new();
-    let mut summary_run_id = None;
+    let run_id = crate::bench::store::new_run_id();
+    crate::bench::log::start(&req.store.run_dir(&run_id).join("cli.log"))?;
+    tracing::info!(run_id = %run_id, "benchmark run logging started");
+    let mut summary_run_id = Some(run_id.clone());
 
     let had_t1 = !t1.is_empty();
     let had_other = !other.is_empty();
     if had_t1 {
-        let summary = run_t1(&t1, req.worker_config, req.store, &opts, req.run_config).await?;
+        let summary = run_t1_with_run_id(
+            &t1,
+            req.worker_config,
+            req.store,
+            &opts,
+            req.run_config,
+            run_id.clone(),
+        )
+        .await?;
         summary_run_id = Some(summary.run_id);
         all_results.extend(summary.results);
         if !had_other {
@@ -143,7 +154,7 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
     for case in &other {
         let run_id = summary_run_id
             .clone()
-            .unwrap_or_else(crate::bench::store::new_run_id);
+            .expect("benchmark run ID initialized");
         let timeout_s = effective_timeout_s(case, &opts);
         let artifact_dir = req.store.case_artifact_dir(&run_id, &case.id);
         let result = match case.tier {
@@ -242,7 +253,7 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
             BenchTier::T1 => unreachable!("T1 partitioned out above"),
         };
         if summary_run_id.is_none() {
-            summary_run_id = Some(run_id);
+            summary_run_id = Some(run_id.clone());
         }
         if result.status == BenchStatus::Error {
             tracing::warn!(
@@ -253,6 +264,14 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
                 "benchmark case errored"
             );
         }
+        let ledger = crate::execution::ExecutionStore::new(
+            artifact_dir
+                .join("workdir")
+                .join(".orbs")
+                .join("executions.jsonl"),
+        );
+        req.store
+            .append_dispatches(&run_id, &case.id, &ledger.read_all()?)?;
         req.store.append_result(&result)?;
         let fatal = is_fatal_worker_error(&result);
         all_results.push(result);

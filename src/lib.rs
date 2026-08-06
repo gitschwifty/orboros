@@ -7,6 +7,7 @@ pub mod config;
 pub mod convo;
 pub mod coordinator;
 pub mod daemon;
+pub mod execution;
 pub mod hooks;
 pub mod ipc;
 pub mod notify;

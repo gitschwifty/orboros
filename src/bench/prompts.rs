@@ -342,6 +342,22 @@ mod tests {
     }
 
     #[test]
+    fn composable_decompose_prompt_keeps_contracts_description_first() {
+        let bench_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("bench");
+        let prompts = BenchPromptSet::load(&bench_root, "composable-v1").unwrap();
+        let config = prompts.prompt_config();
+        let prompt = config.phases["decomposing"].system.as_deref().unwrap();
+
+        assert!(prompt.contains("description` must begin with the\nactual concrete task"));
+        assert!(prompt.contains("Omit it entirely when it\nwould be boilerplate"));
+        assert!(prompt.contains("This is guidance, not an Orboros-executed contract."));
+        assert!(prompt.contains("Do not create an inspection-only child"));
+        assert!(prompt.contains("when they edit the same file"));
+        assert!(prompt.contains("do not require\n  a later-owner label or a detailed handoff plan"));
+        assert!(prompt.contains("focused scope is guidance, not an artificial\nceiling"));
+    }
+
+    #[test]
     fn full_file_overrides_composition_for_same_role() {
         let dir = tempfile::tempdir().unwrap();
         let set = dir.path().join("prompts/x");

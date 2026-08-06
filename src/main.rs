@@ -637,12 +637,24 @@ fn main() -> anyhow::Result<()> {
     // Load .env from current dir or ancestors (silently ignore if missing)
     let _ = dotenvy::dotenv();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("orboros=info,heddle=warn")),
+    use tracing_subscriber::prelude::*;
+
+    let terminal_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("orboros=info,heddle=warn"));
+    let bench_filter = tracing_subscriber::EnvFilter::new("orboros=info,heddle=warn");
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_filter(terminal_filter),
         )
-        .with_target(false)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(orboros::bench::log::BenchLogWriter)
+                .with_ansi(false)
+                .with_target(false)
+                .with_filter(bench_filter),
+        )
         .init();
 
     let cli = Cli::parse();

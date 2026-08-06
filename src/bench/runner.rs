@@ -589,7 +589,27 @@ pub async fn run_t1(
     opts: &RunOptions,
     run_config: &BenchRunConfig,
 ) -> anyhow::Result<TierRunSummary> {
-    let run_id = new_run_id();
+    run_t1_with_run_id(
+        cases,
+        base_worker_config,
+        store,
+        opts,
+        run_config,
+        new_run_id(),
+    )
+    .await
+}
+
+/// Like [`run_t1`], but uses a caller-selected run ID so a CLI can establish
+/// run-level artifacts (such as `cli.log`) before any benchmark work starts.
+pub async fn run_t1_with_run_id(
+    cases: &[BenchCase],
+    base_worker_config: &WorkerConfig,
+    store: &BenchStore,
+    opts: &RunOptions,
+    run_config: &BenchRunConfig,
+    run_id: String,
+) -> anyhow::Result<TierRunSummary> {
     let started_at = Utc::now();
     let mut results = Vec::with_capacity(cases.len());
     let mut total_cost: Option<u64> = None;

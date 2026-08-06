@@ -22,6 +22,17 @@ use serde::{Deserialize, Serialize};
 use crate::bench::case::BenchTier;
 use crate::bench::prompts::PromptManifest;
 
+/// A per-dispatch execution record retained at benchmark run scope.
+///
+/// The flattened execution fields make this useful after case artifacts have
+/// been pruned; `case_id` identifies which benchmark case produced it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchDispatchRecord {
+    pub case_id: String,
+    #[serde(flatten)]
+    pub execution: crate::execution::ExecutionRecord,
+}
+
 /// Outcome of a single case execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -253,6 +264,12 @@ impl BenchStore {
         self.run_dir(run_id).join("results.jsonl")
     }
 
+    /// Path to the durable per-dispatch benchmark evidence for one run.
+    #[must_use]
+    pub fn dispatches_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("dispatches.jsonl")
+    }
+
     /// Directory for artifacts captured from one case within a run.
     #[must_use]
     pub fn case_artifact_dir(&self, run_id: &str, case_id: &str) -> PathBuf {
@@ -270,6 +287,27 @@ impl BenchStore {
         ensure_dir(&self.run_dir(&result.run_id))?;
         let path = self.results_path(&result.run_id);
         append_jsonl(&path, result)
+    }
+
+    /// Copies a case's execution ledger into durable run-level evidence.
+    pub fn append_dispatches(
+        &self,
+        run_id: &str,
+        case_id: &str,
+        records: &[crate::execution::ExecutionRecord],
+    ) -> Result<(), StoreError> {
+        ensure_dir(&self.run_dir(run_id))?;
+        let path = self.dispatches_path(run_id);
+        for execution in records {
+            append_jsonl(
+                &path,
+                &BenchDispatchRecord {
+                    case_id: case_id.into(),
+                    execution: execution.clone(),
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// Appends a run summary row to `runs.jsonl`.

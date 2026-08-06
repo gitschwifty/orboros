@@ -21,6 +21,14 @@ use crate::hooks::sink::HookSink;
 use crate::routing::profile::builtin_tools;
 use crate::worker::process::{Worker, WorkerConfig};
 
+const RETRY_PROMPT_ADDENDUM: &str = concat!(
+    "\nThe previous worker attempt ended because of a recoverable worker or provider ",
+    "error. The working directory may contain partial progress from that attempt. ",
+    "First inspect the current relevant changes and state; preserve correct work, ",
+    "then continue the assigned task and verify it as appropriate. Do not assume the ",
+    "checkout is pristine or redo work blindly."
+);
+
 /// Reduced view of a worker's `SendOutcome` keyed to what the orb
 /// actually stores. `Aborted` is distinct from `Failed` because it
 /// signals a `pre-worker-spawn` hook returning exit 2 — no worker
@@ -28,6 +36,10 @@ use crate::worker::process::{Worker, WorkerConfig};
 #[derive(Debug, Clone, PartialEq)]
 pub enum DispatchStatus {
     Done,
+    /// The worker or its provider failed rather than completing the task.
+    /// The current orb schema persists this as `Failed`, but consumers such as
+    /// the benchmark harness can report it separately from a task failure.
+    Error,
     Failed,
     Cancelled,
     /// A `pre-worker-spawn` hook returned exit 2. The orb is left
@@ -40,6 +52,8 @@ pub enum DispatchStatus {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DispatchOutcome {
     pub status: DispatchStatus,
+    /// Number of whole-dispatch retries performed before this outcome.
+    pub retries: u32,
     pub response: Option<String>,
     pub confidence: Option<f32>,
     pub worker_model: String,
@@ -75,6 +89,7 @@ impl DispatchOutcome {
         let now = Utc::now();
         Self {
             status: DispatchStatus::Aborted,
+            retries: 0,
             response: None,
             confidence: None,
             worker_model,
@@ -115,9 +130,9 @@ impl DispatchOutcome {
 ///
 /// # Errors
 ///
-/// Returns an `anyhow::Error` only for catastrophic failures that
-/// can't be expressed as a dispatch outcome (currently none — IPC
-/// failures fold into `DispatchStatus::Failed`).
+/// Retries a retryable worker/provider error once from a fresh worker process.
+/// A failed streaming response cannot be safely resumed, so this retries the
+/// complete dispatch rather than attempting to continue mid-response.
 #[instrument(
     name = "dispatcher.dispatch_orb",
     skip(orb, prompt, worker_config, hooks),
@@ -174,36 +189,63 @@ pub async fn dispatch_orb(
         "dispatch_orb start",
     );
 
-    let outcome = match Worker::spawn(worker_config).await {
-        Ok(mut worker) => match worker.send(&send_id, prompt).await {
-            Ok(send_outcome) => {
-                let _ = worker.shutdown().await;
-                let completed_at = Utc::now();
-                build_outcome(
-                    orb,
-                    worker_config,
-                    dispatched_at,
-                    completed_at,
-                    send_outcome,
-                )
-            }
+    let mut attempt = 0;
+    let mut outcome = loop {
+        let attempt_prompt = if attempt == 0 {
+            std::borrow::Cow::Borrowed(prompt)
+        } else {
+            std::borrow::Cow::Owned(format!("{prompt}{RETRY_PROMPT_ADDENDUM}"))
+        };
+        let (outcome, retryable) = match Worker::spawn(worker_config).await {
+            Ok(mut worker) => match worker.send(&send_id, &attempt_prompt).await {
+                Ok(send_outcome) => {
+                    let retryable = send_outcome
+                        .error
+                        .as_ref()
+                        .is_some_and(|error| error.retryable);
+                    let _ = worker.shutdown().await;
+                    (
+                        build_outcome(worker_config, dispatched_at, Utc::now(), send_outcome),
+                        retryable,
+                    )
+                }
+                Err(e) => {
+                    let retryable = crate::worker::fsm::FailureClass::from(&e).restart_policy()
+                        == crate::worker::fsm::RestartPolicy::RetryOnce;
+                    let _ = worker.shutdown().await;
+                    (
+                        build_failure(
+                            worker_config,
+                            dispatched_at,
+                            Utc::now(),
+                            format!("worker send failed: {e}"),
+                        ),
+                        retryable,
+                    )
+                }
+            },
             Err(e) => {
-                let _ = worker.shutdown().await;
-                build_failure(
-                    worker_config,
-                    dispatched_at,
-                    Utc::now(),
-                    format!("worker send failed: {e}"),
+                let retryable = crate::worker::fsm::FailureClass::from(&e).restart_policy()
+                    == crate::worker::fsm::RestartPolicy::RetryOnce;
+                (
+                    build_failure(
+                        worker_config,
+                        dispatched_at,
+                        Utc::now(),
+                        format!("worker spawn failed: {e}"),
+                    ),
+                    retryable,
                 )
             }
-        },
-        Err(e) => build_failure(
-            worker_config,
-            dispatched_at,
-            Utc::now(),
-            format!("worker spawn failed: {e}"),
-        ),
+        };
+        if retryable && attempt == 0 {
+            attempt = 1;
+            warn!(orb = %orb.id, "retrying whole worker dispatch after retryable error");
+            continue;
+        }
+        break outcome;
     };
+    outcome.retries = attempt;
 
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     info!(
@@ -242,7 +284,6 @@ pub async fn dispatch_orb(
 }
 
 fn build_outcome(
-    _orb: &Orb,
     worker_config: &WorkerConfig,
     dispatched_at: chrono::DateTime<Utc>,
     completed_at: chrono::DateTime<Utc>,
@@ -252,11 +293,12 @@ fn build_outcome(
     let status = match send.status {
         ResultStatus::Ok => DispatchStatus::Done,
         ResultStatus::Cancelled => DispatchStatus::Cancelled,
-        ResultStatus::Error => DispatchStatus::Failed,
+        ResultStatus::Error => DispatchStatus::Error,
     };
     let error = send.error.as_ref().map(|e| e.message.clone());
     DispatchOutcome {
         status,
+        retries: 0,
         response: send.response,
         confidence: send.confidence,
         worker_model: worker_config.model.clone(),
@@ -291,7 +333,8 @@ fn build_failure(
     message: String,
 ) -> DispatchOutcome {
     DispatchOutcome {
-        status: DispatchStatus::Failed,
+        status: DispatchStatus::Error,
+        retries: 0,
         response: None,
         confidence: None,
         worker_model: worker_config.model.clone(),
@@ -389,7 +432,7 @@ pub fn apply_dispatch_outcome_with_review(
         prompt_category: outcome.prompt_category.clone(),
         system_prompt_hash: outcome.system_prompt_hash.clone(),
         system_prompt_source: outcome.system_prompt_source.clone(),
-        retries: 0,
+        retries: outcome.retries,
     });
 
     match outcome.status {
@@ -409,6 +452,15 @@ pub fn apply_dispatch_outcome_with_review(
         }
         DispatchStatus::Failed => {
             orb.result = outcome.error.clone().or_else(|| outcome.response.clone());
+            if orb.orb_type.uses_phase() {
+                orb.set_phase(OrbPhase::Failed)?;
+            } else {
+                orb.set_status(OrbStatus::Failed)?;
+            }
+        }
+        DispatchStatus::Error => {
+            let message = outcome.error.clone().or_else(|| outcome.response.clone());
+            orb.result = message.map(|message| format!("[worker_error] {message}"));
             if orb.orb_type.uses_phase() {
                 orb.set_phase(OrbPhase::Failed)?;
             } else {
@@ -567,6 +619,7 @@ mod tests {
         let now = Utc::now();
         DispatchOutcome {
             status: DispatchStatus::Done,
+            retries: 0,
             response: Some("the answer".into()),
             confidence: Some(0.82),
             worker_model: "anthropic/claude-sonnet-4-6".into(),
@@ -652,6 +705,30 @@ mod tests {
             o.confidence.is_none(),
             "failed outcomes should not write confidence"
         );
+    }
+
+    #[test]
+    fn apply_worker_error_marks_result_for_benchmark_classification() {
+        let mut o = active_task_orb();
+        let outcome = DispatchOutcome {
+            status: DispatchStatus::Error,
+            error: Some("stream ended early".into()),
+            ..done_outcome()
+        };
+        apply_dispatch_outcome(&mut o, &outcome).unwrap();
+        assert_eq!(
+            o.result.as_deref(),
+            Some("[worker_error] stream ended early")
+        );
+        assert_eq!(o.status, Some(OrbStatus::Failed));
+    }
+
+    #[test]
+    fn retry_prompt_preserves_the_original_task_and_mentions_partial_work() {
+        let prompt = format!("task text{RETRY_PROMPT_ADDENDUM}");
+        assert!(prompt.starts_with("task text"));
+        assert!(prompt.contains("partial progress"));
+        assert!(prompt.contains("Do not assume the checkout is pristine"));
     }
 
     // ── apply_dispatch_outcome — Cancelled ────────────────────
