@@ -78,7 +78,7 @@ enum Commands {
         #[arg(long, default_value_t = 100)]
         interval_ms: u64,
     },
-    /// Legacy TaskStore: decompose a task into subtasks without executing.
+    /// Legacy `TaskStore`: decompose a task into subtasks without executing.
     Decompose {
         /// The high-level task to decompose.
         task: String,
@@ -89,7 +89,7 @@ enum Commands {
         #[arg(long)]
         system_prompt_file: Option<PathBuf>,
     },
-    /// Legacy TaskStore: decompose a task and execute all subtasks.
+    /// Legacy `TaskStore`: decompose a task and execute all subtasks.
     Orchestrate {
         /// The high-level task to orchestrate.
         task: String,
@@ -103,20 +103,20 @@ enum Commands {
         #[arg(long)]
         system_prompt_file: Option<PathBuf>,
     },
-    /// Legacy TaskStore: list tasks, optionally filtered by status.
+    /// Legacy `TaskStore`: list tasks, optionally filtered by status.
     Tasks {
         /// Filter by status (pending, active, review, done, failed).
         #[arg(short, long)]
         status: Option<String>,
     },
-    /// Legacy TaskStore: show status of a specific task by ID.
+    /// Legacy `TaskStore`: show status of a specific task by ID.
     Status {
         /// Task ID (UUID).
         id: String,
     },
-    /// Legacy TaskStore: list tasks awaiting review.
+    /// Legacy `TaskStore`: list tasks awaiting review.
     Review,
-    /// Access legacy TaskStore commands backed by tasks.jsonl.
+    /// Access legacy `TaskStore` commands backed by tasks.jsonl.
     Legacy {
         #[command(subcommand)]
         action: LegacyAction,
@@ -632,7 +632,11 @@ fn make_worker_config(binary: &str, model: &str, system_prompt: &str) -> WorkerC
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(
+    clippy::items_after_statements,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 fn main() -> anyhow::Result<()> {
     // Load .env from current dir or ancestors (silently ignore if missing)
     let _ = dotenvy::dotenv();
@@ -978,6 +982,7 @@ fn cmd_legacy(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn cmd_bench(
     bench_root: &std::path::Path,
     bench_config_path: Option<&std::path::Path>,
@@ -1061,7 +1066,9 @@ fn cmd_bench(
                 worker_model: Some(resolved_model.model.clone()),
                 grader_model: Some(resolved_grader),
                 prompt_variant: prompt_set.as_ref().map(|set| set.name.clone()),
-                prompt_manifest: prompt_set.as_ref().map(|set| set.manifest()),
+                prompt_manifest: prompt_set
+                    .as_ref()
+                    .map(orboros::bench::prompts::BenchPromptSet::manifest),
                 cases_root: Some(bench_root.display().to_string()),
                 bench_config_path: resolved_bench_config
                     .as_ref()
@@ -1303,6 +1310,7 @@ fn cmd_run_orb(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_execute_orb(
     state_dir: &std::path::Path,
     project_dir: Option<&std::path::Path>,
@@ -1490,7 +1498,7 @@ fn cmd_orchestrate(
     let mut tool_profiles = load_legacy_tool_profiles(project_dir);
     tool_profiles.extend(orb_config.tool_profiles.clone());
     let orch_config = OrchestrateConfig {
-        worker_binary: binary.to_string(),
+        worker_binary: binary.clone(),
         worker_args: vec![],
         worker_cwd: None,
         worker_env: vec![],

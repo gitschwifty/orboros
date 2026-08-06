@@ -283,7 +283,7 @@ pub async fn run_t2_case(
     })?;
     if completed == 0 {
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let artifact_path = snapshot_workdir(&seed_dir, &workdir, artifact_dir, &case.id)?;
+        let artifact_path = snapshot_workdir(seed_dir, &workdir, artifact_dir, &case.id)?;
         return Ok(BenchResult {
             case_id: case.id.clone(),
             run_id: run_id.into(),
@@ -333,7 +333,7 @@ pub async fn run_t2_case(
 
     copy_case_test_overlay(case, &workdir)?;
     let tests = evaluate_tests_pass_output(&workdir, &command)?;
-    let artifact_path = snapshot_workdir(&seed_dir, &workdir, artifact_dir, &case.id)?;
+    let artifact_path = snapshot_workdir(seed_dir, &workdir, artifact_dir, &case.id)?;
     let status = if updated.status == Some(OrbStatus::Done) && tests.passed {
         BenchStatus::Pass
     } else {
@@ -475,7 +475,7 @@ async fn run_t2_decompose_case(
             all_orbs = orb_store.load_all()?;
             copy_case_test_overlay(case, &workdir)?;
             let tests = evaluate_tests_pass_output(&workdir, &command).ok();
-            let artifact_path = snapshot_workdir(&seed_dir, &workdir, artifact_dir, &case.id)?;
+            let artifact_path = snapshot_workdir(seed_dir, &workdir, artifact_dir, &case.id)?;
             let worker_error = all_orbs.iter().any(|orb| {
                 orb.result
                     .as_deref()
@@ -514,7 +514,7 @@ async fn run_t2_decompose_case(
             let _ = ql.tick()?;
             copy_case_test_overlay(case, &workdir)?;
             let tests = evaluate_tests_pass_output(&workdir, &command)?;
-            let artifact_path = snapshot_workdir(&seed_dir, &workdir, artifact_dir, &case.id)?;
+            let artifact_path = snapshot_workdir(seed_dir, &workdir, artifact_dir, &case.id)?;
             let final_orbs = orb_store.load_all()?;
             let status = if tests.passed {
                 BenchStatus::Pass
@@ -539,7 +539,7 @@ async fn run_t2_decompose_case(
             if stalled_steps >= 2 {
                 copy_case_test_overlay(case, &workdir)?;
                 let tests = evaluate_tests_pass_output(&workdir, &command).ok();
-                let artifact_path = snapshot_workdir(&seed_dir, &workdir, artifact_dir, &case.id)?;
+                let artifact_path = snapshot_workdir(seed_dir, &workdir, artifact_dir, &case.id)?;
                 return Ok(result_ctx.result(
                     &all_orbs,
                     tests.as_ref(),
@@ -554,7 +554,7 @@ async fn run_t2_decompose_case(
     let all_orbs = orb_store.load_all()?;
     copy_case_test_overlay(case, &workdir)?;
     let tests = evaluate_tests_pass_output(&workdir, &command).ok();
-    let artifact_path = snapshot_workdir(&seed_dir, &workdir, artifact_dir, &case.id)?;
+    let artifact_path = snapshot_workdir(seed_dir, &workdir, artifact_dir, &case.id)?;
     Ok(result_ctx.result(
         &all_orbs,
         tests.as_ref(),
@@ -1032,8 +1032,7 @@ fn benchmark_runtime_placement(artifact_dir: &Path) -> RuntimePlacementConfig {
         artifact_dir.to_path_buf()
     } else {
         std::env::current_dir()
-            .map(|cwd| cwd.join(artifact_dir))
-            .unwrap_or_else(|_| artifact_dir.to_path_buf())
+            .map_or_else(|_| artifact_dir.to_path_buf(), |cwd| cwd.join(artifact_dir))
     };
     RuntimePlacementConfig {
         mode: Some(RuntimeMode::Isolated),

@@ -87,7 +87,7 @@ fn check_binary_path(path: &Path) -> anyhow::Result<()> {
             path.display()
         );
     }
-    let metadata = std::fs::metadata(&path)
+    let metadata = std::fs::metadata(path)
         .map_err(|e| anyhow::anyhow!("could not stat worker binary {}: {e}", path.display()))?;
     if !metadata.is_file() {
         anyhow::bail!(
@@ -95,7 +95,7 @@ fn check_binary_path(path: &Path) -> anyhow::Result<()> {
             path.display()
         );
     }
-    if !is_executable(&path, &metadata) {
+    if !is_executable(path, &metadata) {
         anyhow::bail!(
             "worker binary is not executable: {} (chmod +x?)",
             path.display()

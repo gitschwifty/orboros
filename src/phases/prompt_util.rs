@@ -70,7 +70,7 @@ fn balanced_json_values(text: &str) -> Vec<&str> {
                         break;
                     }
                     if expected_closers.is_empty() {
-                        candidates.push(&text[start..start + offset + 1]);
+                        candidates.push(&text[start..=(start + offset)]);
                         break;
                     }
                 }

@@ -261,7 +261,7 @@ pub fn load_tier(root: &Path, tier: BenchTier) -> Result<Vec<BenchCase>, CorpusE
                 selector: case.selector,
             });
         }
-        case.case_dir = case_dir.clone();
+        case.case_dir.clone_from(&case_dir);
         case.fixture_dir = fixture.is_dir().then_some(fixture);
         let overlay = case_dir.join("overlay");
         case.test_overlay_dir = overlay.is_dir().then_some(overlay);

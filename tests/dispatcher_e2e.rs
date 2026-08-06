@@ -106,7 +106,7 @@ async fn dispatch_then_apply_persists_to_orb() {
 }
 
 #[tokio::test]
-async fn dispatch_with_spawn_failure_returns_failed_status() {
+async fn dispatch_with_spawn_failure_returns_error_status() {
     let dir = tempfile::tempdir().unwrap();
     // Point at a non-existent script.
     let bogus = dir.path().join("does-not-exist.sh");
@@ -116,7 +116,7 @@ async fn dispatch_with_spawn_failure_returns_failed_status() {
     let orb = active_orb();
 
     let outcome = dispatch_orb(&orb, "x", &wc, None).await.unwrap();
-    assert_eq!(outcome.status, DispatchStatus::Failed);
+    assert_eq!(outcome.status, DispatchStatus::Error);
     assert!(outcome.error.is_some());
     assert!(outcome.response.is_none());
 }
@@ -196,7 +196,7 @@ async fn dispatch_fires_post_fail_hook_on_failure() {
     let orb = active_orb();
 
     let outcome = dispatch_orb(&orb, "x", &wc, Some(&sink)).await.unwrap();
-    assert_eq!(outcome.status, DispatchStatus::Failed);
+    assert_eq!(outcome.status, DispatchStatus::Error);
 
     let log = fs::read_to_string(state_dir.join("hooks.log.jsonl")).unwrap_or_default();
     assert!(

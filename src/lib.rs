@@ -1,6 +1,16 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::must_use_candidate)]
+// Public CLI and IPC boundaries deliberately use Result-returning helpers,
+// compact enums, and a few orchestration functions whose shape is clearer
+// than splitting them merely to satisfy style thresholds.
+#![allow(
+    clippy::large_enum_variant,
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 
 pub mod bench;
 pub mod config;

@@ -152,10 +152,7 @@ model = "anthropic/claude-sonnet-4-20250514"
                 allowed_tools: vec!["read".into()],
             },
         );
-        let config = RoutingConfig {
-            profiles,
-            ..Default::default()
-        };
+        let config = RoutingConfig { profiles };
         let profile = config.profile_for("edit").unwrap();
         assert_eq!(profile.allowed_tools, vec!["read", "write"]);
     }
@@ -169,10 +166,7 @@ model = "anthropic/claude-sonnet-4-20250514"
                 allowed_tools: vec!["read".into()],
             },
         );
-        let config = RoutingConfig {
-            profiles,
-            ..Default::default()
-        };
+        let config = RoutingConfig { profiles };
         let profile = config.profile_for("unknown_type").unwrap();
         assert_eq!(profile.allowed_tools, vec!["read"]);
     }
@@ -206,10 +200,7 @@ model = "anthropic/claude-sonnet-4-20250514"
                 allowed_tools: vec![],
             },
         );
-        let config = RoutingConfig {
-            profiles,
-            ..Default::default()
-        };
+        let config = RoutingConfig { profiles };
         let warnings = config.validate();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("edit"));

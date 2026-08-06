@@ -500,9 +500,7 @@ fn absolute_artifact_dir(path: &Path) -> std::path::PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
     } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
+        std::env::current_dir().map_or_else(|_| path.to_path_buf(), |cwd| cwd.join(path))
     }
 }
 
@@ -535,8 +533,8 @@ pub(crate) fn cost_micros_to_cents_ceil(cost_micros: u64) -> u64 {
     if cost_micros == 0 {
         return 0;
     }
-    let cents = cost_micros.saturating_add(9_999) / 10_000;
-    cents
+
+    cost_micros.saturating_add(9_999) / 10_000
 }
 
 fn send_outcome_error(outcome: &SendOutcome) -> String {

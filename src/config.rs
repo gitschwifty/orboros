@@ -497,17 +497,14 @@ pub fn load_config_with_bench(
     bench_root: &Path,
     bench_config_path: Option<&Path>,
 ) -> anyhow::Result<(OrbConfig, Option<PathBuf>)> {
-    let resolved_bench_config = match bench_config_path {
-        Some(path) => {
-            if !path.exists() {
-                anyhow::bail!("bench config not found: {}", path.display());
-            }
-            Some(path.to_path_buf())
+    let resolved_bench_config = if let Some(path) = bench_config_path {
+        if !path.exists() {
+            anyhow::bail!("bench config not found: {}", path.display());
         }
-        None => {
-            let default_path = bench_root.join("config.toml");
-            default_path.exists().then_some(default_path)
-        }
+        Some(path.to_path_buf())
+    } else {
+        let default_path = bench_root.join("config.toml");
+        default_path.exists().then_some(default_path)
     };
 
     let cfg = load_config_with_home_and_bench(
