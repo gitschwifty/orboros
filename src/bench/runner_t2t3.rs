@@ -27,7 +27,7 @@ use orbs::orb_store::OrbStore;
 use orbs::task::TaskStatus;
 use tracing::{debug, warn};
 
-use crate::bench::case::{BenchCase, BenchExpected, BenchRunner, BenchTier};
+use crate::bench::case::{BenchCase, BenchExpected, BenchProcess, BenchRunner, BenchTier};
 use crate::bench::prompts::BenchPromptSet;
 use crate::bench::runner::{effective_max_iterations, nonzero_u64, prompt_hash, RunOptions};
 use crate::bench::store::{BenchResult, BenchStatus};
@@ -290,6 +290,8 @@ pub async fn run_t2_case(
             tier: BenchTier::T2,
             status: BenchStatus::Error,
             score: 0.0,
+            process_score: None,
+            process_annotations: Vec::new(),
             latency_ms: elapsed_ms,
             model_latency_ms: updated.execution.as_ref().and_then(|e| e.model_latency_ms),
             tool_latency_ms: updated.execution.as_ref().and_then(|e| e.tool_latency_ms),
@@ -352,6 +354,8 @@ pub async fn run_t2_case(
         } else {
             0.0
         },
+        process_score: None,
+        process_annotations: Vec::new(),
         latency_ms: elapsed_ms,
         model_latency_ms: execution.and_then(|e| e.model_latency_ms),
         tool_latency_ms: execution.and_then(|e| e.tool_latency_ms),
@@ -690,6 +694,7 @@ impl T2DecomposeResultCtx<'_> {
         } else {
             aggregate_execution_usage(&records)
         };
+        let process = evaluate_process_contract(self.case.process.as_ref(), orbs, self.dep_store);
         BenchResult {
             case_id: self.case.id.clone(),
             run_id: self.run_id.into(),
@@ -700,6 +705,8 @@ impl T2DecomposeResultCtx<'_> {
             } else {
                 0.0
             },
+            process_score: process.as_ref().map(|evaluation| evaluation.score),
+            process_annotations: process.map_or_else(Vec::new, |evaluation| evaluation.annotations),
             latency_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
             model_latency_ms: usage.model_latency,
             tool_latency_ms: usage.tool_latency,
@@ -728,6 +735,90 @@ impl T2DecomposeResultCtx<'_> {
             error,
         }
     }
+}
+
+#[derive(Debug, PartialEq)]
+struct ProcessEvaluation {
+    score: f32,
+    annotations: Vec<String>,
+}
+
+/// Scores the optional process requirements separately from task correctness.
+///
+/// A requirement is one scoring unit. This permits a case to communicate a
+/// useful partial process result (for example, two children were made but an
+/// intended dependency was absent) while keeping the benchmark's task status
+/// exclusively tied to its normal grader.
+fn evaluate_process_contract(
+    contract: Option<&BenchProcess>,
+    orbs: &[Orb],
+    dep_store: &DepStore,
+) -> Option<ProcessEvaluation> {
+    let contract = contract?;
+    let root = orbs.iter().find(|orb| orb.parent_id.is_none())?;
+    let children: Vec<&Orb> = orbs
+        .iter()
+        .filter(|orb| orb.parent_id.as_ref() == Some(&root.id))
+        .collect();
+    let edges = dep_store.all_edges().unwrap_or_default();
+
+    let mut total = 0u32;
+    let mut met = 0u32;
+    let mut annotations = Vec::new();
+
+    if let Some(min_children) = contract.min_children {
+        total = total.saturating_add(1);
+        let actual = u32::try_from(children.len()).unwrap_or(u32::MAX);
+        if actual >= min_children {
+            met = met.saturating_add(1);
+        } else {
+            annotations.push(format!(
+                "process_miss: expected at least {min_children} child orbs, got {actual}"
+            ));
+        }
+    }
+
+    if let Some(expected) = contract.requires_parent_final_work {
+        total = total.saturating_add(1);
+        if root.has_parent_final_work == expected {
+            met = met.saturating_add(1);
+        } else {
+            annotations.push(format!(
+                "process_miss: expected has_parent_final_work={expected}, got {}",
+                root.has_parent_final_work
+            ));
+        }
+    }
+
+    for [dependent, prerequisite] in &contract.required_child_dependencies {
+        total = total.saturating_add(1);
+        let dependent_id = root.id.child(*dependent);
+        let prerequisite_id = root.id.child(*prerequisite);
+        let present = edges.iter().any(|edge| {
+            edge.edge_type == EdgeType::DependsOn
+                && edge.from == dependent_id
+                && edge.to == prerequisite_id
+        });
+        if present {
+            met = met.saturating_add(1);
+        } else {
+            annotations.push(format!(
+                "process_miss: expected child {dependent} to depend on child {prerequisite}"
+            ));
+        }
+    }
+
+    (total > 0).then(|| {
+        // A process contract has a deliberately small, authored set of
+        // requirements. Clamp only defensively so conversion to the result's
+        // f32 score remains exact under Clippy's strict precision policy.
+        let met = u16::try_from(met).unwrap_or(u16::MAX);
+        let total = u16::try_from(total).unwrap_or(u16::MAX);
+        ProcessEvaluation {
+            score: f32::from(met) / f32::from(total),
+            annotations,
+        }
+    })
 }
 
 #[derive(Default)]
@@ -1110,6 +1201,8 @@ pub fn run_t3_case_stub(
         tier: BenchTier::T3,
         status: BenchStatus::Error,
         score: 0.0,
+        process_score: None,
+        process_annotations: Vec::new(),
         latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         model_latency_ms: None,
         tool_latency_ms: None,
@@ -1156,6 +1249,7 @@ mod tests {
             max_iterations: None,
             max_cost_cents: 100,
             tool_policy: None,
+            process: None,
             selector: id.into(),
             case_dir: PathBuf::new(),
             fixture_dir: Some(fixture_dir),
@@ -1263,6 +1357,40 @@ done
         let output = evaluate_tests_pass_output(dir.path(), "echo nope >&2; exit 1").unwrap();
         assert!(!output.passed);
         assert!(output.stderr.contains("nope"));
+    }
+
+    #[test]
+    fn process_contract_scores_requirements_and_records_only_misses() {
+        let dir = tempfile::tempdir().unwrap();
+        let dep_store = DepStore::new(dir.path().join("deps.jsonl"));
+        let mut root = Orb::new("root", "work").with_type(OrbType::Feature);
+        root.has_parent_final_work = true;
+        let mut first = Orb::new("first", "work").with_type(OrbType::Task);
+        first.id = root.id.child(1);
+        first.parent_id = Some(root.id.clone());
+        let mut second = Orb::new("second", "work").with_type(OrbType::Task);
+        second.id = root.id.child(2);
+        second.parent_id = Some(root.id.clone());
+        dep_store
+            .add_edge(DepEdge::new(
+                second.id.clone(),
+                first.id.clone(),
+                EdgeType::DependsOn,
+            ))
+            .unwrap();
+
+        let contract = BenchProcess {
+            min_children: Some(3),
+            requires_parent_final_work: Some(true),
+            required_child_dependencies: vec![[2, 1]],
+        };
+        let evaluation =
+            evaluate_process_contract(Some(&contract), &[root, first, second], &dep_store).unwrap();
+
+        assert!((evaluation.score - (2.0 / 3.0)).abs() < f32::EPSILON);
+        assert_eq!(evaluation.annotations.len(), 1);
+        assert!(evaluation.annotations[0].contains("at least 3 child orbs"));
+        assert!(evaluate_process_contract(None, &[], &dep_store).is_none());
     }
 
     // ── rubric grader prompt + parser ─────────────────────────
@@ -1455,6 +1583,7 @@ done
             max_iterations: None,
             max_cost_cents: 100,
             tool_policy: None,
+            process: None,
             selector: "t3-1".into(),
             case_dir: PathBuf::new(),
             fixture_dir: None,

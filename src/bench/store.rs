@@ -64,6 +64,15 @@ pub struct BenchResult {
     pub status: BenchStatus,
     /// Pass rate across N=3 (or however many) attempts, in `[0.0, 1.0]`.
     pub score: f32,
+    /// Independent score for an optional case process contract. `None` means
+    /// the case does not assess process behavior and must not affect process
+    /// averages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_score: Option<f32>,
+    /// Human-readable unmet process requirements. Retained in detailed JSONL
+    /// and result views, but intentionally omitted from the summary table.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub process_annotations: Vec<String>,
     /// Wall-clock elapsed time; retained as `latency_ms` for schema
     /// compatibility. This is not provider/model latency.
     pub latency_ms: u64,
@@ -547,6 +556,8 @@ mod tests {
             tier: BenchTier::T1,
             status: BenchStatus::Pass,
             score: 1.0,
+            process_score: None,
+            process_annotations: Vec::new(),
             latency_ms: 1234,
             model_latency_ms: Some(1000),
             tool_latency_ms: Some(200),

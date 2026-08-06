@@ -115,6 +115,7 @@ fn t1_case(id: &str, prompt: &str, expected: BenchExpected) -> BenchCase {
         max_iterations: None,
         max_cost_cents: 100,
         tool_policy: None,
+        process: None,
         selector: id.into(),
         case_dir: std::path::PathBuf::new(),
         fixture_dir: None,

@@ -87,6 +87,27 @@ pub enum BenchRunner {
     Decompose,
 }
 
+/// Optional requirements for how a benchmark case is carried out.
+///
+/// This intentionally covers more than orchestration: new process checks can
+/// be added here without treating every benchmark as a decomposition test.
+/// A missing contract means the case has no process score.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchProcess {
+    /// Minimum number of direct child orbs the feature must create.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_children: Option<u32>,
+    /// Whether the feature root must retain work for its final execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_parent_final_work: Option<bool>,
+    /// Required direct-child dependency edges, encoded as
+    /// `[dependent_child, prerequisite_child]`. Child numbers are the stable
+    /// one-based positions assigned during materialization.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_child_dependencies: Vec<[u32; 2]>,
+}
+
 /// A single benchmark case.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -120,6 +141,10 @@ pub struct BenchCase {
     /// base tool list remains a hard ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_policy: Option<PhaseToolPolicy>,
+    /// Optional independent requirements for the process used to complete the
+    /// case. Cases without this field do not contribute a process score.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<BenchProcess>,
     /// Stable human-facing selector derived from the case directory,
     /// for example `t2.001`. It is not part of case.toml.
     #[serde(skip)]
@@ -444,6 +469,39 @@ text = "x"
         let p = write_case(dir.path(), "x.toml", body);
         let err = load_case(&p, None).unwrap_err();
         assert!(matches!(err, CorpusError::Parse { .. }));
+    }
+
+    #[test]
+    fn load_case_parses_optional_process_contract() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_case(
+            dir.path(),
+            "case.toml",
+            r#"
+id = "process"
+tier = "t2"
+name = "process"
+description = "process test"
+prompt = "work"
+[process]
+min_children = 2
+requires_parent_final_work = true
+required_child_dependencies = [[2, 1]]
+[expected]
+kind = "tests_pass"
+command = "true"
+"#,
+        );
+
+        let case = load_case(&p, Some(BenchTier::T2)).unwrap();
+        assert_eq!(
+            case.process,
+            Some(BenchProcess {
+                min_children: Some(2),
+                requires_parent_final_work: Some(true),
+                required_child_dependencies: vec![[2, 1]],
+            })
+        );
     }
 
     // ── tier loaders ──────────────────────────────────────────

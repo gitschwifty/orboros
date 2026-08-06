@@ -179,6 +179,8 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
                             tier: BenchTier::T2,
                             status: BenchStatus::Error,
                             score: 0.0,
+                            process_score: None,
+                            process_annotations: Vec::new(),
                             latency_ms: 0,
                             model_latency_ms: None,
                             tool_latency_ms: None,
@@ -220,6 +222,8 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
                                 tier: BenchTier::T3,
                                 status: BenchStatus::Error,
                                 score: 0.0,
+                                process_score: None,
+                                process_annotations: Vec::new(),
                                 latency_ms: 0,
                                 model_latency_ms: None,
                                 tool_latency_ms: None,
@@ -524,11 +528,12 @@ fn print_result_table(
         .unwrap_or(4)
         .max(20);
     println!(
-        "{selector:<selector_width$}  {name:<name_width$}  {status:<8}  {score:>5}  {elapsed:>9}  {cost:>8}  {turns:>5}  {tools:>5}  {input:>8}  {output:>8}  {cache_r:>8}  {cache_w:>8}  {conf:>5}",
+        "{selector:<selector_width$}  {name:<name_width$}  {status:<8}  {score:>5}  {process:>7}  {elapsed:>9}  {cost:>8}  {turns:>5}  {tools:>5}  {input:>8}  {output:>8}  {cache_r:>8}  {cache_w:>8}  {conf:>5}",
         selector = "case",
         name = "name",
         status = "status",
         score = "score",
+        process = "process",
         elapsed = "elapsed",
         cost = "cost",
         turns = "turns",
@@ -557,6 +562,9 @@ fn print_result_table(
         let conf = r
             .confidence
             .map_or(String::from("-"), |c| format!("{c:.2}"));
+        let process = r
+            .process_score
+            .map_or(String::from("-"), |score| format!("{score:.2}"));
         let input = r
             .prompt_tokens
             .map_or(String::from("-"), |tokens| tokens.to_string());
@@ -570,11 +578,12 @@ fn print_result_table(
             .cache_write_tokens
             .map_or(String::from("-"), |tokens| tokens.to_string());
         println!(
-            "{selector:<selector_width$}  {name:<name_width$}  {status:<8}  {score:>5.2}  {elapsed:>9}  {cost:>8}  {turns:>5}  {tools:>5}  {input:>8}  {output:>8}  {cache_read:>8}  {cache_write:>8}  {conf:>5}",
+            "{selector:<selector_width$}  {name:<name_width$}  {status:<8}  {score:>5.2}  {process:>7}  {elapsed:>9}  {cost:>8}  {turns:>5}  {tools:>5}  {input:>8}  {output:>8}  {cache_read:>8}  {cache_write:>8}  {conf:>5}",
             selector = selector,
             name = name,
             status = status,
             score = r.score,
+            process = process,
             elapsed = latency,
             cost = cost,
             turns = turns,
@@ -598,8 +607,11 @@ fn print_result_details(result: &BenchResult) {
         status = result.status,
     );
     println!(
-        "score={score:.2} elapsed={elapsed}ms tokens_in={input} tokens_out={output} cache_r={cache_read} cache_w={cache_write} cost={cost}",
+        "score={score:.2} process_score={process_score} elapsed={elapsed}ms tokens_in={input} tokens_out={output} cache_r={cache_read} cache_w={cache_write} cost={cost}",
         score = result.score,
+        process_score = result
+            .process_score
+            .map_or_else(|| "-".to_string(), |score| format!("{score:.2}")),
         elapsed = result.latency_ms,
         input = result
             .prompt_tokens
@@ -615,6 +627,9 @@ fn print_result_details(result: &BenchResult) {
             .map_or_else(|| "-".to_string(), |tokens| tokens.to_string()),
         cost = format_cost(result.cost_micros, result.cost_cents),
     );
+    for annotation in &result.process_annotations {
+        println!("{annotation}");
+    }
     println!(
         "worker_latency model={model}ms tool={tool}ms total={total}ms turns={turns} tools={tools}",
         model = result
@@ -925,6 +940,8 @@ mod tests {
             } else {
                 0.0
             },
+            process_score: None,
+            process_annotations: Vec::new(),
             latency_ms: 100,
             model_latency_ms: None,
             tool_latency_ms: None,
