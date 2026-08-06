@@ -10,13 +10,13 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Context;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
-use crate::bench::case::{load_all, load_tier, BenchCase, BenchTier, DEFAULT_TIMEOUT_S};
+use crate::bench::case::{BenchCase, BenchTier, DEFAULT_TIMEOUT_S, load_all, load_tier};
 use crate::bench::prompts::BenchPromptSet;
 use crate::bench::runner::{
-    effective_timeout_s, is_fatal_worker_error, run_t1_with_run_id, timeout_bench_result,
-    BenchRunConfig, RunOptions,
+    BenchRunConfig, RunOptions, effective_timeout_s, is_fatal_worker_error, run_t1_with_run_id,
+    timeout_bench_result,
 };
 use crate::bench::store::{BenchResult, BenchRun, BenchStatus, BenchStore};
 use crate::worker::process::WorkerConfig;
@@ -116,6 +116,7 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
     };
     let mut all_results = Vec::new();
     let run_id = crate::bench::store::new_run_id();
+    let run_started_at = Utc::now();
     crate::bench::log::start(&req.store.run_dir(&run_id).join("cli.log"))?;
     tracing::info!(run_id = %run_id, "benchmark run logging started");
     let mut summary_run_id = Some(run_id.clone());
@@ -290,18 +291,21 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
         }
     }
 
+    let mut completed_run = None;
     if let Some(ref id) = summary_run_id {
         if let Some(prompt_set) = req.prompt_set {
             prompt_set.copy_to_run(&req.store.run_dir(id))?;
         }
         let run = summarize_run(
             id,
+            run_started_at,
             common_tier(&all_results),
             &all_results,
             req.run_config,
             req.worker_config,
         );
         req.store.append_run(&run)?;
+        completed_run = Some(run.clone());
         if !had_t1 || had_other {
             println!("\n== summary ==");
             print_run_summary(&run);
@@ -309,6 +313,9 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
     }
 
     print_result_table(&all_results, Some(&case_labels));
+    if let Some(run) = completed_run.as_ref() {
+        print_run_completion(run, &all_results);
+    }
     if let Some(ref id) = summary_run_id {
         println!("\nRun id: {id}");
     }
@@ -551,7 +558,7 @@ fn print_result_table(
             .and_then(|labels| labels.get(&r.case_id))
             .map_or_else(|| (r.tier.to_string(), "-".to_string()), Clone::clone);
         let status = format!("{:?}", r.status);
-        let latency = format!("{}ms", r.latency_ms);
+        let latency = format_elapsed_ms(r.latency_ms);
         let cost = format_cost(r.cost_micros, r.cost_cents);
         let turns = r
             .assistant_turns
@@ -597,6 +604,127 @@ fn print_result_table(
             name_width = name_width,
         );
     }
+}
+
+fn format_elapsed_ms(elapsed_ms: u64) -> String {
+    if elapsed_ms < 1_000 {
+        return format!("{elapsed_ms}ms");
+    }
+    let seconds = elapsed_ms / 1_000;
+    if seconds < 60 {
+        let tenths = elapsed_ms / 100;
+        return format!("{}.{}s", tenths / 10, tenths % 10);
+    }
+    let minutes = seconds / 60;
+    let remaining_seconds = seconds % 60;
+    if minutes < 60 {
+        return format!("{minutes}m {remaining_seconds:02}s");
+    }
+    format!(
+        "{}h {:02}m {remaining_seconds:02}s",
+        seconds / 3_600,
+        minutes % 60
+    )
+}
+
+fn print_run_completion(run: &BenchRun, results: &[BenchResult]) {
+    let model = run
+        .worker_model
+        .as_deref()
+        .or_else(|| results.first().map(|result| result.worker_model.as_str()))
+        .unwrap_or("-");
+    println!("\n== run complete ==");
+    println!("model: {model}");
+    println!(
+        "{} passed, {} failed, {} errored, {} skipped of {} total",
+        run.passed, run.failed, run.errored, run.skipped, run.total
+    );
+
+    let process_results: Vec<&BenchResult> = results
+        .iter()
+        .filter(|result| result.process_score.is_some())
+        .collect();
+    if !process_results.is_empty() {
+        let fully_met = process_results
+            .iter()
+            .filter(|result| result.process_score == Some(1.0))
+            .count();
+        let earned: f32 = process_results
+            .iter()
+            .filter_map(|result| result.process_score)
+            .sum();
+        println!(
+            "process: {fully_met}/{} cases fully met their contract ({earned:.2}/{} points)",
+            process_results.len(),
+            process_results.len()
+        );
+    }
+
+    let causes = failure_causes(results);
+    if !causes.is_empty() {
+        let causes = causes
+            .iter()
+            .map(|(cause, count)| format!("{cause}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("failure causes: {causes}");
+    }
+
+    println!(
+        "cache tokens: {} read, {} written",
+        display_count(run.cache_read_tokens),
+        display_count(run.cache_write_tokens)
+    );
+    println!(
+        "tokens: {} prompt + {} completion = {} tokens, {}",
+        display_count(run.prompt_tokens),
+        display_count(run.completion_tokens),
+        display_count(run.total_tokens),
+        format_cost(run.total_cost_micros, run.total_cost_cents)
+    );
+    println!(
+        "activity: {} assistant turns, {} tool calls",
+        display_count(run.assistant_turns),
+        display_count(run.tool_calls)
+    );
+    let elapsed_ms = u64::try_from((run.finished_at - run.started_at).num_milliseconds().max(0))
+        .unwrap_or(u64::MAX);
+    println!("wall time: {}", format_elapsed_ms(elapsed_ms));
+}
+
+fn display_count(value: Option<u64>) -> String {
+    value.map_or_else(|| "-".to_string(), |value| value.to_string())
+}
+
+fn failure_causes(results: &[BenchResult]) -> Vec<(&'static str, u32)> {
+    let mut causes = HashMap::new();
+    for result in results {
+        if !matches!(result.status, BenchStatus::Fail | BenchStatus::Error) {
+            continue;
+        }
+        let detail = result
+            .error
+            .as_deref()
+            .or(result.output.as_deref())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let cause = if detail.contains("[worker_error]")
+            || detail.contains("provider")
+            || detail.contains("streaming response")
+        {
+            "provider_api"
+        } else if detail.contains("timed out") {
+            "timeout"
+        } else if result.status == BenchStatus::Fail {
+            "tests_failed"
+        } else {
+            "worker_or_harness"
+        };
+        *causes.entry(cause).or_insert(0u32) += 1;
+    }
+    let mut causes: Vec<_> = causes.into_iter().collect();
+    causes.sort_unstable_by_key(|(cause, _)| *cause);
+    causes
 }
 
 fn print_result_details(result: &BenchResult) {
@@ -671,6 +799,7 @@ fn case_id_width<'a>(ids: impl Iterator<Item = &'a str>) -> usize {
 
 fn summarize_run(
     run_id: &str,
+    started_at: DateTime<Utc>,
     tier: Option<BenchTier>,
     results: &[BenchResult],
     run_config: &BenchRunConfig,
@@ -694,7 +823,7 @@ fn summarize_run(
     let tool_calls = sum_u32(results, |r| r.tool_calls);
     BenchRun {
         run_id: run_id.into(),
-        started_at: Utc::now(),
+        started_at,
         finished_at: Utc::now(),
         tier,
         tiers: tiers_in_results(results),
@@ -837,7 +966,9 @@ fn print_run_summary(r: &BenchRun) {
         cache_write = r
             .cache_write_tokens
             .map_or_else(|| "-".into(), |v| v.to_string()),
-        turns = r.assistant_turns.map_or_else(|| "-".into(), |v| v.to_string()),
+        turns = r
+            .assistant_turns
+            .map_or_else(|| "-".into(), |v| v.to_string()),
         tools = r.tool_calls.map_or_else(|| "-".into(), |v| v.to_string()),
     );
     println!(
@@ -863,7 +994,7 @@ fn print_run_summary(r: &BenchRun) {
             orboros_commit = short_commit(r.orboros_commit.as_deref()),
             bench_commit = short_commit(r.bench_commit.as_deref()),
             config = r.config_hash,
-    );
+        );
     }
 }
 
@@ -1025,6 +1156,27 @@ text = "x"
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn elapsed_display_is_human_readable() {
+        assert_eq!(format_elapsed_ms(42), "42ms");
+        assert_eq!(format_elapsed_ms(6_349), "6.3s");
+        assert_eq!(format_elapsed_ms(117_248), "1m 57s");
+        assert_eq!(format_elapsed_ms(3_661_000), "1h 01m 01s");
+    }
+
+    #[test]
+    fn failure_causes_distinguish_provider_and_test_failures() {
+        let mut provider = sample_result("provider", "run", BenchStatus::Error);
+        provider.error = Some("[worker_error] error reading streaming response body".into());
+        let mut tests = sample_result("tests", "run", BenchStatus::Fail);
+        tests.error = Some("tests_pass command failed".into());
+
+        assert_eq!(
+            failure_causes(&[provider, tests]),
+            vec![("provider_api", 1), ("tests_failed", 1)]
+        );
     }
 
     // ── cmd_bench_list ────────────────────────────────────────
