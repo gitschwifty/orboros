@@ -762,11 +762,9 @@ mod tests {
         let store = BenchStore::new(dir.path().join("bench"));
         let r = sample_result(DATED_RUN_ID, "case-a");
         store.append_result(&r).unwrap();
-        assert!(
-            store
-                .results_path(DATED_RUN_ID)
-                .ends_with("2026-07-21/bench-20260721200204-16b98c28/results.jsonl")
-        );
+        assert!(store
+            .results_path(DATED_RUN_ID)
+            .ends_with("2026-07-21/bench-20260721200204-16b98c28/results.jsonl"));
         let read = store.read_results(DATED_RUN_ID).unwrap();
         assert_eq!(read.len(), 1);
         assert_eq!(read[0], r);

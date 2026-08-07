@@ -354,9 +354,7 @@ mod tests {
         assert!(prompt.contains("This is guidance, not an Orboros-executed contract."));
         assert!(prompt.contains("Do not create an inspection-only child"));
         assert!(prompt.contains("when they edit the same file"));
-        assert!(
-            prompt.contains("do not require\n  a later-owner label or a detailed handoff plan")
-        );
+        assert!(prompt.contains("do not require\n  a later-owner label or a detailed handoff plan"));
         assert!(prompt.contains("focused scope is guidance, not an artificial\nceiling"));
     }
 

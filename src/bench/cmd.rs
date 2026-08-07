@@ -13,11 +13,11 @@ use anyhow::Context;
 use chrono::{DateTime, NaiveDate, Utc};
 use sha2::{Digest, Sha256};
 
-use crate::bench::case::{BenchCase, BenchTier, DEFAULT_TIMEOUT_S, load_all, load_tier};
+use crate::bench::case::{load_all, load_tier, BenchCase, BenchTier, DEFAULT_TIMEOUT_S};
 use crate::bench::prompts::BenchPromptSet;
 use crate::bench::runner::{
-    BenchRunConfig, RunOptions, effective_timeout_s, is_fatal_worker_error, run_t1_with_run_id,
-    timeout_bench_result,
+    effective_timeout_s, is_fatal_worker_error, run_t1_with_run_id, timeout_bench_result,
+    BenchRunConfig, RunOptions,
 };
 use crate::bench::store::{
     BenchDispatchRecord, BenchPromptRecord, BenchResult, BenchRun, BenchStatus, BenchStore,
@@ -327,12 +327,7 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
     }
 
     if let Some(run) = completed_run.as_ref() {
-        print_completed_run(
-            run,
-            &all_results,
-            &case_labels,
-            &resource_guidance,
-        );
+        print_completed_run(run, &all_results, &case_labels, &resource_guidance);
     } else {
         print_result_table(&all_results, Some(&case_labels), Some(&resource_guidance));
     }
@@ -352,11 +347,7 @@ fn build_suite_manifest(
             id: case.id.clone(),
             selector: case.selector.clone(),
             case_toml_sha256: hash_file(&case.case_dir.join("case.toml"))?,
-            fixture_sha256: case
-                .fixture_dir
-                .as_deref()
-                .map(hash_tree)
-                .transpose()?,
+            fixture_sha256: case.fixture_dir.as_deref().map(hash_tree).transpose()?,
             overlay_sha256: case
                 .test_overlay_dir
                 .as_deref()
@@ -370,7 +361,10 @@ fn build_suite_manifest(
         .map(|manifest| serde_json::to_vec(&manifest))
         .transpose()?
         .map(|bytes| sha256(&bytes));
-    let fingerprint = sha256(&serde_json::to_vec(&(suite_cases.clone(), &prompt_manifest_sha256))?);
+    let fingerprint = sha256(&serde_json::to_vec(&(
+        suite_cases.clone(),
+        &prompt_manifest_sha256,
+    ))?);
     Ok(BenchSuiteManifest {
         fingerprint,
         cases: suite_cases,
@@ -392,10 +386,12 @@ fn hash_tree(root: &Path) -> anyhow::Result<String> {
     for relative in files {
         hasher.update(relative.to_string_lossy().as_bytes());
         hasher.update([0]);
-        hasher.update(
-            std::fs::read(root.join(&relative))
-                .with_context(|| format!("failed to read suite input {}", root.join(&relative).display()))?,
-        );
+        hasher.update(std::fs::read(root.join(&relative)).with_context(|| {
+            format!(
+                "failed to read suite input {}",
+                root.join(&relative).display()
+            )
+        })?);
         hasher.update([0]);
     }
     Ok(format!("{:x}", hasher.finalize()))
@@ -433,12 +429,7 @@ pub fn cmd_bench_show(store: &BenchStore, run_id: &str) -> anyhow::Result<()> {
     if let Some(run) = store.read_runs()?.into_iter().find(|r| r.run_id == run_id) {
         let case_labels = case_labels_for_run(&run);
         let resource_guidance = resource_guidance_for_run(&run);
-        print_completed_run(
-            &run,
-            &results,
-            &case_labels,
-            &resource_guidance,
-        );
+        print_completed_run(&run, &results, &case_labels, &resource_guidance);
     } else {
         print_result_table(&results, None, None);
     }
@@ -537,7 +528,9 @@ pub fn cmd_bench_report(
             .then_with(|| kind_a.cmp(kind_b))
     });
     let (selector_width, name_width) = report_case_widths(
-        summary_rows.iter().map(|((case_id, _), _)| case_id.as_str()),
+        summary_rows
+            .iter()
+            .map(|((case_id, _), _)| case_id.as_str()),
         &case_labels,
     );
     println!(
@@ -723,14 +716,17 @@ fn print_tool_policy_report(
     }
 
     let mut rows: Vec<_> = counts.into_iter().collect();
-    rows.sort_by(|((case_a, kind_a, _, _, _), _), ((case_b, kind_b, _, _, _), _)| {
-        display_case_label(case_labels, case_a)
-            .0
-            .cmp(&display_case_label(case_labels, case_b).0)
-            .then_with(|| kind_a.cmp(kind_b))
-    });
+    rows.sort_by(
+        |((case_a, kind_a, _, _, _), _), ((case_b, kind_b, _, _, _), _)| {
+            display_case_label(case_labels, case_a)
+                .0
+                .cmp(&display_case_label(case_labels, case_b).0)
+                .then_with(|| kind_a.cmp(kind_b))
+        },
+    );
     let (selector_width, name_width) = report_case_widths(
-        rows.iter().map(|((case_id, _, _, _, _), _)| case_id.as_str()),
+        rows.iter()
+            .map(|((case_id, _, _, _, _), _)| case_id.as_str()),
         case_labels,
     );
     println!("\n== effective tool policies ==");
@@ -804,7 +800,9 @@ fn print_prompt_context_report(
             .then_with(|| kind_a.cmp(kind_b))
     });
     let (selector_width, name_width) = report_case_widths(
-        summary_rows.iter().map(|((case_id, _), _)| case_id.as_str()),
+        summary_rows
+            .iter()
+            .map(|((case_id, _), _)| case_id.as_str()),
         case_labels,
     );
     println!(
@@ -1514,7 +1512,10 @@ fn resource_target_status(
     let measurements = [
         (guidance.cost_micros.as_ref(), result.cost_micros),
         (guidance.input_tokens.as_ref(), result.prompt_tokens),
-        (guidance.cache_read_tokens.as_ref(), result.cache_read_tokens),
+        (
+            guidance.cache_read_tokens.as_ref(),
+            result.cache_read_tokens,
+        ),
         (guidance.elapsed_ms.as_ref(), Some(result.latency_ms)),
         (
             guidance.assistant_turns.as_ref(),
@@ -1551,9 +1552,10 @@ fn result_resource_guidance<'a>(
     result: &'a BenchResult,
     live_guidance: Option<&'a HashMap<String, crate::bench::case::BenchResourceGuidance>>,
 ) -> Option<&'a crate::bench::case::BenchResourceGuidance> {
-    result.resource_guidance.as_ref().or_else(|| {
-        live_guidance.and_then(|guidance| guidance.get(&result.case_id))
-    })
+    result
+        .resource_guidance
+        .as_ref()
+        .or_else(|| live_guidance.and_then(|guidance| guidance.get(&result.case_id)))
 }
 
 fn display_case_label(
@@ -1570,10 +1572,15 @@ fn report_case_widths<'a>(
     ids: impl Iterator<Item = &'a str>,
     case_labels: &HashMap<String, (String, String)>,
 ) -> (usize, usize) {
-    ids.map(|id| display_case_label(case_labels, id))
-        .fold((4, 4), |(selector_width, name_width), (selector, name)| {
-            (selector_width.max(selector.len()), name_width.max(name.len()))
-        })
+    ids.map(|id| display_case_label(case_labels, id)).fold(
+        (4, 4),
+        |(selector_width, name_width), (selector, name)| {
+            (
+                selector_width.max(selector.len()),
+                name_width.max(name.len()),
+            )
+        },
+    )
 }
 
 fn run_display_label(run_id: &str) -> &str {

@@ -596,7 +596,10 @@ mod tests {
             r#"{"upstream_provider":"openrouter","effective_upstream_provider":"openai","upstream_provider_history":["openai"]}"#,
         )
         .unwrap();
-        assert_eq!(routing.effective_upstream_provider.as_deref(), Some("openai"));
+        assert_eq!(
+            routing.effective_upstream_provider.as_deref(),
+            Some("openai")
+        );
         assert_eq!(routing.upstream_provider_history, ["openai"]);
     }
 

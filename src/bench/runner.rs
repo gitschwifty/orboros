@@ -17,7 +17,7 @@ use tracing::{info, warn};
 use crate::bench::case::{BenchCase, BenchExpected, BenchTier, DEFAULT_TIMEOUT_S};
 use crate::bench::prompts::PromptManifest;
 use crate::bench::store::{
-    BenchResult, BenchRun, BenchStatus, BenchStore, BenchSuiteManifest, new_run_id,
+    new_run_id, BenchResult, BenchRun, BenchStatus, BenchStore, BenchSuiteManifest,
 };
 use crate::ipc::types::{ResultStatus, RuntimeMode, RuntimePlacementConfig};
 use crate::routing::profile::builtin_tools;
