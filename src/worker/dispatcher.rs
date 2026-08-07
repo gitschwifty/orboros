@@ -150,6 +150,28 @@ pub async fn dispatch_orb(
     worker_config: &WorkerConfig,
     hooks: Option<&HookSink>,
 ) -> anyhow::Result<DispatchOutcome> {
+    dispatch_orb_with_retry_limit(orb, prompt, worker_config, hooks, 1).await
+}
+
+/// Dispatches exactly once, including no automatic retry after a retryable
+/// worker/provider failure. This is for bounded recovery protocols where a
+/// second send would violate the caller's attempt cap.
+pub async fn dispatch_orb_once(
+    orb: &Orb,
+    prompt: &str,
+    worker_config: &WorkerConfig,
+    hooks: Option<&HookSink>,
+) -> anyhow::Result<DispatchOutcome> {
+    dispatch_orb_with_retry_limit(orb, prompt, worker_config, hooks, 0).await
+}
+
+async fn dispatch_orb_with_retry_limit(
+    orb: &Orb,
+    prompt: &str,
+    worker_config: &WorkerConfig,
+    hooks: Option<&HookSink>,
+    retry_limit: u32,
+) -> anyhow::Result<DispatchOutcome> {
     // 1. pre-worker-spawn — gating. Exit 2 from any matching hook
     //    short-circuits before we spawn anything. We're already in
     //    async context, so use `fire` directly (not `fire_blocking`,
@@ -238,7 +260,7 @@ pub async fn dispatch_orb(
                 )
             }
         };
-        if retryable && attempt == 0 {
+        if retryable && attempt < retry_limit {
             attempt = 1;
             warn!(orb = %orb.id, "retrying whole worker dispatch after retryable error");
             continue;

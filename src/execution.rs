@@ -81,6 +81,36 @@ pub struct ExecutionRecord {
     /// records and deliberately excludes opaque Heddle/provider context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_context: Option<PromptContextMetrics>,
+    /// Evidence from the one permitted fresh-worker repair of a malformed
+    /// decomposition response. Kept on the repair dispatch record so the
+    /// original dispatch remains an unmodified account of what it returned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decomposition_repair: Option<DecompositionRepairDiagnostic>,
+}
+
+/// Attribution for a bounded decomposition JSON repair attempt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecompositionRepairDiagnostic {
+    /// The normal parser failed before this repair worker was started.
+    pub initial_parse_error: String,
+    /// The original worker had already shut down, so this is always a fresh
+    /// session rather than a misleading continuation claim.
+    pub same_session_repair_available: bool,
+    /// Whether the single permitted fresh-worker repair was dispatched.
+    pub repair_attempted: bool,
+    /// Whether the repair response passed the normal decomposition parser.
+    pub repair_succeeded: bool,
+    /// Why the repair response could not be used, when it was attempted but
+    /// did not produce a valid plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_parse_error: Option<String>,
+    /// Confidence emitted with the malformed original response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_confidence: Option<f32>,
+    /// Confidence emitted by the repair response. This is the confidence used
+    /// for a successfully repaired decomposition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repaired_confidence: Option<f32>,
 }
 
 impl ExecutionRecord {
@@ -124,6 +154,7 @@ impl ExecutionRecord {
             cache_write_tokens: outcome.cache_write_tokens,
             retries: outcome.retries,
             prompt_context,
+            decomposition_repair: None,
         }
     }
 }
