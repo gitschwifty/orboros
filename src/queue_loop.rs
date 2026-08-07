@@ -1110,6 +1110,11 @@ async fn dispatch_one_owned(
         &orb,
         prompt_category,
         target.tool_policy_key(),
+        Some(if tool_policy.is_some() {
+            "case_override".into()
+        } else {
+            "phase_default".into()
+        }),
         wc.tools.clone(),
         &outcome,
         Some(prompt_context),

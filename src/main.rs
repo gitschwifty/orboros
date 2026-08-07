@@ -274,8 +274,27 @@ enum BenchAction {
     },
     /// Diff two saved runs by case outcome.
     Compare { run_a: String, run_b: String },
-    /// List every recorded run.
-    ListRuns,
+    /// List recorded runs, with optional comparability filters.
+    ListRuns {
+        /// Match configured or resolved worker model text.
+        #[arg(long)]
+        model: Option<String>,
+        /// Match a tier (`t1`, `t2`, or `t3`).
+        #[arg(long)]
+        tier: Option<String>,
+        /// Match a suite fingerprint or its prefix.
+        #[arg(long)]
+        suite: Option<String>,
+        /// Match a benchmark prompt-set name.
+        #[arg(long)]
+        prompt_set: Option<String>,
+        /// Include runs started on or after this UTC date (`YYYY-MM-DD`).
+        #[arg(long)]
+        since: Option<String>,
+        /// Show at most this many newest matching runs.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Calibration report: bucket confidence vs pass rate + correlation.
     Calibration {
         /// Run id to analyze.
@@ -1092,6 +1111,7 @@ fn cmd_bench(
                 prompt_manifest: prompt_set
                     .as_ref()
                     .map(orboros::bench::prompts::BenchPromptSet::manifest),
+                suite_manifest: None,
                 cases_root: Some(bench_root.display().to_string()),
                 bench_config_path: resolved_bench_config
                     .as_ref()
@@ -1130,7 +1150,35 @@ fn cmd_bench(
         BenchAction::Compare { run_a, run_b } => {
             bench_cmd::cmd_bench_compare(&store, &run_a, &run_b)
         }
-        BenchAction::ListRuns => bench_cmd::cmd_bench_list_runs(&store),
+        BenchAction::ListRuns {
+            model,
+            tier,
+            suite,
+            prompt_set,
+            since,
+            limit,
+        } => {
+            let tier = tier
+                .as_deref()
+                .map(str::parse::<orboros::bench::case::BenchTier>)
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
+            let since = since
+                .as_deref()
+                .map(|date| chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d"))
+                .transpose()?;
+            bench_cmd::cmd_bench_list_runs_filtered(
+                &store,
+                &bench_cmd::BenchRunFilter {
+                    model: model.as_deref(),
+                    tier,
+                    suite: suite.as_deref(),
+                    prompt_set: prompt_set.as_deref(),
+                    since,
+                    limit,
+                },
+            )
+        }
         BenchAction::Calibration { run_id, buckets } => {
             orboros::bench::calibration::cmd_bench_calibration(&store, &run_id, buckets)
         }

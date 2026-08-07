@@ -216,6 +216,7 @@ mod tests {
             },
             process_score: None,
             process_annotations: Vec::new(),
+            resource_guidance: None,
             latency_ms: 0,
             model_latency_ms: None,
             tool_latency_ms: None,

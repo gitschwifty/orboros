@@ -6,11 +6,12 @@
 //! `hooks::cmd`.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
+use sha2::{Digest, Sha256};
 
 use crate::bench::case::{BenchCase, BenchTier, DEFAULT_TIMEOUT_S, load_all, load_tier};
 use crate::bench::prompts::BenchPromptSet;
@@ -20,6 +21,7 @@ use crate::bench::runner::{
 };
 use crate::bench::store::{
     BenchDispatchRecord, BenchPromptRecord, BenchResult, BenchRun, BenchStatus, BenchStore,
+    BenchSuiteCase, BenchSuiteManifest,
 };
 use crate::worker::process::WorkerConfig;
 
@@ -113,6 +115,8 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
                 .map(|guidance| (case.id.clone(), guidance))
         })
         .collect();
+    let mut run_config = req.run_config.clone();
+    run_config.suite_manifest = Some(build_suite_manifest(&cases, req.prompt_set)?);
 
     // Split by tier and dispatch. Today only T1 actually runs the
     // pipeline; T2/T3 fall through to scaffolded error rows.
@@ -137,7 +141,7 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
             req.worker_config,
             req.store,
             &opts,
-            req.run_config,
+            &run_config,
             run_id.clone(),
         )
         .await?;
@@ -186,6 +190,7 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
                             score: 0.0,
                             process_score: None,
                             process_annotations: Vec::new(),
+                            resource_guidance: case.resource_guidance.clone(),
                             latency_ms: 0,
                             model_latency_ms: None,
                             tool_latency_ms: None,
@@ -229,6 +234,7 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
                                 score: 0.0,
                                 process_score: None,
                                 process_annotations: Vec::new(),
+                                resource_guidance: case.resource_guidance.clone(),
                                 latency_ms: 0,
                                 model_latency_ms: None,
                                 tool_latency_ms: None,
@@ -313,7 +319,7 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
             run_started_at,
             common_tier(&all_results),
             &all_results,
-            req.run_config,
+            &run_config,
             req.worker_config,
         );
         req.store.append_run(&run)?;
@@ -334,6 +340,84 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
         println!("\nRun id: {id}");
     }
     Ok(())
+}
+
+fn build_suite_manifest(
+    cases: &[BenchCase],
+    prompt_set: Option<&BenchPromptSet>,
+) -> anyhow::Result<BenchSuiteManifest> {
+    let mut suite_cases = Vec::with_capacity(cases.len());
+    for case in cases {
+        suite_cases.push(BenchSuiteCase {
+            id: case.id.clone(),
+            selector: case.selector.clone(),
+            case_toml_sha256: hash_file(&case.case_dir.join("case.toml"))?,
+            fixture_sha256: case
+                .fixture_dir
+                .as_deref()
+                .map(hash_tree)
+                .transpose()?,
+            overlay_sha256: case
+                .test_overlay_dir
+                .as_deref()
+                .map(hash_tree)
+                .transpose()?,
+        });
+    }
+    suite_cases.sort_by(|a, b| a.selector.cmp(&b.selector));
+    let prompt_manifest_sha256 = prompt_set
+        .map(BenchPromptSet::manifest)
+        .map(|manifest| serde_json::to_vec(&manifest))
+        .transpose()?
+        .map(|bytes| sha256(&bytes));
+    let fingerprint = sha256(&serde_json::to_vec(&(suite_cases.clone(), &prompt_manifest_sha256))?);
+    Ok(BenchSuiteManifest {
+        fingerprint,
+        cases: suite_cases,
+        prompt_manifest_sha256,
+    })
+}
+
+fn hash_file(path: &Path) -> anyhow::Result<String> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read suite input {}", path.display()))?;
+    Ok(sha256(&bytes))
+}
+
+fn hash_tree(root: &Path) -> anyhow::Result<String> {
+    let mut files = Vec::new();
+    collect_files(root, root, &mut files)?;
+    files.sort();
+    let mut hasher = Sha256::new();
+    for relative in files {
+        hasher.update(relative.to_string_lossy().as_bytes());
+        hasher.update([0]);
+        hasher.update(
+            std::fs::read(root.join(&relative))
+                .with_context(|| format!("failed to read suite input {}", root.join(&relative).display()))?,
+        );
+        hasher.update([0]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn collect_files(root: &Path, dir: &Path, files: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read suite input directory {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(root, &path, files)?;
+        } else if path.is_file() {
+            files.push(path.strip_prefix(root)?.to_path_buf());
+        }
+    }
+    Ok(())
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Prints a saved run's per-case results.
@@ -496,6 +580,7 @@ pub fn cmd_bench_report(
             name_width = name_width,
         );
     }
+    print_tool_policy_report(&records, &case_labels);
     print_prompt_context_report(store, run_id, case_id, &case_labels)?;
     Ok(())
 }
@@ -598,6 +683,76 @@ fn summarize_dispatches(
             .saturating_add(u64::try_from(duration).unwrap_or(u64::MAX));
     }
     summaries
+}
+
+fn print_tool_policy_report(
+    records: &[BenchDispatchRecord],
+    case_labels: &HashMap<String, (String, String)>,
+) {
+    let mut counts = BTreeMap::<(String, String, String, String, String), u32>::new();
+    for record in records {
+        let policy = record
+            .execution
+            .tool_policy
+            .as_deref()
+            .unwrap_or("-")
+            .to_string();
+        let source = record
+            .execution
+            .tool_policy_source
+            .as_deref()
+            .unwrap_or("-")
+            .to_string();
+        let tools = match record.execution.allowed_tools.as_deref() {
+            None => "-".to_string(),
+            Some([]) => "(none)".to_string(),
+            Some(tools) => tools.join(","),
+        };
+        let key = (
+            record.case_id.clone(),
+            record.execution.dispatch_kind.clone(),
+            policy,
+            source,
+            tools,
+        );
+        let count = counts.entry(key).or_default();
+        *count = count.saturating_add(1);
+    }
+    if counts.is_empty() {
+        return;
+    }
+
+    let mut rows: Vec<_> = counts.into_iter().collect();
+    rows.sort_by(|((case_a, kind_a, _, _, _), _), ((case_b, kind_b, _, _, _), _)| {
+        display_case_label(case_labels, case_a)
+            .0
+            .cmp(&display_case_label(case_labels, case_b).0)
+            .then_with(|| kind_a.cmp(kind_b))
+    });
+    let (selector_width, name_width) = report_case_widths(
+        rows.iter().map(|((case_id, _, _, _, _), _)| case_id.as_str()),
+        case_labels,
+    );
+    println!("\n== effective tool policies ==");
+    println!(
+        "{selector:<selector_width$}  {name:<name_width$}  {kind:<18} {policy:<14} {source:<14} {tools:<40} {count:>5}",
+        selector = "case",
+        name = "name",
+        kind = "dispatch",
+        policy = "policy",
+        source = "source",
+        tools = "allowed tools",
+        count = "count",
+        selector_width = selector_width,
+        name_width = name_width,
+    );
+    for ((case_id, kind, policy, source, tools), count) in rows {
+        let (selector, name) = display_case_label(case_labels, &case_id);
+        let row = format!(
+            "{selector:<selector_width$}  {name:<name_width$}  {kind:<18} {policy:<14} {source:<14} {tools:<40} {count:>5}"
+        );
+        println!("{row}");
+    }
 }
 
 fn add_optional_u32(total: &mut Option<u64>, value: Option<u32>) {
@@ -767,6 +922,7 @@ pub fn cmd_bench_compare(store: &BenchStore, run_a: &str, run_b: &str) -> anyhow
         print_run_summary(run);
     }
     warn_on_run_metadata_drift(run_meta_a, run_meta_b);
+    report_suite_manifest_difference(run_meta_a, run_meta_b);
     report_prompt_manifest_difference(run_meta_a, run_meta_b);
 
     let case_labels = run_meta_a
@@ -861,18 +1017,131 @@ pub fn cmd_bench_compare(store: &BenchStore, run_a: &str, run_b: &str) -> anyhow
 /// # Errors
 ///
 /// Returns an error if the store can't be read.
+pub struct BenchRunFilter<'a> {
+    pub model: Option<&'a str>,
+    pub tier: Option<BenchTier>,
+    pub suite: Option<&'a str>,
+    pub prompt_set: Option<&'a str>,
+    pub since: Option<NaiveDate>,
+    pub limit: Option<usize>,
+}
+
 pub fn cmd_bench_list_runs(store: &BenchStore) -> anyhow::Result<()> {
+    cmd_bench_list_runs_filtered(
+        store,
+        &BenchRunFilter {
+            model: None,
+            tier: None,
+            suite: None,
+            prompt_set: None,
+            since: None,
+            limit: None,
+        },
+    )
+}
+
+/// Lists saved runs with optional metadata filters and resource-guidance
+/// status totals calculated from immutable result snapshots.
+pub fn cmd_bench_list_runs_filtered(
+    store: &BenchStore,
+    filter: &BenchRunFilter<'_>,
+) -> anyhow::Result<()> {
     let mut runs = store.read_runs()?;
     runs.sort_by_key(|run| std::cmp::Reverse(run.started_at));
+    runs.retain(|run| run_matches_filter(run, filter));
+    if let Some(limit) = filter.limit {
+        runs.truncate(limit);
+    }
     if runs.is_empty() {
-        println!("No runs recorded.");
+        println!("No matching runs recorded.");
         return Ok(());
     }
-    for r in &runs {
-        print_run_summary(r);
+
+    println!(
+        "run           started              suite         tier  model                         pass fail err  cost         guidance"
+    );
+    for run in &runs {
+        let results = store.read_results(&run.run_id)?;
+        let (under, over, investigate) = stored_resource_target_counts(&results);
+        let guidance = if under + over + investigate == 0 {
+            "-".to_string()
+        } else {
+            format!("{under}U {over}O {investigate}I")
+        };
+        println!(
+            "{run_id:<12}  {started:<19}  {suite:<12}  {tier:<4}  {model:<28}  {passed:>4} {failed:>4} {errored:>3}  {cost:<11}  {guidance}",
+            run_id = run_display_label(&run.run_id),
+            started = run.started_at.format("%Y-%m-%d %H:%M:%S"),
+            suite = run
+                .suite_manifest
+                .as_ref()
+                .map_or("legacy", |suite| short_hash(&suite.fingerprint)),
+            tier = run_tier_label(run),
+            model = run.worker_model.as_deref().unwrap_or("-"),
+            passed = run.passed,
+            failed = run.failed,
+            errored = run.errored,
+            cost = format_cost(run.total_cost_micros, run.total_cost_cents),
+            guidance = guidance,
+        );
     }
     println!("\n{} run(s)", runs.len());
     Ok(())
+}
+
+fn run_matches_filter(run: &BenchRun, filter: &BenchRunFilter<'_>) -> bool {
+    if let Some(model) = filter.model {
+        let matches = [
+            run.model_selector.as_deref(),
+            run.worker_model.as_deref(),
+            run.model_key.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|candidate| candidate.contains(model));
+        if !matches {
+            return false;
+        }
+    }
+    if let Some(tier) = filter.tier {
+        if !run.tiers.contains(&tier) && run.tier != Some(tier) {
+            return false;
+        }
+    }
+    if let Some(suite) = filter.suite {
+        if !run
+            .suite_manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.fingerprint.starts_with(suite))
+        {
+            return false;
+        }
+    }
+    if let Some(prompt_set) = filter.prompt_set {
+        if run.prompt_variant.as_deref() != Some(prompt_set) {
+            return false;
+        }
+    }
+    filter
+        .since
+        .is_none_or(|since| run.started_at.date_naive() >= since)
+}
+
+fn stored_resource_target_counts(results: &[BenchResult]) -> (u32, u32, u32) {
+    let mut under = 0;
+    let mut over = 0;
+    let mut investigate = 0;
+    for result in results {
+        match result_resource_guidance(result, None)
+            .and_then(|guidance| resource_target_status(result, guidance))
+        {
+            Some(ResourceTargetStatus::Under) => under += 1,
+            Some(ResourceTargetStatus::Over) => over += 1,
+            Some(ResourceTargetStatus::Investigate) => investigate += 1,
+            None => {}
+        }
+    }
+    (under, over, investigate)
 }
 
 fn print_completed_run(
@@ -955,8 +1224,7 @@ fn print_result_table(
         let cache_write = r
             .cache_write_tokens
             .map_or(String::from("-"), |tokens| tokens.to_string());
-        let target = resource_guidance
-            .and_then(|guidance| guidance.get(&r.case_id))
+        let target = result_resource_guidance(r, resource_guidance)
             .and_then(|guidance| resource_target_status(r, guidance))
             .map_or("-", ResourceTargetStatus::label);
         println!(
@@ -1044,8 +1312,7 @@ fn print_run_completion(
     let target_statuses: Vec<_> = results
         .iter()
         .filter_map(|result| {
-            resource_guidance
-                .get(&result.case_id)
+            result_resource_guidance(result, Some(resource_guidance))
                 .and_then(|guidance| resource_target_status(result, guidance))
         })
         .collect();
@@ -1245,8 +1512,14 @@ fn resource_target_status(
     guidance: &crate::bench::case::BenchResourceGuidance,
 ) -> Option<ResourceTargetStatus> {
     let measurements = [
+        (guidance.cost_micros.as_ref(), result.cost_micros),
         (guidance.input_tokens.as_ref(), result.prompt_tokens),
         (guidance.cache_read_tokens.as_ref(), result.cache_read_tokens),
+        (guidance.elapsed_ms.as_ref(), Some(result.latency_ms)),
+        (
+            guidance.assistant_turns.as_ref(),
+            result.assistant_turns.map(u64::from),
+        ),
         (
             guidance.tool_calls.as_ref(),
             result.tool_calls.map(u64::from),
@@ -1271,6 +1544,15 @@ fn resource_target_status(
         ResourceTargetStatus::Over
     } else {
         ResourceTargetStatus::Under
+    })
+}
+
+fn result_resource_guidance<'a>(
+    result: &'a BenchResult,
+    live_guidance: Option<&'a HashMap<String, crate::bench::case::BenchResourceGuidance>>,
+) -> Option<&'a crate::bench::case::BenchResourceGuidance> {
+    result.resource_guidance.as_ref().or_else(|| {
+        live_guidance.and_then(|guidance| guidance.get(&result.case_id))
     })
 }
 
@@ -1319,6 +1601,28 @@ fn report_prompt_manifest_difference(a: Option<&BenchRun>, b: Option<&BenchRun>)
     }
 }
 
+fn report_suite_manifest_difference(a: Option<&BenchRun>, b: Option<&BenchRun>) {
+    match (
+        a.and_then(|run| run.suite_manifest.as_ref()),
+        b.and_then(|run| run.suite_manifest.as_ref()),
+    ) {
+        (Some(a), Some(b)) if a.fingerprint == b.fingerprint => {
+            println!("suite: {} (matching)", short_hash(&a.fingerprint));
+        }
+        (Some(a), Some(b)) => {
+            eprintln!(
+                "warning: suite fingerprints differ ({} vs {}); direct comparison may be misleading",
+                short_hash(&a.fingerprint),
+                short_hash(&b.fingerprint)
+            );
+        }
+        (None, None) => {}
+        _ => eprintln!(
+            "note: suite fingerprint is unavailable for one run; suite compatibility cannot be verified"
+        ),
+    }
+}
+
 fn summarize_run(
     run_id: &str,
     started_at: DateTime<Utc>,
@@ -1359,6 +1663,7 @@ fn summarize_run(
         grader_model: run_config.grader_model.clone(),
         prompt_variant: run_config.prompt_variant.clone(),
         prompt_manifest: run_config.prompt_manifest.clone(),
+        suite_manifest: run_config.suite_manifest.clone(),
         cases_root: run_config.cases_root.clone(),
         bench_config_path: run_config.bench_config_path.clone(),
         orboros_commit: run_config.orboros_commit.clone(),
@@ -1505,13 +1810,15 @@ fn print_run_summary(r: &BenchRun) {
     if r.model_selector.is_some()
         || r.model_key.is_some()
         || r.prompt_variant.is_some()
+        || r.suite_manifest.is_some()
         || r.cases_root.is_some()
         || r.bench_config_path.is_some()
         || r.orboros_commit.is_some()
         || r.bench_commit.is_some()
     {
         println!(
-            "  metadata: prompt={prompt} cases={cases} bench_config={bench_config} orboros_commit={orboros_commit} bench_commit={bench_commit} orboros_dirty={orboros_dirty} bench_dirty={bench_dirty} config={config}",
+            "  metadata: suite={suite} prompt={prompt} cases={cases} bench_config={bench_config} orboros_commit={orboros_commit} bench_commit={bench_commit} orboros_dirty={orboros_dirty} bench_dirty={bench_dirty} config={config}",
+            suite = r.suite_manifest.as_ref().map_or("-", |suite| short_hash(&suite.fingerprint)),
             prompt = r.prompt_variant.as_deref().unwrap_or("-"),
             cases = r.cases_root.as_deref().unwrap_or("-"),
             bench_config = r.bench_config_path.as_deref().unwrap_or("-"),
@@ -1559,6 +1866,10 @@ fn short_commit(commit: Option<&str>) -> &str {
     commit.and_then(|c| c.get(..12)).unwrap_or("-")
 }
 
+fn short_hash(value: &str) -> &str {
+    value.get(..12).unwrap_or(value)
+}
+
 fn warn_on_run_metadata_drift(a: Option<&BenchRun>, b: Option<&BenchRun>) {
     let Some(a) = a else { return };
     let Some(b) = b else { return };
@@ -1568,6 +1879,9 @@ fn warn_on_run_metadata_drift(a: Option<&BenchRun>, b: Option<&BenchRun>) {
     }
     if a.grader_model != b.grader_model {
         drift.push("grader model");
+    }
+    if a.config_hash != b.config_hash {
+        drift.push("execution config");
     }
     if a.prompt_variant != b.prompt_variant {
         drift.push("prompt variant");
@@ -1603,6 +1917,7 @@ mod tests {
             },
             process_score: None,
             process_annotations: Vec::new(),
+            resource_guidance: None,
             latency_ms: 100,
             model_latency_ms: None,
             tool_latency_ms: None,
@@ -1641,6 +1956,7 @@ mod tests {
             grader_model: None,
             prompt_variant: None,
             prompt_manifest: None,
+            suite_manifest: None,
             cases_root: None,
             bench_config_path: None,
             orboros_commit: None,
@@ -1668,6 +1984,7 @@ mod tests {
     #[test]
     fn resource_target_status_uses_the_highest_exceeded_threshold() {
         let guidance = BenchResourceGuidance {
+            cost_micros: None,
             input_tokens: Some(BenchResourceThreshold {
                 target: 30,
                 investigate: 50,
@@ -1676,6 +1993,8 @@ mod tests {
                 target: 20,
                 investigate: 40,
             }),
+            elapsed_ms: None,
+            assistant_turns: None,
             tool_calls: Some(BenchResourceThreshold {
                 target: 10,
                 investigate: 20,
@@ -1704,6 +2023,20 @@ mod tests {
 
         result.cache_read_tokens = None;
         assert_eq!(resource_target_status(&result, &guidance), None);
+    }
+
+    #[test]
+    fn suite_manifest_changes_when_a_selected_case_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        write_case(dir.path(), BenchTier::T1, "alpha");
+        let cases = load_all(dir.path()).unwrap();
+        let original = build_suite_manifest(&cases, None).unwrap();
+
+        let case_toml = dir.path().join("t1/001-alpha/case.toml");
+        std::fs::write(&case_toml, "id = \"alpha\"\ntier = \"t1\"\nname = \"changed\"\ndescription = \"d\"\nprompt = \"p\"\n[expected]\nkind = \"exact\"\ntext = \"x\"\n").unwrap();
+        let changed = build_suite_manifest(&load_all(dir.path()).unwrap(), None).unwrap();
+
+        assert_ne!(original.fingerprint, changed.fingerprint);
     }
 
     fn write_case(dir: &Path, tier: BenchTier, id: &str) {
@@ -1798,6 +2131,7 @@ text = "x"
                 grader_model: None,
                 prompt_variant: None,
                 prompt_manifest: None,
+                suite_manifest: None,
                 cases_root: None,
                 bench_config_path: None,
                 orboros_commit: None,

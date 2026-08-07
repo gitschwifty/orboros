@@ -117,9 +117,15 @@ pub struct BenchProcess {
 #[serde(deny_unknown_fields)]
 pub struct BenchResourceGuidance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<BenchResourceThreshold>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<BenchResourceThreshold>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_read_tokens: Option<BenchResourceThreshold>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<BenchResourceThreshold>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_turns: Option<BenchResourceThreshold>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<BenchResourceThreshold>,
 }

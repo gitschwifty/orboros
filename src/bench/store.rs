@@ -19,8 +19,30 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::bench::case::BenchTier;
+use crate::bench::case::{BenchResourceGuidance, BenchTier};
 use crate::bench::prompts::PromptManifest;
+
+/// Deterministic identity for the evaluated benchmark suite, deliberately
+/// separate from source-commit and runtime/config provenance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchSuiteManifest {
+    pub fingerprint: String,
+    pub cases: Vec<BenchSuiteCase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_manifest_sha256: Option<String>,
+}
+
+/// Content identities contributing to one selected case in a suite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchSuiteCase {
+    pub id: String,
+    pub selector: String,
+    pub case_toml_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixture_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_sha256: Option<String>,
+}
 
 /// A per-dispatch execution record retained at benchmark run scope.
 ///
@@ -83,6 +105,11 @@ pub struct BenchResult {
     /// and result views, but intentionally omitted from the summary table.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub process_annotations: Vec<String>,
+    /// Exact non-failing resource guidance selected for this case at run
+    /// startup. This snapshots evaluation semantics so historical displays do
+    /// not change when the corpus's case TOML is later edited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_guidance: Option<BenchResourceGuidance>,
     /// Wall-clock elapsed time; retained as `latency_ms` for schema
     /// compatibility. This is not provider/model latency.
     pub latency_ms: u64,
@@ -186,6 +213,10 @@ pub struct BenchRun {
     /// Detailed inputs are also copied beneath the run artifact directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_manifest: Option<PromptManifest>,
+    /// Evaluated suite identity and its content-addressed inputs. Historical
+    /// runs predate this field and are intentionally non-comparable by suite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suite_manifest: Option<BenchSuiteManifest>,
     /// Corpus root used for the run, for provenance when cases live
     /// in a sibling private repo.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -622,6 +653,7 @@ mod tests {
             score: 1.0,
             process_score: None,
             process_annotations: Vec::new(),
+            resource_guidance: None,
             latency_ms: 1234,
             model_latency_ms: Some(1000),
             tool_latency_ms: Some(200),
@@ -675,6 +707,7 @@ mod tests {
                     }],
                 }],
             }),
+            suite_manifest: None,
             cases_root: Some("bench/cases".into()),
             bench_config_path: None,
             orboros_commit: None,

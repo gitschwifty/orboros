@@ -36,8 +36,18 @@ pub struct ExecutionRecord {
     pub orb_id: String,
     pub parent_id: Option<String>,
     pub dispatch_kind: String,
-    pub tool_policy: String,
-    pub allowed_tools: Vec<String>,
+    /// Resolved phase tool-policy key/profile. Missing for historical records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_policy: Option<String>,
+    /// Where the policy selection came from, such as `phase_default` or a
+    /// benchmark `case_override`. Missing for historical records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_policy_source: Option<String>,
+    /// Concrete Heddle tools available to this dispatch after policy and base
+    /// ceilings were intersected. Missing is distinct from an explicitly empty
+    /// tool inventory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
     pub status: String,
     pub dispatched_at: DateTime<Utc>,
     pub completed_at: DateTime<Utc>,
@@ -78,6 +88,7 @@ impl ExecutionRecord {
         orb: &orbs::orb::Orb,
         dispatch_kind: impl Into<String>,
         tool_policy: impl Into<String>,
+        tool_policy_source: Option<String>,
         allowed_tools: Vec<String>,
         outcome: &DispatchOutcome,
         prompt_context: Option<PromptContextMetrics>,
@@ -86,8 +97,9 @@ impl ExecutionRecord {
             orb_id: orb.id.to_string(),
             parent_id: orb.parent_id.as_ref().map(ToString::to_string),
             dispatch_kind: dispatch_kind.into(),
-            tool_policy: tool_policy.into(),
-            allowed_tools,
+            tool_policy: Some(tool_policy.into()),
+            tool_policy_source,
+            allowed_tools: Some(allowed_tools),
             status: match outcome.status {
                 DispatchStatus::Done => "done",
                 DispatchStatus::Error => "error",
@@ -232,5 +244,46 @@ impl PromptStore {
             .lines()
             .filter_map(|line| line.ok().and_then(|line| serde_json::from_str(&line).ok()))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExecutionRecord;
+
+    #[test]
+    fn execution_record_reads_historical_rows_without_tool_telemetry() {
+        let record: ExecutionRecord = serde_json::from_str(
+            r#"{
+                "orb_id":"orb-1",
+                "parent_id":null,
+                "dispatch_kind":"execute",
+                "status":"done",
+                "dispatched_at":"2026-08-01T00:00:00Z",
+                "completed_at":"2026-08-01T00:00:01Z"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(record.tool_policy, None);
+        assert_eq!(record.allowed_tools, None);
+    }
+
+    #[test]
+    fn execution_record_distinguishes_empty_and_unknown_tool_inventory() {
+        let record: ExecutionRecord = serde_json::from_str(
+            r#"{
+                "orb_id":"orb-1",
+                "parent_id":null,
+                "dispatch_kind":"execute",
+                "tool_policy":"execute",
+                "allowed_tools":[],
+                "status":"done",
+                "dispatched_at":"2026-08-01T00:00:00Z",
+                "completed_at":"2026-08-01T00:00:01Z"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(record.tool_policy.as_deref(), Some("execute"));
+        assert_eq!(record.allowed_tools, Some(Vec::new()));
     }
 }

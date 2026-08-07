@@ -16,7 +16,9 @@ use tracing::{info, warn};
 
 use crate::bench::case::{BenchCase, BenchExpected, BenchTier, DEFAULT_TIMEOUT_S};
 use crate::bench::prompts::PromptManifest;
-use crate::bench::store::{BenchResult, BenchRun, BenchStatus, BenchStore, new_run_id};
+use crate::bench::store::{
+    BenchResult, BenchRun, BenchStatus, BenchStore, BenchSuiteManifest, new_run_id,
+};
 use crate::ipc::types::{ResultStatus, RuntimeMode, RuntimePlacementConfig};
 use crate::routing::profile::builtin_tools;
 use crate::worker::process::{SendOutcome, Worker, WorkerConfig};
@@ -125,6 +127,7 @@ pub fn timeout_bench_result(
         score: 0.0,
         process_score: None,
         process_annotations: Vec::new(),
+        resource_guidance: case.resource_guidance.clone(),
         latency_ms: u64::from(timeout_s).saturating_mul(1000),
         model_latency_ms: None,
         tool_latency_ms: None,
@@ -161,6 +164,7 @@ pub struct BenchRunConfig {
     pub grader_model: Option<String>,
     pub prompt_variant: Option<String>,
     pub prompt_manifest: Option<PromptManifest>,
+    pub suite_manifest: Option<BenchSuiteManifest>,
     pub cases_root: Option<String>,
     pub bench_config_path: Option<String>,
     pub orboros_commit: Option<String>,
@@ -177,7 +181,7 @@ impl BenchRunConfig {
     #[must_use]
     pub fn config_hash_input(&self, base_worker_config: &WorkerConfig) -> String {
         format!(
-            "variant={:?}\nmodel_selector={:?}\nmodel_key={:?}\nworker_model={:?}\ngrader_model={:?}\nprompt_variant={:?}\nprompt_manifest={:?}\ncases_root={:?}\nbench_config_path={:?}\norboros_commit={:?}\nbench_commit={:?}\norboros_dirty={:?}\nbench_dirty={:?}\ntimeout_s={:?}\nmax_iterations={:?}\nworker_command={}\nsystem_prompt={}",
+            "variant={:?}\nmodel_selector={:?}\nmodel_key={:?}\nworker_model={:?}\ngrader_model={:?}\nprompt_variant={:?}\nprompt_manifest={:?}\nbench_config_path={:?}\ntimeout_s={:?}\nmax_iterations={:?}\nworker_command={}\nsystem_prompt={}",
             self.variant,
             self.model_selector,
             self.model_key,
@@ -185,12 +189,7 @@ impl BenchRunConfig {
             self.grader_model,
             self.prompt_variant,
             self.prompt_manifest,
-            self.cases_root,
             self.bench_config_path,
-            self.orboros_commit,
-            self.bench_commit,
-            self.orboros_dirty,
-            self.bench_dirty,
             self.timeout_s,
             self.max_iterations,
             base_worker_config.command,
@@ -464,6 +463,7 @@ pub async fn run_t1_case_with_artifacts(
         score,
         process_score: None,
         process_annotations: Vec::new(),
+        resource_guidance: case.resource_guidance.clone(),
         latency_ms: elapsed_ms,
         model_latency_ms,
         tool_latency_ms,
@@ -700,6 +700,7 @@ pub async fn run_t1_with_run_id(
         grader_model: run_config.grader_model.clone(),
         prompt_variant: run_config.prompt_variant.clone(),
         prompt_manifest: run_config.prompt_manifest.clone(),
+        suite_manifest: run_config.suite_manifest.clone(),
         cases_root: run_config.cases_root.clone(),
         bench_config_path: run_config.bench_config_path.clone(),
         orboros_commit: run_config.orboros_commit.clone(),
@@ -802,6 +803,7 @@ mod tests {
             score: 0.0,
             process_score: None,
             process_annotations: Vec::new(),
+            resource_guidance: None,
             latency_ms: 0,
             model_latency_ms: None,
             tool_latency_ms: None,
