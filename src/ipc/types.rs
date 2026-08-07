@@ -94,6 +94,13 @@ pub struct RoutingMetadata {
     pub grouping_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub routed_model: Option<String>,
+    /// Provider actually observed in a response, distinct from the requested
+    /// routing provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_upstream_provider: Option<String>,
+    /// Providers observed across a routed request. Empty for older workers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstream_provider_history: Vec<String>,
 }
 
 /// Effective runtime placement reported by Heddle.
@@ -255,6 +262,11 @@ pub enum WorkerEvent {
     },
     RoutedModel {
         model: String,
+    },
+    /// Provider observed by the upstream transport for the current request.
+    /// Heddle emits this independently of the requested routing metadata.
+    UpstreamProvider {
+        provider: String,
     },
     Error {
         message: String,
@@ -561,6 +573,31 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(resp, parsed);
+    }
+
+    #[test]
+    fn parses_heddle_upstream_provider_event() {
+        let response: IpcResponse = serde_json::from_str(
+            r#"{"type":"event","event":{"event":"upstream_provider","provider":"openai"},"event_seq":1,"send_id":"2"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            response,
+            IpcResponse::Event {
+                event: WorkerEvent::UpstreamProvider { provider },
+                ..
+            } if provider == "openai"
+        ));
+    }
+
+    #[test]
+    fn parses_heddle_effective_routing_metadata() {
+        let routing: RoutingMetadata = serde_json::from_str(
+            r#"{"upstream_provider":"openrouter","effective_upstream_provider":"openai","upstream_provider_history":["openai"]}"#,
+        )
+        .unwrap();
+        assert_eq!(routing.effective_upstream_provider.as_deref(), Some("openai"));
+        assert_eq!(routing.upstream_provider_history, ["openai"]);
     }
 
     #[test]

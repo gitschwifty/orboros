@@ -454,6 +454,7 @@ fn map_worker_event(turn_id: &TurnId, event: &WorkerEvent) -> Vec<SessionEvent> 
         | WorkerEvent::PermissionDenied { .. }
         | WorkerEvent::PlanComplete { .. }
         | WorkerEvent::RoutedModel { .. }
+        | WorkerEvent::UpstreamProvider { .. }
         | WorkerEvent::ContextPrune { .. }
         | WorkerEvent::ContextCompact {}
         | WorkerEvent::ContextHandoff {} => Vec::new(),
