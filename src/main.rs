@@ -264,6 +264,8 @@ enum BenchAction {
         #[arg(long)]
         case: Option<String>,
     },
+    /// Aggregate persisted dispatch telemetry across compatible historical runs.
+    ReportHistory,
     /// Inspect durable worker prompt snapshots from one benchmark run.
     Prompts {
         /// Run id, as printed by `bench run` or `bench list-runs`.
@@ -1149,6 +1151,7 @@ fn cmd_bench(
         BenchAction::Report { run_id, case } => {
             bench_cmd::cmd_bench_report(&store, &run_id, case.as_deref())
         }
+        BenchAction::ReportHistory => bench_cmd::cmd_bench_report_history(&store),
         BenchAction::Prompts { run_id, case, orb } => {
             bench_cmd::cmd_bench_prompts(&store, &run_id, &case, orb.as_deref())
         }

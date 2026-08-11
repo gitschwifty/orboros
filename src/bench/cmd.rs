@@ -356,13 +356,14 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
 
 async fn cmd_bench_run_parallel(
     req: BenchRunRequest<'_>,
-    cases: Vec<BenchCase>,
+    mut cases: Vec<BenchCase>,
     case_labels: HashMap<String, (String, String)>,
     resource_guidance: HashMap<String, crate::bench::case::BenchResourceGuidance>,
     run_config: BenchRunConfig,
 ) -> anyhow::Result<()> {
     use tokio::task::JoinSet;
 
+    cases.sort_by(|left, right| left.selector.cmp(&right.selector));
     let opts = RunOptions {
         no_budget: req.no_budget,
         timeout_s: req.timeout_s,
@@ -815,6 +816,78 @@ pub fn cmd_bench_report(
     }
     print_tool_policy_report(&records, &case_labels);
     print_prompt_context_report(store, run_id, case_id, &case_labels)?;
+    Ok(())
+}
+
+/// Aggregates canonical dispatch ledgers across historical runs that share a
+/// suite, prompt, worker-model, and config identity. Runs without a retained
+/// suite identity stay in their own compatibility group rather than being
+/// silently compared to newer data.
+pub fn cmd_bench_report_history(store: &BenchStore) -> anyhow::Result<()> {
+    let runs = store.read_runs()?;
+    let mut groups = BTreeMap::<
+        (String, String, String, String),
+        Vec<(BenchRun, Vec<BenchDispatchRecord>)>,
+    >::new();
+    for run in runs {
+        let records = store.read_dispatches(&run.run_id)?;
+        if records.is_empty() {
+            continue;
+        }
+        let suite = run.suite_manifest.as_ref().map_or_else(
+            || format!("historical:{}", run.run_id),
+            |manifest| manifest.fingerprint.clone(),
+        );
+        let prompt = run.prompt_variant.clone().unwrap_or_else(|| "-".into());
+        let model = run.worker_model.clone().unwrap_or_else(|| "-".into());
+        groups
+            .entry((suite, prompt, model, run.config_hash.clone()))
+            .or_default()
+            .push((run, records));
+    }
+    if groups.is_empty() {
+        anyhow::bail!("no saved runs with persisted dispatch telemetry");
+    }
+
+    println!("== historical dispatch report ==");
+    for ((suite, prompt, model, config), runs) in groups {
+        let mut records = Vec::new();
+        for (_, run_records) in &runs {
+            records.extend(run_records.iter().cloned());
+        }
+        println!(
+            "\n-- runs={} suite={} prompt={} model={} config={} dispatches={} --",
+            runs.len(),
+            short_hash(&suite),
+            prompt,
+            model,
+            short_hash(&config),
+            records.len(),
+        );
+        let summaries = summarize_dispatches(&records);
+        for ((case_id, kind), summary) in summaries {
+            let total = summary
+                .done
+                .saturating_add(summary.failed)
+                .saturating_add(summary.errors);
+            let pass_rate = if total == 0 {
+                0.0
+            } else {
+                f64::from(summary.done) / f64::from(total)
+            };
+            println!(
+                "{case_id:<28} {kind:<18} runs={total:>3} done={done:>3} error={error:>3} pass={pass_rate:>5.1}% retry={retries:>3} in={input:>8} cache_r={cache:>8} cost={cost:>10} wall={wall:>9}",
+                done = summary.done,
+                error = summary.errors,
+                retries = summary.retries,
+                input = display_count(summary.prompt_tokens),
+                cache = display_count(summary.cache_read_tokens),
+                cost = format_cost(summary.cost_micros, None),
+                wall = format_elapsed_ms(summary.wall_ms),
+                pass_rate = pass_rate * 100.0,
+            );
+        }
+    }
     Ok(())
 }
 
@@ -2333,7 +2406,7 @@ done
                 .iter()
                 .map(|result| result.case_id.as_str())
                 .collect::<Vec<_>>(),
-            ["case-b", "case-a"],
+            ["case-a", "case-b"],
         );
     }
 
