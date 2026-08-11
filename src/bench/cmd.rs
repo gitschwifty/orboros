@@ -5,7 +5,7 @@
 //! style mirrors the rest of the CLI surface in `orb_cmd` and
 //! `hooks::cmd`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -16,8 +16,8 @@ use sha2::{Digest, Sha256};
 use crate::bench::case::{load_all, load_tier, BenchCase, BenchTier, DEFAULT_TIMEOUT_S};
 use crate::bench::prompts::BenchPromptSet;
 use crate::bench::runner::{
-    effective_timeout_s, is_fatal_worker_error, run_t1_with_run_id, timeout_bench_result,
-    BenchRunConfig, RunOptions,
+    effective_timeout_s, is_fatal_worker_error, run_t1_case_with_artifacts, run_t1_with_run_id,
+    timeout_bench_result, BenchRunConfig, RunOptions,
 };
 use crate::bench::store::{
     BenchDispatchRecord, BenchPromptRecord, BenchResult, BenchRun, BenchStatus, BenchStore,
@@ -32,10 +32,19 @@ pub struct BenchRunRequest<'a> {
     pub case_id: Option<&'a str>,
     pub worker_config: &'a WorkerConfig,
     pub no_budget: bool,
+    /// Maximum independent benchmark cases in flight. One preserves the
+    /// historical serial behavior.
+    pub jobs: usize,
     pub timeout_s: Option<u32>,
     pub max_iterations: Option<u32>,
     pub run_config: &'a BenchRunConfig,
     pub prompt_set: Option<&'a BenchPromptSet>,
+}
+
+struct CaseCompletion {
+    index: usize,
+    artifact_dir: PathBuf,
+    result: BenchResult,
 }
 
 /// Prints every case in the corpus, grouped by tier.
@@ -117,6 +126,14 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
         .collect();
     let mut run_config = req.run_config.clone();
     run_config.suite_manifest = Some(build_suite_manifest(&cases, req.prompt_set)?);
+
+    if req.jobs == 0 {
+        anyhow::bail!("--jobs must be at least 1");
+    }
+    if req.jobs > 1 {
+        return cmd_bench_run_parallel(req, cases, case_labels, resource_guidance, run_config)
+            .await;
+    }
 
     // Split by tier and dispatch. Today only T1 actually runs the
     // pipeline; T2/T3 fall through to scaffolded error rows.
@@ -335,6 +352,229 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
         println!("\nRun id: {id}");
     }
     Ok(())
+}
+
+async fn cmd_bench_run_parallel(
+    req: BenchRunRequest<'_>,
+    cases: Vec<BenchCase>,
+    case_labels: HashMap<String, (String, String)>,
+    resource_guidance: HashMap<String, crate::bench::case::BenchResourceGuidance>,
+    run_config: BenchRunConfig,
+) -> anyhow::Result<()> {
+    use tokio::task::JoinSet;
+
+    let opts = RunOptions {
+        no_budget: req.no_budget,
+        timeout_s: req.timeout_s,
+        max_iterations: req.max_iterations,
+    };
+    let run_id = crate::bench::store::new_run_id();
+    let run_started_at = Utc::now();
+    crate::bench::log::start(&req.store.run_dir(&run_id).join("cli.log"))?;
+    println!(
+        "Running {} benchmark case(s) with {} case jobs. Nested T2 orb dispatches may use additional workers.",
+        cases.len(),
+        req.jobs
+    );
+    tracing::info!(run_id = %run_id, jobs = req.jobs, "parallel benchmark run logging started");
+
+    let mut pending = cases.into_iter().enumerate().collect::<VecDeque<_>>();
+    let mut in_flight = JoinSet::new();
+    let mut completions = Vec::new();
+    let mut stop_scheduling = false;
+
+    loop {
+        while !stop_scheduling && in_flight.len() < req.jobs {
+            let Some((index, case)) = pending.pop_front() else {
+                break;
+            };
+            let artifact_dir = req.store.case_artifact_dir(&run_id, &case.id);
+            in_flight.spawn(run_case(
+                index,
+                case,
+                run_id.clone(),
+                req.worker_config.clone(),
+                opts.clone(),
+                artifact_dir,
+                req.prompt_set.cloned(),
+            ));
+        }
+
+        let Some(joined) = in_flight.join_next().await else {
+            break;
+        };
+        let completion =
+            joined.map_err(|error| anyhow::anyhow!("benchmark case task failed: {error}"))?;
+        if is_fatal_worker_error(&completion.result) {
+            stop_scheduling = true;
+            eprintln!(
+                "fatal worker/provider error: no further benchmark cases will be scheduled; waiting for {} in-flight case(s)",
+                in_flight.len()
+            );
+        }
+        completions.push(completion);
+    }
+
+    completions.sort_by_key(|completion| completion.index);
+    let mut all_results = Vec::with_capacity(completions.len());
+    for completion in completions {
+        persist_case_evidence(req.store, &run_id, &completion)?;
+        if completion.result.status == BenchStatus::Error {
+            tracing::warn!(
+                run_id = %completion.result.run_id,
+                case = %completion.result.case_id,
+                tier = ?completion.result.tier,
+                error = %completion.result.error.as_deref().unwrap_or("unknown error"),
+                "benchmark case errored"
+            );
+        }
+        req.store.append_result(&completion.result)?;
+        all_results.push(completion.result);
+    }
+
+    if let Some(prompt_set) = req.prompt_set {
+        prompt_set.copy_to_run(&req.store.run_dir(&run_id))?;
+    }
+    let run = summarize_run(
+        &run_id,
+        run_started_at,
+        common_tier(&all_results),
+        &all_results,
+        &run_config,
+        req.worker_config,
+    );
+    req.store.append_run(&run)?;
+    print_completed_run(&run, &all_results, &case_labels, &resource_guidance);
+    println!("\nRun id: {run_id}");
+    Ok(())
+}
+
+fn persist_case_evidence(
+    store: &BenchStore,
+    run_id: &str,
+    completion: &CaseCompletion,
+) -> anyhow::Result<()> {
+    let ledger = crate::execution::ExecutionStore::new(
+        completion
+            .artifact_dir
+            .join("workdir")
+            .join(".orbs")
+            .join("executions.jsonl"),
+    );
+    store.append_dispatches(run_id, &completion.result.case_id, &ledger.read_all()?)?;
+    let prompt_ledger = crate::execution::PromptStore::new(
+        completion
+            .artifact_dir
+            .join("workdir")
+            .join(".orbs")
+            .join("prompts.jsonl"),
+    );
+    store.append_prompts(
+        run_id,
+        &completion.result.case_id,
+        &prompt_ledger.read_all()?,
+    )?;
+    store.retain_orb_state(
+        run_id,
+        &completion.result.case_id,
+        &completion.artifact_dir.join("workdir").join(".orbs"),
+    )?;
+    Ok(())
+}
+
+async fn run_case(
+    index: usize,
+    case: BenchCase,
+    run_id: String,
+    worker_config: WorkerConfig,
+    opts: RunOptions,
+    artifact_dir: PathBuf,
+    prompt_set: Option<BenchPromptSet>,
+) -> CaseCompletion {
+    let timeout_s = effective_timeout_s(&case, &opts);
+    let result = match case.tier {
+        BenchTier::T1 => match tokio::time::timeout(
+            Duration::from_secs(u64::from(timeout_s)),
+            run_t1_case_with_artifacts(&case, &run_id, &worker_config, &opts, Some(&artifact_dir)),
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => error_bench_result(&case, &run_id, error),
+            Err(_) => timeout_bench_result(&case, &run_id, &worker_config.model, timeout_s),
+        },
+        BenchTier::T2 => match tokio::time::timeout(
+            Duration::from_secs(u64::from(timeout_s)),
+            crate::bench::runner_t2t3::run_t2_case(
+                &case,
+                &run_id,
+                &worker_config,
+                &opts,
+                Some(&artifact_dir),
+                prompt_set.as_ref(),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => error_bench_result(&case, &run_id, error),
+            Err(_) => timeout_bench_result(&case, &run_id, &worker_config.model, timeout_s),
+        },
+        BenchTier::T3 => {
+            match tokio::time::timeout(Duration::from_secs(u64::from(timeout_s)), async {
+                crate::bench::runner_t2t3::run_t3_case_stub(&case, &run_id, &opts)
+            })
+            .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => error_bench_result(&case, &run_id, error),
+                Err(_) => timeout_bench_result(&case, &run_id, &worker_config.model, timeout_s),
+            }
+        }
+    };
+    CaseCompletion {
+        index,
+        artifact_dir,
+        result,
+    }
+}
+
+fn error_bench_result(
+    case: &BenchCase,
+    run_id: &str,
+    error: impl std::fmt::Display,
+) -> BenchResult {
+    BenchResult {
+        case_id: case.id.clone(),
+        run_id: run_id.into(),
+        tier: case.tier,
+        status: BenchStatus::Error,
+        score: 0.0,
+        process_score: None,
+        process_annotations: Vec::new(),
+        resource_guidance: case.resource_guidance.clone(),
+        latency_ms: 0,
+        model_latency_ms: None,
+        tool_latency_ms: None,
+        total_latency_ms: None,
+        cost_cents: None,
+        cost_micros: None,
+        iterations: 0,
+        assistant_turns: None,
+        tool_calls: None,
+        prompt_tokens: None,
+        completion_tokens: None,
+        total_tokens: None,
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        worker_model: String::new(),
+        prompt_hash: crate::bench::runner::prompt_hash(&case.prompt),
+        system_prompt_hash: None,
+        system_prompt_source: None,
+        confidence: None,
+        output: None,
+        error: Some(error.to_string()),
+    }
 }
 
 fn build_suite_manifest(
@@ -1910,6 +2150,8 @@ mod tests {
     use crate::bench::case::{BenchExpected, BenchResourceGuidance, BenchResourceThreshold};
     use crate::bench::store::BenchResult;
     use chrono::Utc;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
 
     fn sample_result(case_id: &str, run_id: &str, status: BenchStatus) -> BenchResult {
         BenchResult {
@@ -1986,6 +2228,113 @@ mod tests {
             assistant_turns: None,
             tool_calls: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn parallel_case_jobs_overlap_and_persist_in_selector_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("slow-worker.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  type=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['type'])")
+  id=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['id'])")
+  case "$type" in
+    init) echo '{"type":"init_ok","id":"'"$id"'","session_id":"s","protocol_version":"0.4.0"}' ;;
+    send) sleep 0.10; echo '{"type":"result","id":"'"$id"'","status":"ok","response":"ok","tool_calls_made":[],"iterations":1}' ;;
+    shutdown) echo '{"type":"shutdown_ok","id":"'"$id"'"}'; exit 0 ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let make_case = |id: &str, selector: &str| BenchCase {
+            id: id.into(),
+            tier: BenchTier::T1,
+            name: id.into(),
+            description: "test".into(),
+            prompt: "reply ok".into(),
+            expected: BenchExpected::Exact { text: "ok".into() },
+            runner: None,
+            timeout_s: Some(10),
+            max_iterations: Some(1),
+            max_cost_cents: 100,
+            tool_policy: None,
+            process: None,
+            resource_guidance: None,
+            selector: selector.into(),
+            case_dir: dir.path().to_path_buf(),
+            fixture_dir: None,
+            test_overlay_dir: None,
+        };
+        let cases = vec![make_case("case-b", "t1.002"), make_case("case-a", "t1.001")];
+        let store = BenchStore::new(dir.path().join("results"));
+        let worker_config = WorkerConfig {
+            command: "bash".into(),
+            args: vec![script.to_string_lossy().into()],
+            cwd: None,
+            env: vec![],
+            model: "mock/parallel".into(),
+            system_prompt: String::new(),
+            tools: vec![],
+            max_iterations: Some(1),
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
+            runtime: None,
+            routing: None,
+        };
+        let request = BenchRunRequest {
+            bench_root: dir.path(),
+            store: &store,
+            tier: Some(BenchTier::T1),
+            case_id: None,
+            worker_config: &worker_config,
+            no_budget: false,
+            jobs: 2,
+            timeout_s: Some(10),
+            max_iterations: Some(1),
+            run_config: &BenchRunConfig::default(),
+            prompt_set: None,
+        };
+        let labels = HashMap::from([
+            ("case-b".into(), ("t1.002".into(), "case-b".into())),
+            ("case-a".into(), ("t1.001".into(), "case-a".into())),
+        ]);
+
+        let started = Instant::now();
+        cmd_bench_run_parallel(
+            request,
+            cases,
+            labels,
+            HashMap::new(),
+            BenchRunConfig::default(),
+        )
+        .await
+        .unwrap();
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap();
+        let run_id = store.read_runs().unwrap().pop().unwrap().run_id;
+        let results = store.read_results(&run_id).unwrap();
+        let summed_case_latency = results.iter().map(|result| result.latency_ms).sum::<u64>();
+        assert!(
+            summed_case_latency > elapsed_ms.saturating_mul(3) / 2,
+            "expected overlapping case work: summed={summed_case_latency}ms, wall={elapsed_ms}ms"
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.case_id.as_str())
+                .collect::<Vec<_>>(),
+            ["case-b", "case-a"],
+        );
     }
 
     #[test]

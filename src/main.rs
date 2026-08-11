@@ -236,6 +236,9 @@ enum BenchAction {
         /// Skip the per-case cost ceiling (`max_cost_cents`).
         #[arg(long)]
         no_budget: bool,
+        /// Maximum benchmark cases to run concurrently. Defaults to serial execution.
+        #[arg(long, default_value_t = 1)]
+        jobs: usize,
     },
     /// Print every result row in a saved run.
     Show {
@@ -1046,6 +1049,7 @@ fn cmd_bench(
             variant,
             prompt_set,
             no_budget,
+            jobs,
         } => {
             let tier = match tier.as_deref() {
                 None => None,
@@ -1131,6 +1135,7 @@ fn cmd_bench(
                 case_id: case.as_deref(),
                 worker_config: &worker_config,
                 no_budget,
+                jobs,
                 timeout_s: cfg.bench.timeout_s,
                 max_iterations: cfg.bench.max_iterations,
                 run_config: &run_config,
