@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::worker::dispatcher::{DispatchOutcome, DispatchStatus};
+use crate::worker::dispatcher::{DispatchOutcome, DispatchStatus, TerminalRetryDiagnostic};
 
 /// Character-level attribution for Orboros-owned prompt construction.
 ///
@@ -86,6 +86,10 @@ pub struct ExecutionRecord {
     /// original dispatch remains an unmodified account of what it returned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decomposition_repair: Option<DecompositionRepairDiagnostic>,
+    /// Evidence for a single fresh-worker retry after Heddle reported a
+    /// structured terminal loop or iteration limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_retry: Option<TerminalRetryDiagnostic>,
 }
 
 /// Attribution for a bounded decomposition JSON repair attempt.
@@ -155,6 +159,7 @@ impl ExecutionRecord {
             retries: outcome.retries,
             prompt_context,
             decomposition_repair: None,
+            terminal_retry: outcome.terminal_retry.clone(),
         }
     }
 }

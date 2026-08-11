@@ -121,6 +121,109 @@ async fn dispatch_with_spawn_failure_returns_error_status() {
     assert!(outcome.response.is_none());
 }
 
+#[tokio::test]
+async fn dispatch_retries_one_structured_doom_loop_from_a_fresh_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let counter = dir.path().join("attempts");
+    let requests = dir.path().join("requests.jsonl");
+    let script = dir.path().join("doom-loop-once.sh");
+    fs::write(
+        &script,
+        format!(
+            r##"#!/bin/bash
+COUNTER='{counter}'
+REQUESTS='{requests}'
+while IFS= read -r line; do
+  type=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['type'])")
+  id=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['id'])")
+  case "$type" in
+    init)
+      attempt=$(cat "$COUNTER" 2>/dev/null || echo 0)
+      echo "$line" >> "$REQUESTS"
+      echo "{{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"session-$attempt\",\"protocol_version\":\"0.4.0\"}}"
+      ;;
+    send)
+      attempt=$(cat "$COUNTER" 2>/dev/null || echo 0)
+      echo "$line" >> "$REQUESTS"
+      if [ "$attempt" = 0 ]; then
+        echo 1 > "$COUNTER"
+        echo "{{\"type\":\"result\",\"id\":\"$id\",\"status\":\"error\",\"error\":{{\"code\":\"loop_detected\",\"message\":\"Doom loop detected\",\"retryable\":false}},\"tool_calls_made\":[],\"iterations\":3,\"failure\":{{\"code\":\"loop_detected\",\"termination_reason\":\"Doom loop detected: 3 iterations\",\"iterations\":3,\"tool_calls_made\":3,\"last_tool_name\":\"read_file\"}}}}"
+      else
+        echo "{{\"type\":\"result\",\"id\":\"$id\",\"status\":\"ok\",\"response\":\"recovered\",\"tool_calls_made\":[],\"iterations\":1}}"
+      fi
+      ;;
+    shutdown) echo "{{\"type\":\"shutdown_ok\",\"id\":\"$id\"}}"; exit 0 ;;
+  esac
+done
+"##,
+            counter = counter.display(),
+            requests = requests.display(),
+        ),
+    )
+    .unwrap();
+    make_executable(&script);
+
+    let mut wc = worker_config(&script);
+    wc.tools = vec!["read_file".into()];
+    wc.max_iterations = Some(7);
+    let outcome = dispatch_orb(&active_orb(), "repair this task", &wc, None)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, DispatchStatus::Done);
+    assert_eq!(outcome.response.as_deref(), Some("recovered"));
+    assert_eq!(outcome.retries, 1);
+    let retry = outcome.terminal_retry.expect("terminal retry diagnostic");
+    assert_eq!(retry.initial_failure.code, "loop_detected");
+    assert!(retry.retry_attempted);
+    assert_ne!(retry.initial_worker_id, retry.retry_worker_id);
+    assert_ne!(retry.initial_session_id, retry.retry_session_id);
+
+    let requests = fs::read_to_string(requests).unwrap();
+    assert_eq!(requests.matches("\"type\":\"init\"").count(), 2);
+    assert_eq!(requests.matches("\"tools\":[\"read_file\"]").count(), 2);
+    assert_eq!(requests.matches("\"max_iterations\":7").count(), 2);
+    assert!(requests.contains("previous worker stopped before completing"));
+}
+
+#[tokio::test]
+async fn dispatch_does_not_retry_an_ineligible_structured_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let counter = dir.path().join("attempts");
+    let script = dir.path().join("permission-denied.sh");
+    fs::write(
+        &script,
+        format!(
+            r##"#!/bin/bash
+COUNTER='{counter}'
+while IFS= read -r line; do
+  type=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['type'])")
+  id=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['id'])")
+  case "$type" in
+    init) echo "{{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"s\",\"protocol_version\":\"0.4.0\"}}" ;;
+    send)
+      echo x >> "$COUNTER"
+      echo "{{\"type\":\"result\",\"id\":\"$id\",\"status\":\"error\",\"error\":{{\"code\":\"tool_error\",\"message\":\"permission denied\",\"retryable\":false}},\"tool_calls_made\":[],\"iterations\":1,\"failure\":{{\"code\":\"tool_error\",\"termination_reason\":\"permission denied\",\"iterations\":1,\"tool_calls_made\":1}}}}"
+      ;;
+    shutdown) echo "{{\"type\":\"shutdown_ok\",\"id\":\"$id\"}}"; exit 0 ;;
+  esac
+done
+"##,
+            counter = counter.display(),
+        ),
+    )
+    .unwrap();
+    make_executable(&script);
+
+    let outcome = dispatch_orb(&active_orb(), "x", &worker_config(&script), None)
+        .await
+        .unwrap();
+    assert_eq!(outcome.status, DispatchStatus::Error);
+    assert_eq!(outcome.retries, 0);
+    assert!(outcome.terminal_retry.is_none());
+    assert_eq!(fs::read_to_string(counter).unwrap().lines().count(), 1);
+}
+
 // ── Hook firing (60.7) ───────────────────────────────────────────
 
 use orboros::hooks::sink::HookSink;

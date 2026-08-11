@@ -18,6 +18,7 @@ use tracing::{info, instrument, warn};
 use crate::hooks::event::HookEvent;
 use crate::hooks::runner::{FireCtx, FireOutcome};
 use crate::hooks::sink::HookSink;
+use crate::ipc::types::FailureDetails;
 use crate::routing::profile::builtin_tools;
 use crate::worker::process::{Worker, WorkerConfig};
 
@@ -27,6 +28,13 @@ const RETRY_PROMPT_ADDENDUM: &str = concat!(
     "First inspect the current relevant changes and state; preserve correct work, ",
     "then continue the assigned task and verify it as appropriate. Do not assume the ",
     "checkout is pristine or redo work blindly."
+);
+
+const TERMINAL_RETRY_PROMPT_ADDENDUM: &str = concat!(
+    "\nA previous worker stopped before completing because Heddle detected a terminal ",
+    "runtime loop or iteration limit. This is a fresh worker, not a resumed session. ",
+    "Inspect the current repository state first, preserve useful partial progress, and ",
+    "complete the assigned task. Avoid repeating the prior unproductive tool pattern."
 );
 
 /// Reduced view of a worker's `SendOutcome` keyed to what the orb
@@ -58,6 +66,9 @@ pub struct DispatchOutcome {
     pub confidence: Option<f32>,
     pub worker_model: String,
     pub worker_id: Option<String>,
+    /// Heddle session that produced the final result, when initialization
+    /// completed. Used to attribute fresh-worker recovery attempts.
+    pub session_id: Option<String>,
     pub model_latency_ms: Option<u64>,
     pub tool_latency_ms: Option<u64>,
     pub total_latency_ms: Option<u64>,
@@ -78,6 +89,23 @@ pub struct DispatchOutcome {
     pub system_prompt_hash: Option<String>,
     pub system_prompt_source: Option<String>,
     pub error: Option<String>,
+    /// Structured terminal failure reported by the final worker attempt.
+    pub failure: Option<FailureDetails>,
+    /// Evidence for the one permitted recovery from a terminal Heddle loop or
+    /// iteration-limit result. `None` means this dispatch never used that path.
+    pub terminal_retry: Option<TerminalRetryDiagnostic>,
+}
+
+/// Attribution for a bounded fresh-worker retry after Heddle ends a session
+/// with a structured terminal runtime failure.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TerminalRetryDiagnostic {
+    pub initial_failure: FailureDetails,
+    pub initial_worker_id: Option<String>,
+    pub initial_session_id: Option<String>,
+    pub retry_attempted: bool,
+    pub retry_worker_id: Option<String>,
+    pub retry_session_id: Option<String>,
 }
 
 impl DispatchOutcome {
@@ -94,6 +122,7 @@ impl DispatchOutcome {
             confidence: None,
             worker_model,
             worker_id: None,
+            session_id: None,
             model_latency_ms: None,
             tool_latency_ms: None,
             total_latency_ms: None,
@@ -114,6 +143,8 @@ impl DispatchOutcome {
             system_prompt_hash: None,
             system_prompt_source: None,
             error: Some(reason),
+            failure: None,
+            terminal_retry: None,
         }
     }
 }
@@ -212,23 +243,51 @@ async fn dispatch_orb_with_retry_limit(
     );
 
     let mut attempt = 0;
+    let mut terminal_retry = None;
     let mut outcome = loop {
+        let retry_is_terminal = terminal_retry.is_some();
         let attempt_prompt = if attempt == 0 {
             std::borrow::Cow::Borrowed(prompt)
+        } else if retry_is_terminal {
+            std::borrow::Cow::Owned(format!("{prompt}{TERMINAL_RETRY_PROMPT_ADDENDUM}"))
         } else {
             std::borrow::Cow::Owned(format!("{prompt}{RETRY_PROMPT_ADDENDUM}"))
         };
-        let (outcome, retryable) = match Worker::spawn(worker_config).await {
+        let mut attempt_config = worker_config.clone();
+        if attempt > 0 {
+            attempt_config.worker_id = Some(uuid::Uuid::new_v4().to_string());
+        }
+        let (outcome, retry_kind) = match Worker::spawn(&attempt_config).await {
             Ok(mut worker) => match worker.send(&send_id, &attempt_prompt).await {
                 Ok(send_outcome) => {
                     let retryable = send_outcome
                         .error
                         .as_ref()
                         .is_some_and(|error| error.retryable);
+                    let terminal_failure = terminal_retry_candidate(&send_outcome);
+                    let session_id = Some(worker.session_id().to_string());
                     let _ = worker.shutdown().await;
                     (
-                        build_outcome(worker_config, dispatched_at, Utc::now(), send_outcome),
-                        retryable,
+                        build_outcome(
+                            &attempt_config,
+                            dispatched_at,
+                            Utc::now(),
+                            session_id.clone(),
+                            send_outcome,
+                        ),
+                        terminal_failure.map_or_else(
+                            || retryable.then_some(RetryKind::Transient),
+                            |failure| {
+                                Some(RetryKind::Terminal(TerminalRetryDiagnostic {
+                                    initial_failure: failure,
+                                    initial_worker_id: attempt_config.worker_id.clone(),
+                                    initial_session_id: session_id,
+                                    retry_attempted: true,
+                                    retry_worker_id: None,
+                                    retry_session_id: None,
+                                }))
+                            },
+                        ),
                     )
                 }
                 Err(e) => {
@@ -237,12 +296,12 @@ async fn dispatch_orb_with_retry_limit(
                     let _ = worker.shutdown().await;
                     (
                         build_failure(
-                            worker_config,
+                            &attempt_config,
                             dispatched_at,
                             Utc::now(),
                             format!("worker send failed: {e}"),
                         ),
-                        retryable,
+                        retryable.then_some(RetryKind::Transient),
                     )
                 }
             },
@@ -251,23 +310,38 @@ async fn dispatch_orb_with_retry_limit(
                     == crate::worker::fsm::RestartPolicy::RetryOnce;
                 (
                     build_failure(
-                        worker_config,
+                        &attempt_config,
                         dispatched_at,
                         Utc::now(),
                         format!("worker spawn failed: {e}"),
                     ),
-                    retryable,
+                    retryable.then_some(RetryKind::Transient),
                 )
             }
         };
-        if retryable && attempt < retry_limit {
+        if let Some(retry_kind) = retry_kind.filter(|_| attempt < retry_limit) {
+            if let RetryKind::Terminal(mut diagnostic) = retry_kind {
+                // The next loop iteration assigns a new worker ID and spawns
+                // a new process. Fill its identity from that final outcome.
+                diagnostic.retry_worker_id = None;
+                terminal_retry = Some(diagnostic);
+            }
             attempt = 1;
-            warn!(orb = %orb.id, "retrying whole worker dispatch after retryable error");
+            warn!(orb = %orb.id, terminal = terminal_retry.is_some(), "retrying whole worker dispatch from a fresh worker");
             continue;
         }
         break outcome;
     };
     outcome.retries = attempt;
+    if let Some(mut diagnostic) = terminal_retry {
+        diagnostic.retry_worker_id.clone_from(&outcome.worker_id);
+        diagnostic.retry_session_id.clone_from(&outcome.session_id);
+        // A Heddle session is always created during successful spawn. The
+        // dispatcher intentionally spawns a new process per attempt, so a
+        // distinct worker ID is durable attribution even for older protocol
+        // workers that omit the result session ID.
+        outcome.terminal_retry = Some(diagnostic);
+    }
 
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     info!(
@@ -309,6 +383,7 @@ fn build_outcome(
     worker_config: &WorkerConfig,
     dispatched_at: chrono::DateTime<Utc>,
     completed_at: chrono::DateTime<Utc>,
+    session_id: Option<String>,
     send: crate::worker::process::SendOutcome,
 ) -> DispatchOutcome {
     use crate::ipc::types::ResultStatus;
@@ -325,6 +400,7 @@ fn build_outcome(
         confidence: send.confidence,
         worker_model: worker_config.model.clone(),
         worker_id: worker_config.worker_id.clone(),
+        session_id,
         model_latency_ms: send.model_latency_ms,
         tool_latency_ms: send.tool_latency_ms,
         total_latency_ms: send.total_latency_ms,
@@ -345,6 +421,8 @@ fn build_outcome(
         system_prompt_hash: None,
         system_prompt_source: None,
         error,
+        failure: send.failure,
+        terminal_retry: None,
     }
 }
 
@@ -361,6 +439,7 @@ fn build_failure(
         confidence: None,
         worker_model: worker_config.model.clone(),
         worker_id: worker_config.worker_id.clone(),
+        session_id: None,
         model_latency_ms: None,
         tool_latency_ms: None,
         total_latency_ms: None,
@@ -381,7 +460,26 @@ fn build_failure(
         system_prompt_hash: None,
         system_prompt_source: None,
         error: Some(message),
+        failure: None,
+        terminal_retry: None,
     }
+}
+
+enum RetryKind {
+    Transient,
+    Terminal(TerminalRetryDiagnostic),
+}
+
+fn terminal_retry_candidate(send: &crate::worker::process::SendOutcome) -> Option<FailureDetails> {
+    if send.status != crate::ipc::types::ResultStatus::Error {
+        return None;
+    }
+    let failure = send.failure.as_ref()?;
+    is_terminal_retry_code(&failure.code).then(|| failure.clone())
+}
+
+fn is_terminal_retry_code(code: &str) -> bool {
+    matches!(code, "loop_detected" | "doom_loop" | "max_iterations")
 }
 
 /// Attaches prompt identity to a dispatch outcome before it is
@@ -646,6 +744,7 @@ mod tests {
             confidence: Some(0.82),
             worker_model: "anthropic/claude-sonnet-4-6".into(),
             worker_id: Some("w-1".into()),
+            session_id: Some("session-1".into()),
             model_latency_ms: Some(150),
             tool_latency_ms: Some(20),
             total_latency_ms: Some(170),
@@ -666,6 +765,8 @@ mod tests {
             system_prompt_hash: Some("abc123".into()),
             system_prompt_source: Some("built_in".into()),
             error: None,
+            failure: None,
+            terminal_retry: None,
         }
     }
 
@@ -751,6 +852,15 @@ mod tests {
         assert!(prompt.starts_with("task text"));
         assert!(prompt.contains("partial progress"));
         assert!(prompt.contains("Do not assume the checkout is pristine"));
+    }
+
+    #[test]
+    fn terminal_retry_policy_is_limited_to_explicit_heddle_codes() {
+        assert!(is_terminal_retry_code("loop_detected"));
+        assert!(is_terminal_retry_code("doom_loop"));
+        assert!(is_terminal_retry_code("max_iterations"));
+        assert!(!is_terminal_retry_code("tool_error"));
+        assert!(!is_terminal_retry_code("cancelled"));
     }
 
     // ── apply_dispatch_outcome — Cancelled ────────────────────

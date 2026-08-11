@@ -302,7 +302,13 @@ for that worker role. Built-ins are `coordinator`/`review` (read-only), `test`
 (read-only plus `bash`), `research` (read/web/write artifact), `edit`, and the
 benchmark roles `bench_t1` (none) and `bench_t2` (edit capability). A `default`
 profile applies when no exact worker-type profile exists. `tools: []` is an
-explicit no-tool allowlist, not a request for Heddle defaults.
+explicit no-tool allowlist, not a request for Heddle defaults. The dispatched
+inventory is a capability boundary: Heddle rejects tools that are not listed,
+excludes generated/VCS trees from broad repository discovery unless they are
+explicitly targeted, and bounds retained tool output before it can grow later
+worker context. Orboros records each dispatch's resolved inventory in the
+execution ledger so benchmark evidence can distinguish the permitted policy
+from a worker's attempted tool calls.
 
 `routing.toml` is legacy and remains only as a fallback reader for old tool
 profile files.
