@@ -10,6 +10,18 @@ const FIELD_MAX_CHARS: usize = 1_200;
 const RESULT_MAX_CHARS: usize = 800;
 const LIST_MAX_ITEMS: usize = 8;
 
+/// A deterministic context ceiling for one dispatch role. The ceiling applies
+/// only to task context constructed by Orboros; Heddle/provider context is
+/// intentionally outside this accounting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextBudget {
+    pub max_chars: usize,
+}
+
+pub const CHILD_EXECUTION_CONTEXT_BUDGET: ContextBudget = ContextBudget { max_chars: 8_000 };
+pub const REVIEW_CONTEXT_BUDGET: ContextBudget = ContextBudget { max_chars: 6_000 };
+pub const PARENT_FINAL_CONTEXT_BUDGET: ContextBudget = ContextBudget { max_chars: 10_000 };
+
 /// Builds task-specific context for an orb worker invocation.
 ///
 /// Heddle owns project-level context such as `AGENTS.md`. This helper
@@ -36,17 +48,38 @@ pub fn build_orb_task_context_with_metrics(
     all_orbs: &[Orb],
     edges: &[DepEdge],
 ) -> BuiltTaskContext {
+    build_orb_task_context_with_budget(
+        orb,
+        all_orbs,
+        edges,
+        ContextBudget {
+            max_chars: usize::MAX,
+        },
+    )
+}
+
+/// Builds bounded task context. Sections are selected in caller-supplied
+/// priority order so a large low-priority sibling/child summary cannot crowd
+/// out the current task or direct dependency evidence.
+#[must_use]
+pub fn build_orb_task_context_with_budget(
+    orb: &Orb,
+    all_orbs: &[Orb],
+    edges: &[DepEdge],
+    budget: ContextBudget,
+) -> BuiltTaskContext {
     let mut out = String::from("## Orboros Task Context\n\n");
     let task_context_overhead_chars = char_count(&out);
-    let current_orb_chars = appended_chars(&mut out, |out| push_current_orb(out, orb));
-    let parent_and_root_chars = appended_chars(&mut out, |out| {
-        push_parent_and_root(out, orb, all_orbs);
-    });
-    let sibling_orbs_chars = appended_chars(&mut out, |out| push_siblings(out, orb, all_orbs));
-    let child_orbs_chars = appended_chars(&mut out, |out| push_children(out, orb, all_orbs));
-    let upstream_dependency_chars = appended_chars(&mut out, |out| {
-        push_upstream_dependencies(out, orb, all_orbs, edges);
-    });
+    let current = rendered(|out| push_current_orb(out, orb));
+    let parent = rendered(|out| push_parent_and_root(out, orb, all_orbs));
+    let siblings = rendered(|out| push_siblings(out, orb, all_orbs));
+    let children = rendered(|out| push_children(out, orb, all_orbs));
+    let dependencies = rendered(|out| push_upstream_dependencies(out, orb, all_orbs, edges));
+    let current_orb_chars = append_bounded(&mut out, &current, budget.max_chars);
+    let upstream_dependency_chars = append_bounded(&mut out, &dependencies, budget.max_chars);
+    let parent_and_root_chars = append_bounded(&mut out, &parent, budget.max_chars);
+    let child_orbs_chars = append_bounded(&mut out, &children, budget.max_chars);
+    let sibling_orbs_chars = append_bounded(&mut out, &siblings, budget.max_chars);
     let task_context_chars = char_count(&out);
     BuiltTaskContext {
         text: out,
@@ -63,10 +96,31 @@ pub fn build_orb_task_context_with_metrics(
     }
 }
 
-fn appended_chars(out: &mut String, append: impl FnOnce(&mut String)) -> u32 {
-    let before = out.chars().count();
-    append(out);
-    u32::try_from(out.chars().count().saturating_sub(before)).unwrap_or(u32::MAX)
+fn rendered(append: impl FnOnce(&mut String)) -> String {
+    let mut text = String::new();
+    append(&mut text);
+    text
+}
+
+fn append_bounded(out: &mut String, section: &str, max_chars: usize) -> u32 {
+    let used = out.chars().count();
+    let remaining = max_chars.saturating_sub(used);
+    if remaining == 0 || section.is_empty() {
+        return 0;
+    }
+    if section.chars().count() <= remaining {
+        out.push_str(section);
+    } else {
+        let marker = "\n[Orboros task context truncated by dispatch budget]\n";
+        let marker_chars = marker.chars().count();
+        if remaining <= marker_chars {
+            out.extend(marker.chars().take(remaining));
+        } else {
+            out.extend(section.chars().take(remaining - marker_chars));
+            out.push_str(marker);
+        }
+    }
+    u32::try_from(out.chars().count().saturating_sub(used)).unwrap_or(u32::MAX)
 }
 
 fn char_count(value: &str) -> u32 {
@@ -344,5 +398,31 @@ mod tests {
         let combined = append_task_context("Do the task", "## Context");
         assert!(combined.starts_with("Do the task\n\n---"));
         assert!(combined.contains("## Context"));
+    }
+
+    #[test]
+    fn bounded_context_keeps_current_and_dependency_before_large_child_results() {
+        let mut parent = Orb::new("Parent", "Parent work").with_type(OrbType::Feature);
+        parent.has_parent_final_work = true;
+        let mut dependency = Orb::new("Dependency", "Required API").with_type(OrbType::Task);
+        dependency.set_status(OrbStatus::Active).unwrap();
+        dependency.set_status(OrbStatus::Done).unwrap();
+        dependency.result = Some("verification passed".into());
+        let mut child = Orb::new("Child", "Large implementation").with_type(OrbType::Task);
+        child.parent_id = Some(parent.id.clone());
+        child.result = Some("x".repeat(RESULT_MAX_CHARS));
+        let edge = DepEdge::new(dependency.id.clone(), parent.id.clone(), EdgeType::Blocks);
+
+        let context = build_orb_task_context_with_budget(
+            &parent,
+            &[parent.clone(), dependency, child],
+            &[edge],
+            ContextBudget { max_chars: 800 },
+        );
+
+        assert!(context.text.contains("### Current Orb"));
+        assert!(context.text.contains("Dependency"), "{}", context.text);
+        assert!(context.text.contains("truncated by dispatch budget"));
+        assert!(usize::try_from(context.metrics.task_context_chars).unwrap() <= 800);
     }
 }

@@ -1038,10 +1038,18 @@ async fn dispatch_one_owned(
             orb.description.clone(),
         ),
     };
-    let task_context = crate::prompt_context::build_orb_task_context_with_metrics(
+    let context_budget = if target == DispatchTarget::Execute && orb.has_parent_final_work {
+        crate::prompt_context::PARENT_FINAL_CONTEXT_BUDGET
+    } else if orb.parent_id.is_some() {
+        crate::prompt_context::CHILD_EXECUTION_CONTEXT_BUDGET
+    } else {
+        crate::prompt_context::REVIEW_CONTEXT_BUDGET
+    };
+    let task_context = crate::prompt_context::build_orb_task_context_with_budget(
         &orb,
         context.orbs,
         context.edges,
+        context_budget,
     );
     let mut prompt_context = task_context.metrics;
     prompt_context.base_user_chars = u32::try_from(user.chars().count()).unwrap_or(u32::MAX);
