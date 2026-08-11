@@ -165,6 +165,9 @@ enum Commands {
         /// Tick interval in milliseconds (default: 1000).
         #[arg(long)]
         tick_interval: Option<u64>,
+        /// Supervise only this registered project name.
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Manage orbs (create, show, list, update, delete, deps, review).
     Orb {
@@ -794,6 +797,7 @@ fn main() -> anyhow::Result<()> {
             pid_file,
             log_file,
             tick_interval,
+            project,
         } => {
             let mut daemon_config = DaemonConfig::default();
             if let Some(pf) = pid_file {
@@ -809,9 +813,15 @@ fn main() -> anyhow::Result<()> {
             if stop {
                 cmd_daemon_stop(&daemon_config)
             } else if status {
-                cmd_daemon_status(&daemon_config)
+                cmd_daemon_status(&daemon_config, dirs::home_dir().as_deref())
             } else {
-                cmd_daemon_start(&store, &state_dir, daemon_config)
+                cmd_daemon_start(
+                    &store,
+                    &state_dir,
+                    daemon_config,
+                    project.as_deref(),
+                    &cli.state_dir,
+                )
             }
         }
         Commands::Orb { action } => {
@@ -1744,6 +1754,8 @@ fn cmd_daemon_start(
     _store: &TaskStore,
     state_dir: &std::path::Path,
     daemon_config: DaemonConfig,
+    project: Option<&str>,
+    requested_state_dir: &str,
 ) -> anyhow::Result<()> {
     if orboros::daemon::is_running(&daemon_config) {
         let pid = orboros::daemon::read_pid_file(&daemon_config)?;
@@ -1753,7 +1765,17 @@ fn cmd_daemon_start(
         );
     }
 
-    println!("Starting daemon...");
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+    let supervisor_mode = project.is_some() || requested_state_dir == DEFAULT_STATE_DIR;
+    if supervisor_mode {
+        return cmd_supervisor_start(&home, daemon_config, project);
+    }
+
+    println!(
+        "Starting single-project daemon for {}...",
+        state_dir.display()
+    );
 
     let orb_store = orbs::orb_store::OrbStore::new(state_dir.join("orbs.jsonl"));
     let dep_store = orbs::dep_store::DepStore::new(state_dir.join("deps.jsonl"));
@@ -1794,6 +1816,73 @@ fn cmd_daemon_start(
     Ok(())
 }
 
+fn cmd_supervisor_start(
+    home: &Path,
+    daemon_config: DaemonConfig,
+    selected_project: Option<&str>,
+) -> anyhow::Result<()> {
+    use orboros::daemon::SupervisedProject;
+    let (registered, skipped) = config::registered_project_state_dirs(home)?;
+    for project in skipped {
+        tracing::warn!(project = %project.name, path = %project.path.display(), "skipping missing or uninitialized registered project");
+        println!(
+            "  warning: skipping {} (missing {})",
+            project.name,
+            project.path.join(".orbs").display()
+        );
+    }
+    let registered: Vec<_> = registered
+        .into_iter()
+        .filter(|project| selected_project.is_none_or(|name| project.entry.name == name))
+        .collect();
+    if registered.is_empty() {
+        anyhow::bail!("No initialized registered projects to supervise");
+    }
+    if let Some(name) = selected_project {
+        if registered.len() != 1 {
+            anyhow::bail!("Registered project {name:?} was not initialized");
+        }
+    }
+
+    let mut projects = Vec::with_capacity(registered.len());
+    for project in registered {
+        let entry = project.entry;
+        let project_state_dir = project.state_dir;
+        let orb_store = OrbStore::new(project_state_dir.join("orbs.jsonl"));
+        let dep_store = DepStore::new(project_state_dir.join("deps.jsonl"));
+        let mut queue = QueueLoop::new(orb_store, dep_store, project_state_dir.clone());
+        if let Some(sink) =
+            orboros::hooks::HookSink::from_state_dir(&project_state_dir, &entry.path)?
+        {
+            queue = queue.with_hooks(sink);
+        }
+        let dispatch = match orboros::worker::dispatcher::default_worker_config(
+            Some(home),
+            Some(&project_state_dir),
+        ) {
+            Ok(base_worker_config) => Some(orboros::daemon::DispatchSettings {
+                base_worker_config,
+                max_concurrency: daemon_config.max_concurrency,
+            }),
+            Err(error) => {
+                tracing::warn!(project = %entry.name, %error, "project dispatch disabled — worker_binary unconfigured");
+                None
+            }
+        };
+        projects.push(SupervisedProject {
+            name: entry.name,
+            queue,
+            dispatch,
+        });
+    }
+    println!(
+        "Starting supervisor for {} registered project(s)...",
+        projects.len()
+    );
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(orboros::daemon::run_supervisor(daemon_config, projects))
+}
+
 fn cmd_daemon_stop(daemon_config: &DaemonConfig) -> anyhow::Result<()> {
     match orboros::daemon::read_pid_file(daemon_config)? {
         Some(pid) => {
@@ -1816,17 +1905,23 @@ fn cmd_daemon_stop(daemon_config: &DaemonConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_daemon_status(daemon_config: &DaemonConfig) -> anyhow::Result<()> {
+fn cmd_daemon_status(daemon_config: &DaemonConfig, home: Option<&Path>) -> anyhow::Result<()> {
+    let project_count = home
+        .and_then(|home| config::registered_project_state_dirs(home).ok())
+        .map_or(0, |(projects, _)| projects.len());
     if orboros::daemon::is_running(daemon_config) {
         let pid = orboros::daemon::read_pid_file(daemon_config)?;
-        println!("Daemon is running (PID {}).", pid.unwrap_or(0));
+        println!(
+            "Daemon is running (PID {}). Supervising {project_count} registered project(s).",
+            pid.unwrap_or(0)
+        );
     } else if daemon_config.pid_file.exists() {
         println!(
             "Daemon is not running (stale PID file at {}).",
             daemon_config.pid_file.display()
         );
     } else {
-        println!("Daemon is not running.");
+        println!("Daemon is not running. {project_count} registered project(s) available.");
     }
     Ok(())
 }

@@ -197,6 +197,95 @@ pub struct DispatchSettings {
     pub max_concurrency: usize,
 }
 
+/// One independently-ticked project managed by the supervisor daemon.
+pub struct SupervisedProject {
+    pub name: String,
+    pub queue: crate::queue_loop::QueueLoop,
+    pub dispatch: Option<DispatchSettings>,
+}
+
+async fn tick_project(project: &SupervisedProject) {
+    let project_name = project.name.as_str();
+    match project.queue.tick_async().await {
+        Ok(result) if !result.is_idle() => tracing::debug!(
+            project = project_name,
+            pipelines = result.pipelines_started,
+            executed = result.orbs_executed,
+            completed = result.roots_completed,
+            reevaluated = result.orbs_reevaluated,
+            "tick completed"
+        ),
+        Ok(_) => {}
+        Err(error) => {
+            tracing::error!(project = project_name, %error, "project tick failed; continuing");
+            return;
+        }
+    }
+
+    if let Some(settings) = &project.dispatch {
+        match project
+            .queue
+            .dispatch_ready_orbs(&settings.base_worker_config, settings.max_concurrency)
+            .await
+        {
+            Ok(0) => {}
+            Ok(dispatched) => tracing::debug!(
+                project = project_name,
+                dispatched,
+                "workers completed this tick"
+            ),
+            Err(error) => {
+                tracing::error!(project = project_name, %error, "project dispatch failed; continuing");
+            }
+        }
+    }
+    project.queue.fire_on_queue_tick().await;
+}
+
+/// Run exactly one isolated tick for every supplied project.  This is kept
+/// public for operator tooling and lets tests exercise supervisor behavior
+/// without waiting for signals or a timer.
+pub async fn tick_supervised_projects(projects: &[SupervisedProject]) {
+    for project in projects {
+        tick_project(project).await;
+    }
+}
+
+/// Run a single PID-managed daemon which supervises multiple project queues.
+/// A failed queue or worker setup in one project is logged and does not prevent
+/// the remaining projects from receiving their tick.
+pub async fn run_supervisor(config: DaemonConfig, projects: Vec<SupervisedProject>) -> Result<()> {
+    write_pid_file(&config).context("failed to write PID file")?;
+    tracing::info!(
+        pid = std::process::id(),
+        projects = projects.len(),
+        "supervisor daemon started"
+    );
+    let mut shutdown_rx = setup_signal_handlers();
+    let tick_interval = std::time::Duration::from_millis(config.tick_interval_ms);
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    tracing::info!("shutdown signal received, stopping supervisor");
+                    for project in &projects { project.queue.stop(); }
+                    break;
+                }
+            }
+            () = tokio::time::sleep(tick_interval) => {
+                if let Err(error) = rotate_log(&config) { tracing::warn!(%error, "log rotation failed"); }
+                tick_supervised_projects(&projects).await;
+            }
+        }
+    }
+    if let Err(error) = remove_pid_file(&config) {
+        tracing::warn!(%error, "failed to remove PID file");
+    }
+    tracing::info!("supervisor daemon stopped");
+    Ok(())
+}
+
 /// Runs the daemon: writes PID file, sets up signal handlers, runs the queue
 /// loop, and cleans up on shutdown.
 ///
@@ -307,6 +396,8 @@ pub async fn run_daemon(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orbs::dep_store::DepStore;
+    use orbs::orb_store::OrbStore;
     use tempfile::tempdir;
 
     fn config_in(dir: &std::path::Path) -> DaemonConfig {
@@ -328,6 +419,32 @@ mod tests {
         assert!(config.log_file.is_none());
         assert_eq!(config.log_max_size, 10 * 1024 * 1024);
         assert_eq!(config.tick_interval_ms, 1000);
+    }
+
+    #[tokio::test]
+    async fn supervisor_ticks_each_registered_project() {
+        let tmp = tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        let project = |name: &str, dir: &std::path::Path| SupervisedProject {
+            name: name.into(),
+            queue: crate::queue_loop::QueueLoop::new(
+                OrbStore::new(dir.join("orbs.jsonl")),
+                DepStore::new(dir.join("deps.jsonl")),
+                dir.to_path_buf(),
+            ),
+            dispatch: None,
+        };
+        let projects = vec![project("first", &first), project("second", &second)];
+
+        tick_supervised_projects(&projects).await;
+
+        // Both queues are still live: a clean/idle first project did not
+        // prevent the second one from receiving its independent tick.
+        assert!(projects.iter().all(|project| project
+            .queue
+            .running_flag()
+            .load(std::sync::atomic::Ordering::SeqCst)));
     }
 
     // ── PID file write/read/remove ──────────────────────────────────

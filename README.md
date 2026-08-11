@@ -34,7 +34,7 @@ orboros execute orb-k4f --wait
 # Legacy full orchestration: decompose + route + execute
 orboros legacy orchestrate "Refactor the authentication module"
 
-# Start the daemon (background processing)
+# Start the supervisor daemon (background processing for every registered project)
 orboros daemon
 ```
 
@@ -71,7 +71,7 @@ orboros daemon
 | Command | Description |
 |---------|-------------|
 | `init` | Initialize `.orbs/` in current directory |
-| `daemon` | Start background queue loop |
+| `daemon` | Start the registered-project supervisor |
 | `daemon --stop` | Stop running daemon |
 | `daemon --status` | Check daemon status |
 | `legacy tasks [-s status]` | List legacy tasks |

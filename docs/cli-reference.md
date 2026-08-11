@@ -263,7 +263,9 @@ orboros orb review orb-k4f revise    # send back for changes
 
 ### `daemon`
 
-Run or manage the background queue loop.
+Run or manage the background supervisor. By default it processes every project
+registered by `orboros init`; use an explicit `--state-dir` for legacy
+single-project operation.
 
 ```bash
 # Start daemon
@@ -283,6 +285,7 @@ orboros daemon --stop
 | `--pid-file <PATH>` | `~/.orboros/orboros.pid` | PID file location |
 | `--log-file <PATH>` | — | Log file path |
 | `--tick-interval <MS>` | 1000 | Queue loop tick interval |
+| `--project <NAME>` | — | Supervise one registered project |
 
 ---
 

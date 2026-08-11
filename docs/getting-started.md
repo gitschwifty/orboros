@@ -139,7 +139,9 @@ cargo run -- orb review orb-k4f revise
 
 ### Daemon mode
 
-The daemon runs a background loop that processes the pipeline:
+The daemon is a single supervisor process. `orboros init` registers a project,
+then the default daemon command discovers every registered project's `.orbs`
+directory and processes its queue independently:
 
 ```bash
 # Start
@@ -151,6 +153,12 @@ cargo run -- daemon --status
 # Stop
 cargo run -- daemon --stop
 ```
+
+Use `cargo run -- daemon --project <name>` to inspect one registered project,
+or pass an explicit `--state-dir <project>/.orbs` for legacy single-project
+operation. Normal `run --queue`, `plan`, and `orb` commands write directly to
+each project's shared `.orbs` state; the supervisor picks up the changes on its
+next tick.
 
 The daemon loop:
 1. Detects pending epics/features → starts pipeline (speccing)

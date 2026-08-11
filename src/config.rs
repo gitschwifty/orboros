@@ -578,6 +578,13 @@ pub struct ProjectEntry {
     pub created_at: DateTime<Utc>,
 }
 
+/// A registered project with a usable `.orbs` state directory.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegisteredProjectState {
+    pub entry: ProjectEntry,
+    pub state_dir: PathBuf,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ProjectsFile {
     #[serde(default)]
@@ -642,6 +649,29 @@ pub fn list_projects(home: &Path) -> anyhow::Result<Vec<ProjectEntry>> {
     Ok(pf.projects)
 }
 
+/// Return registered projects which still have an initialized Orboros state
+/// directory.  Entries which point at deleted or uninitialized directories are
+/// returned separately so long-running callers can warn without preventing
+/// healthy projects from starting.
+pub fn registered_project_state_dirs(
+    home: &Path,
+) -> anyhow::Result<(Vec<RegisteredProjectState>, Vec<ProjectEntry>)> {
+    let mut active = Vec::new();
+    let mut skipped = Vec::new();
+    for project in list_projects(home)? {
+        let state_dir = project.path.join(".orbs");
+        if state_dir.is_dir() {
+            active.push(RegisteredProjectState {
+                entry: project,
+                state_dir,
+            });
+        } else {
+            skipped.push(project);
+        }
+    }
+    Ok((active, skipped))
+}
+
 /// Find a project by name.
 ///
 /// # Errors
@@ -696,6 +726,25 @@ pub fn init_project(home: &Path, project_dir: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn registered_project_state_dirs_skips_missing_and_uninitialized_projects() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let active = tmp.path().join("active");
+        let missing = tmp.path().join("missing");
+        std::fs::create_dir_all(active.join(".orbs")).unwrap();
+        std::fs::create_dir_all(&missing).unwrap();
+        register_project(&home, "active", &active).unwrap();
+        register_project(&home, "missing", &missing).unwrap();
+
+        let (projects, skipped) = registered_project_state_dirs(&home).unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].entry.name, "active");
+        assert_eq!(projects[0].state_dir, active.join(".orbs"));
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].name, "missing");
+    }
 
     // --- Config loading ---
 
