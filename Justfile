@@ -62,14 +62,14 @@ bench-run-model model tier="" variant="" root="bench" prompt_set="":
     fi
 
 # Run an explicit model with a prompt set:
-# `just bench-run-model-prompt openrouter/free composable-v1 t2`.
-bench-run-model-prompt model prompt_set tier="" variant="" root="bench": build-release
+# `just bench-run-model-prompt openrouter/free composable-v1 t2 4`.
+bench-run-model-prompt model prompt_set tier="" jobs="1" variant="" root="bench": build-release
     @variant_arg=""; \
     if [ -n "{{variant}}" ]; then variant_arg='--variant "{{variant}}"'; fi; \
     if [ -n "{{tier}}" ]; then \
-        ./target/release/orboros bench --bench-root "{{root}}" run --tier "{{tier}}" --model "{{model}}" --prompt-set "{{prompt_set}}" $variant_arg; \
+        ./target/release/orboros bench --bench-root "{{root}}" run --tier "{{tier}}" --jobs "{{jobs}}" --model "{{model}}" --prompt-set "{{prompt_set}}" $variant_arg; \
     else \
-        ./target/release/orboros bench --bench-root "{{root}}" run --model "{{model}}" --prompt-set "{{prompt_set}}" $variant_arg; \
+        ./target/release/orboros bench --bench-root "{{root}}" run --jobs "{{jobs}}" --model "{{model}}" --prompt-set "{{prompt_set}}" $variant_arg; \
     fi
 
 # Build release, then run benchmark cases with an explicit model.

@@ -446,6 +446,7 @@ async fn cmd_bench_run_parallel(
     );
     req.store.append_run(&run)?;
     print_completed_run(&run, &all_results, &case_labels, &resource_guidance);
+    print_parallel_timing(&run, &all_results, req.jobs);
     println!("\nRun id: {run_id}");
     Ok(())
 }
@@ -1465,6 +1466,34 @@ fn print_completed_run(
     print_run_summary(run);
     print_result_table(results, Some(case_labels), Some(resource_guidance));
     print_run_completion(run, results, resource_guidance);
+}
+
+/// Shows the aggregate case work separately from elapsed wall-clock time.
+/// This only appears for opt-in parallel runs: serial output remains unchanged.
+fn print_parallel_timing(run: &BenchRun, results: &[BenchResult], jobs: usize) {
+    let case_work_ms = results.iter().fold(0_u64, |total, result| {
+        total.saturating_add(result.latency_ms)
+    });
+    let wall_ms = u64::try_from((run.finished_at - run.started_at).num_milliseconds()).unwrap_or(0);
+    let speedup = effective_speedup(case_work_ms, wall_ms);
+    println!("\n== parallel timing ==");
+    println!(
+        "aggregate case work: {} (sum of per-case elapsed time)",
+        format_elapsed_ms(case_work_ms)
+    );
+    println!("wall-clock elapsed:   {}", format_elapsed_ms(wall_ms));
+    match speedup {
+        Some(speedup) => println!("effective speedup:    {speedup:.2}x ({jobs} case jobs)"),
+        None => println!("effective speedup:    unavailable (zero wall-clock elapsed)"),
+    }
+}
+
+fn effective_speedup(case_work_ms: u64, wall_ms: u64) -> Option<f64> {
+    (wall_ms != 0).then(|| {
+        let case_work_ms = u32::try_from(case_work_ms).unwrap_or(u32::MAX);
+        let wall_ms = u32::try_from(wall_ms).unwrap_or(u32::MAX);
+        f64::from(case_work_ms) / f64::from(wall_ms)
+    })
 }
 
 fn print_result_table(
@@ -2499,6 +2528,12 @@ text = "x"
         assert_eq!(format_elapsed_ms(6_349), "6.3s");
         assert_eq!(format_elapsed_ms(117_248), "1m 57s");
         assert_eq!(format_elapsed_ms(3_661_000), "1h 01m 01s");
+    }
+
+    #[test]
+    fn effective_speedup_uses_case_work_over_wall_clock() {
+        assert_eq!(effective_speedup(500, 0), None);
+        assert_eq!(effective_speedup(600, 200), Some(3.0));
     }
 
     #[test]
