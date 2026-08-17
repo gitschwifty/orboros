@@ -155,6 +155,18 @@ impl CancelSender {
 }
 
 impl Worker {
+    /// Returns runtime placement confirmed during the init handshake.
+    #[must_use]
+    pub fn runtime(&self) -> Option<&EffectiveRuntimeMetadata> {
+        self.runtime.as_ref()
+    }
+
+    /// Returns routing metadata confirmed during the init handshake.
+    #[must_use]
+    pub fn routing(&self) -> Option<&RoutingMetadata> {
+        self.routing.as_ref()
+    }
+
     /// Spawns a new worker process and performs the init handshake.
     ///
     /// # Errors

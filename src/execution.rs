@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::worker::dispatcher::{DispatchOutcome, DispatchStatus, TerminalRetryDiagnostic};
+use crate::worker::dispatcher::{
+    DispatchAttempt, DispatchOutcome, DispatchStatus, TerminalRetryDiagnostic,
+};
 
 /// Character-level attribution for Orboros-owned prompt construction.
 ///
@@ -90,6 +92,10 @@ pub struct ExecutionRecord {
     /// structured terminal loop or iteration limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_retry: Option<TerminalRetryDiagnostic>,
+    /// Every worker attempt, including fresh retries that did not produce a
+    /// final successful result. Missing on historical records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<DispatchAttempt>,
 }
 
 /// Attribution for a bounded decomposition JSON repair attempt.
@@ -160,7 +166,105 @@ impl ExecutionRecord {
             prompt_context,
             decomposition_repair: None,
             terminal_retry: outcome.terminal_retry.clone(),
+            attempts: outcome.attempts.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod attempt_tests {
+    use chrono::Utc;
+    use orbs::orb::{Orb, OrbType};
+
+    use super::*;
+    use crate::worker::dispatcher::{DispatchAttempt, DispatchOutcome, DispatchStatus};
+
+    #[test]
+    fn execution_record_retains_every_worker_attempt() {
+        let now = Utc::now();
+        let outcome = DispatchOutcome {
+            status: DispatchStatus::Error,
+            retries: 1,
+            response: None,
+            confidence: None,
+            worker_model: "mock/model".into(),
+            worker_id: Some("retry-worker".into()),
+            session_id: Some("retry-session".into()),
+            runtime: None,
+            routing: None,
+            model_latency_ms: None,
+            tool_latency_ms: None,
+            total_latency_ms: None,
+            assistant_turns: None,
+            tool_calls: None,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            cost_micros: None,
+            cost_currency: None,
+            cached_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            generation_id: None,
+            dispatched_at: now,
+            completed_at: now,
+            prompt_category: None,
+            system_prompt_hash: None,
+            system_prompt_source: None,
+            error: Some("worker send failed: stream decode".into()),
+            failure: None,
+            terminal_retry: None,
+            attempts: vec![
+                DispatchAttempt {
+                    worker_id: Some("first-worker".into()),
+                    session_id: Some("first-session".into()),
+                    dispatched_at: now,
+                    completed_at: now,
+                    status: "error".into(),
+                    error: Some("worker send failed: stream decode".into()),
+                    failure: None,
+                    runtime: None,
+                    routing: None,
+                    total_tokens: None,
+                    cost_micros: None,
+                },
+                DispatchAttempt {
+                    worker_id: Some("retry-worker".into()),
+                    session_id: Some("retry-session".into()),
+                    dispatched_at: now,
+                    completed_at: now,
+                    status: "error".into(),
+                    error: Some("worker send failed: stream decode".into()),
+                    failure: None,
+                    runtime: None,
+                    routing: None,
+                    total_tokens: None,
+                    cost_micros: None,
+                },
+            ],
+        };
+        let orb = Orb::new("task", "description").with_type(OrbType::Task);
+        let record = ExecutionRecord::from_outcome(
+            &orb,
+            "worker.execute",
+            "execute",
+            None,
+            Vec::new(),
+            &outcome,
+            None,
+        );
+
+        assert_eq!(record.attempts.len(), 2);
+        assert_eq!(
+            record.attempts[0].session_id.as_deref(),
+            Some("first-session")
+        );
+        assert_eq!(
+            record.attempts[1].session_id.as_deref(),
+            Some("retry-session")
+        );
+        let json = serde_json::to_value(record).unwrap();
+        assert_eq!(json["attempts"].as_array().unwrap().len(), 2);
     }
 }
 

@@ -675,6 +675,13 @@ pub fn cmd_bench_show(store: &BenchStore, run_id: &str) -> anyhow::Result<()> {
     } else {
         print_result_table(&results, None, None);
     }
+    let dispatches = store.read_dispatches(run_id)?;
+    for result in results
+        .iter()
+        .filter(|result| result.status == BenchStatus::Error)
+    {
+        print_failure_attribution(&dispatches, &result.case_id);
+    }
     Ok(())
 }
 
@@ -700,6 +707,7 @@ pub fn cmd_bench_details(
         println!("== summary ==");
         print_run_summary(&run);
     }
+    let dispatches = store.read_dispatches(run_id)?;
 
     let mut printed = 0usize;
     for result in &results {
@@ -712,6 +720,7 @@ pub fn cmd_bench_details(
             continue;
         }
         print_result_details(result);
+        print_failure_attribution(&dispatches, &result.case_id);
         printed += 1;
     }
 
@@ -725,6 +734,48 @@ pub fn cmd_bench_details(
         }
     }
     Ok(())
+}
+
+fn print_failure_attribution(records: &[BenchDispatchRecord], case_id: &str) {
+    let failed: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            record.case_id == case_id
+                && record
+                    .execution
+                    .attempts
+                    .iter()
+                    .any(|attempt| attempt.status != "done")
+        })
+        .collect();
+    if failed.is_empty() {
+        return;
+    }
+    println!("\n-- worker attempts --");
+    for record in failed {
+        for (index, attempt) in record.execution.attempts.iter().enumerate() {
+            let transcript = attempt
+                .runtime
+                .as_ref()
+                .map_or("-", |runtime| runtime.transcript_path.as_str());
+            let failure = attempt
+                .failure
+                .as_ref()
+                .map(|failure| failure.code.as_str())
+                .or(attempt.error.as_deref())
+                .unwrap_or("-");
+            println!(
+                "{} attempt={} status={} worker={} session={} transcript={} error={}",
+                record.execution.dispatch_kind,
+                index + 1,
+                attempt.status,
+                attempt.worker_id.as_deref().unwrap_or("-"),
+                attempt.session_id.as_deref().unwrap_or("-"),
+                transcript,
+                failure,
+            );
+        }
+    }
 }
 
 /// Prints persisted dispatch telemetry grouped by case and dispatch kind.

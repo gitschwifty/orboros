@@ -18,7 +18,7 @@ use tracing::{info, instrument, warn};
 use crate::hooks::event::HookEvent;
 use crate::hooks::runner::{FireCtx, FireOutcome};
 use crate::hooks::sink::HookSink;
-use crate::ipc::types::FailureDetails;
+use crate::ipc::types::{EffectiveRuntimeMetadata, FailureDetails, RoutingMetadata};
 use crate::routing::profile::builtin_tools;
 use crate::worker::process::{Worker, WorkerConfig};
 
@@ -69,6 +69,10 @@ pub struct DispatchOutcome {
     /// Heddle session that produced the final result, when initialization
     /// completed. Used to attribute fresh-worker recovery attempts.
     pub session_id: Option<String>,
+    /// Effective Heddle runtime placement for the final attempt.
+    pub runtime: Option<EffectiveRuntimeMetadata>,
+    /// Effective Heddle routing metadata for the final attempt.
+    pub routing: Option<RoutingMetadata>,
     pub model_latency_ms: Option<u64>,
     pub tool_latency_ms: Option<u64>,
     pub total_latency_ms: Option<u64>,
@@ -94,6 +98,57 @@ pub struct DispatchOutcome {
     /// Evidence for the one permitted recovery from a terminal Heddle loop or
     /// iteration-limit result. `None` means this dispatch never used that path.
     pub terminal_retry: Option<TerminalRetryDiagnostic>,
+    /// Every worker process used for this dispatch, including failed fresh
+    /// retries. This is the durable attribution boundary for benchmark cost
+    /// and transcript investigation.
+    pub attempts: Vec<DispatchAttempt>,
+}
+
+/// Durable facts about one worker process used by a dispatch.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DispatchAttempt {
+    pub worker_id: Option<String>,
+    pub session_id: Option<String>,
+    pub dispatched_at: chrono::DateTime<Utc>,
+    pub completed_at: chrono::DateTime<Utc>,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<FailureDetails>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<EffectiveRuntimeMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micros: Option<u64>,
+}
+
+impl DispatchAttempt {
+    fn from_outcome(outcome: &DispatchOutcome) -> Self {
+        Self {
+            worker_id: outcome.worker_id.clone(),
+            session_id: outcome.session_id.clone(),
+            dispatched_at: outcome.dispatched_at,
+            completed_at: outcome.completed_at,
+            status: match outcome.status {
+                DispatchStatus::Done => "done",
+                DispatchStatus::Error => "error",
+                DispatchStatus::Failed => "failed",
+                DispatchStatus::Cancelled => "cancelled",
+                DispatchStatus::Aborted => "aborted",
+            }
+            .into(),
+            error: outcome.error.clone(),
+            failure: outcome.failure.clone(),
+            runtime: outcome.runtime.clone(),
+            routing: outcome.routing.clone(),
+            total_tokens: outcome.total_tokens,
+            cost_micros: outcome.cost_micros,
+        }
+    }
 }
 
 /// Attribution for a bounded fresh-worker retry after Heddle ends a session
@@ -123,6 +178,8 @@ impl DispatchOutcome {
             worker_model,
             worker_id: None,
             session_id: None,
+            runtime: None,
+            routing: None,
             model_latency_ms: None,
             tool_latency_ms: None,
             total_latency_ms: None,
@@ -145,6 +202,7 @@ impl DispatchOutcome {
             error: Some(reason),
             failure: None,
             terminal_retry: None,
+            attempts: Vec::new(),
         }
     }
 }
@@ -244,6 +302,7 @@ async fn dispatch_orb_with_retry_limit(
 
     let mut attempt = 0;
     let mut terminal_retry = None;
+    let mut attempts = Vec::new();
     let mut outcome = loop {
         let retry_is_terminal = terminal_retry.is_some();
         let attempt_prompt = if attempt == 0 {
@@ -266,6 +325,8 @@ async fn dispatch_orb_with_retry_limit(
                         .is_some_and(|error| error.retryable);
                     let terminal_failure = terminal_retry_candidate(&send_outcome);
                     let session_id = Some(worker.session_id().to_string());
+                    let runtime = worker.runtime().cloned();
+                    let routing = worker.routing().cloned();
                     let _ = worker.shutdown().await;
                     (
                         build_outcome(
@@ -273,6 +334,8 @@ async fn dispatch_orb_with_retry_limit(
                             dispatched_at,
                             Utc::now(),
                             session_id.clone(),
+                            runtime,
+                            routing,
                             send_outcome,
                         ),
                         terminal_failure.map_or_else(
@@ -293,12 +356,18 @@ async fn dispatch_orb_with_retry_limit(
                 Err(e) => {
                     let retryable = crate::worker::fsm::FailureClass::from(&e).restart_policy()
                         == crate::worker::fsm::RestartPolicy::RetryOnce;
+                    let session_id = Some(worker.session_id().to_string());
+                    let runtime = worker.runtime().cloned();
+                    let routing = worker.routing().cloned();
                     let _ = worker.shutdown().await;
                     (
                         build_failure(
                             &attempt_config,
                             dispatched_at,
                             Utc::now(),
+                            session_id,
+                            runtime,
+                            routing,
                             format!("worker send failed: {e}"),
                         ),
                         retryable.then_some(RetryKind::Transient),
@@ -313,12 +382,16 @@ async fn dispatch_orb_with_retry_limit(
                         &attempt_config,
                         dispatched_at,
                         Utc::now(),
+                        None,
+                        None,
+                        None,
                         format!("worker spawn failed: {e}"),
                     ),
                     retryable.then_some(RetryKind::Transient),
                 )
             }
         };
+        attempts.push(DispatchAttempt::from_outcome(&outcome));
         if let Some(retry_kind) = retry_kind.filter(|_| attempt < retry_limit) {
             if let RetryKind::Terminal(mut diagnostic) = retry_kind {
                 // The next loop iteration assigns a new worker ID and spawns
@@ -333,6 +406,7 @@ async fn dispatch_orb_with_retry_limit(
         break outcome;
     };
     outcome.retries = attempt;
+    outcome.attempts = attempts;
     if let Some(mut diagnostic) = terminal_retry {
         diagnostic.retry_worker_id.clone_from(&outcome.worker_id);
         diagnostic.retry_session_id.clone_from(&outcome.session_id);
@@ -384,6 +458,8 @@ fn build_outcome(
     dispatched_at: chrono::DateTime<Utc>,
     completed_at: chrono::DateTime<Utc>,
     session_id: Option<String>,
+    init_runtime: Option<EffectiveRuntimeMetadata>,
+    init_routing: Option<RoutingMetadata>,
     send: crate::worker::process::SendOutcome,
 ) -> DispatchOutcome {
     use crate::ipc::types::ResultStatus;
@@ -401,6 +477,8 @@ fn build_outcome(
         worker_model: worker_config.model.clone(),
         worker_id: worker_config.worker_id.clone(),
         session_id,
+        runtime: send.runtime.or(init_runtime),
+        routing: send.routing.or(init_routing),
         model_latency_ms: send.model_latency_ms,
         tool_latency_ms: send.tool_latency_ms,
         total_latency_ms: send.total_latency_ms,
@@ -423,6 +501,7 @@ fn build_outcome(
         error,
         failure: send.failure,
         terminal_retry: None,
+        attempts: Vec::new(),
     }
 }
 
@@ -430,6 +509,9 @@ fn build_failure(
     worker_config: &WorkerConfig,
     dispatched_at: chrono::DateTime<Utc>,
     completed_at: chrono::DateTime<Utc>,
+    session_id: Option<String>,
+    runtime: Option<EffectiveRuntimeMetadata>,
+    routing: Option<RoutingMetadata>,
     message: String,
 ) -> DispatchOutcome {
     DispatchOutcome {
@@ -439,7 +521,9 @@ fn build_failure(
         confidence: None,
         worker_model: worker_config.model.clone(),
         worker_id: worker_config.worker_id.clone(),
-        session_id: None,
+        session_id,
+        runtime,
+        routing,
         model_latency_ms: None,
         tool_latency_ms: None,
         total_latency_ms: None,
@@ -462,6 +546,7 @@ fn build_failure(
         error: Some(message),
         failure: None,
         terminal_retry: None,
+        attempts: Vec::new(),
     }
 }
 
@@ -745,6 +830,8 @@ mod tests {
             worker_model: "anthropic/claude-sonnet-4-6".into(),
             worker_id: Some("w-1".into()),
             session_id: Some("session-1".into()),
+            runtime: None,
+            routing: None,
             model_latency_ms: Some(150),
             tool_latency_ms: Some(20),
             total_latency_ms: Some(170),
@@ -767,6 +854,7 @@ mod tests {
             error: None,
             failure: None,
             terminal_retry: None,
+            attempts: Vec::new(),
         }
     }
 

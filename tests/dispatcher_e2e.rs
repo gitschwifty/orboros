@@ -140,7 +140,7 @@ while IFS= read -r line; do
     init)
       attempt=$(cat "$COUNTER" 2>/dev/null || echo 0)
       echo "$line" >> "$REQUESTS"
-      echo "{{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"session-$attempt\",\"protocol_version\":\"0.4.0\"}}"
+      echo "{{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"session-$attempt\",\"protocol_version\":\"0.4.0\",\"runtime\":{{\"mode\":\"isolated\",\"state_root\":\"/tmp/state\",\"transcript_path\":\"/tmp/transcript-$attempt.jsonl\"}}}}"
       ;;
     send)
       attempt=$(cat "$COUNTER" 2>/dev/null || echo 0)
@@ -173,6 +173,18 @@ done
     assert_eq!(outcome.status, DispatchStatus::Done);
     assert_eq!(outcome.response.as_deref(), Some("recovered"));
     assert_eq!(outcome.retries, 1);
+    assert_eq!(outcome.attempts.len(), 2);
+    assert_eq!(outcome.attempts[0].status, "error");
+    assert_eq!(outcome.attempts[0].session_id.as_deref(), Some("session-0"));
+    assert_eq!(
+        outcome.attempts[0]
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.transcript_path.as_str()),
+        Some("/tmp/transcript-0.jsonl")
+    );
+    assert_eq!(outcome.attempts[1].status, "done");
+    assert_eq!(outcome.attempts[1].session_id.as_deref(), Some("session-1"));
     let retry = outcome.terminal_retry.expect("terminal retry diagnostic");
     assert_eq!(retry.initial_failure.code, "loop_detected");
     assert!(retry.retry_attempted);
