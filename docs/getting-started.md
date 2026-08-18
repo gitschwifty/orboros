@@ -137,7 +137,7 @@ This creates an epic orb, decomposes it into child tasks with dependency edges, 
 cargo run -- run "What is the capital of France?"
 
 # Full orchestration: decompose + route + execute
-cargo run -- orchestrate "Refactor the authentication module"
+cargo run -- plan "Refactor the authentication module"
 ```
 
 ### Review orbs
@@ -167,7 +167,7 @@ cargo run -- daemon --stop
 ```
 
 Use `cargo run -- daemon --project <name>` to inspect one registered project,
-or pass an explicit `--state-dir <project>/.orbs` for legacy single-project
+or pass an explicit `--state-dir <project>/.orbs` for single-project
 operation. Normal `run --queue`, `plan`, and `orb` commands write directly to
 each project's shared `.orbs` state; the supervisor picks up the changes on its
 next tick.

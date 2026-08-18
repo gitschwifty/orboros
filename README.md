@@ -31,9 +31,6 @@ orboros plan "Build user management system"
 # Drive an existing orb through the foreground queue path
 orboros execute orb-k4f --wait
 
-# Legacy full orchestration: decompose + route + execute
-orboros legacy orchestrate "Refactor the authentication module"
-
 # Start the supervisor daemon (background processing for every registered project)
 orboros daemon
 ```
@@ -48,9 +45,6 @@ orboros daemon
 | `execute <orb-id> --wait` | Drive an existing orb with the foreground queue |
 | `plan <description>` | Create an epic with shallow decomposition |
 | `plan --file <path>` | Plan from a markdown file |
-| `legacy run <task>` | Execute a legacy `tasks.jsonl` task directly via worker |
-| `legacy decompose <task>` | Break a legacy task into subtasks, print plan |
-| `legacy orchestrate <task>` | Legacy TaskStore decompose + execute flow |
 
 ### Orb Management
 
@@ -74,9 +68,6 @@ orboros daemon
 | `daemon` | Start the registered-project supervisor |
 | `daemon --stop` | Stop running daemon |
 | `daemon --status` | Check daemon status |
-| `legacy tasks [-s status]` | List legacy tasks |
-| `legacy status <id>` | Show legacy task details |
-| `legacy review` | List legacy tasks awaiting review |
 
 ### Global Options
 
@@ -284,7 +275,7 @@ global/project config:
 
 ```bash
 orboros decompose "Plan the refactor" --system-prompt-file prompts/decompose-v2.md
-orboros orchestrate "Fix auth flow" --system-prompt "You are a strict implementation worker."
+orboros run "Fix auth flow"
 ```
 
 Queue dispatch also appends dynamic Orboros task context to worker user prompts:

@@ -12,16 +12,11 @@ use orbs::orb::{Orb, OrbType};
 use orbs::orb_store::OrbStore;
 
 use orboros::config;
-use orboros::coordinator::decompose::decompose_with_prompt_resolver;
 use orboros::daemon::DaemonConfig;
 use orboros::orb_cmd;
-use orboros::orchestrator::{orchestrate, OrchestrateConfig, CONTEXT_RESULT_MAX_CHARS};
 use orboros::plan::{self, PlanConfig};
 use orboros::queue_loop::{DrainResult, QueueLoop};
 use orboros::routing::profile::builtin_tools;
-use orboros::runner::execute_task;
-use orboros::state::store::TaskStore;
-use orboros::state::task::{Task, TaskStatus};
 use orboros::worker::process::WorkerConfig;
 
 const DEFAULT_STATE_DIR: &str = "~/.orboros/default";
@@ -77,49 +72,6 @@ enum Commands {
         /// Delay between foreground queue cycles.
         #[arg(long, default_value_t = 100)]
         interval_ms: u64,
-    },
-    /// Legacy `TaskStore`: decompose a task into subtasks without executing.
-    Decompose {
-        /// The high-level task to decompose.
-        task: String,
-        /// Override the decomposition system prompt.
-        #[arg(long)]
-        system_prompt: Option<String>,
-        /// Read the system prompt override from a file.
-        #[arg(long)]
-        system_prompt_file: Option<PathBuf>,
-    },
-    /// Legacy `TaskStore`: decompose a task and execute all subtasks.
-    Orchestrate {
-        /// The high-level task to orchestrate.
-        task: String,
-        /// Priority for subtasks (1=highest, 5=lowest).
-        #[arg(short, long, default_value = "3")]
-        priority: u8,
-        /// Override all system prompts used by this orchestration.
-        #[arg(long)]
-        system_prompt: Option<String>,
-        /// Read the system prompt override from a file.
-        #[arg(long)]
-        system_prompt_file: Option<PathBuf>,
-    },
-    /// Legacy `TaskStore`: list tasks, optionally filtered by status.
-    Tasks {
-        /// Filter by status (pending, active, review, done, failed).
-        #[arg(short, long)]
-        status: Option<String>,
-    },
-    /// Legacy `TaskStore`: show status of a specific task by ID.
-    Status {
-        /// Task ID (UUID).
-        id: String,
-    },
-    /// Legacy `TaskStore`: list tasks awaiting review.
-    Review,
-    /// Access legacy `TaskStore` commands backed by tasks.jsonl.
-    Legacy {
-        #[command(subcommand)]
-        action: LegacyAction,
     },
     /// Drive the normal orb queue/dispatch path for an existing orb.
     Execute {
@@ -345,65 +297,6 @@ enum BenchAction {
         #[arg(long, default_value_t = 10)]
         buckets: usize,
     },
-}
-
-#[derive(Subcommand)]
-enum LegacyAction {
-    /// Submit a new legacy task for execution.
-    Run {
-        /// The task description.
-        task: String,
-        /// Priority (1=highest, 5=lowest).
-        #[arg(short, long, default_value = "3")]
-        priority: u8,
-        /// Queue only, don't execute immediately.
-        #[arg(long)]
-        queue: bool,
-        /// Override the system prompt for this worker invocation.
-        #[arg(long)]
-        system_prompt: Option<String>,
-        /// Read the system prompt override from a file.
-        #[arg(long)]
-        system_prompt_file: Option<PathBuf>,
-    },
-    /// Decompose a legacy task into subtasks without executing.
-    Decompose {
-        /// The high-level task to decompose.
-        task: String,
-        /// Override the decomposition system prompt.
-        #[arg(long)]
-        system_prompt: Option<String>,
-        /// Read the system prompt override from a file.
-        #[arg(long)]
-        system_prompt_file: Option<PathBuf>,
-    },
-    /// Decompose a legacy task and execute all subtasks.
-    Orchestrate {
-        /// The high-level task to orchestrate.
-        task: String,
-        /// Priority for subtasks (1=highest, 5=lowest).
-        #[arg(short, long, default_value = "3")]
-        priority: u8,
-        /// Override all system prompts used by this orchestration.
-        #[arg(long)]
-        system_prompt: Option<String>,
-        /// Read the system prompt override from a file.
-        #[arg(long)]
-        system_prompt_file: Option<PathBuf>,
-    },
-    /// List legacy tasks, optionally filtered by status.
-    Tasks {
-        /// Filter by status (pending, active, review, done, failed).
-        #[arg(short, long)]
-        status: Option<String>,
-    },
-    /// Show status of a specific legacy task by ID.
-    Status {
-        /// Task ID (UUID).
-        id: String,
-    },
-    /// List legacy tasks awaiting review.
-    Review,
 }
 
 #[derive(Subcommand)]
@@ -748,7 +641,6 @@ fn main() -> anyhow::Result<()> {
     let effective_state = resolve_effective_state_dir(&cli.state_dir);
     let state_dir = effective_state.state_dir;
     std::fs::create_dir_all(&state_dir)?;
-    let store = TaskStore::new(state_dir.join("tasks.jsonl"));
 
     match cli.command {
         Commands::Run {
@@ -785,43 +677,6 @@ fn main() -> anyhow::Result<()> {
             interval_ms,
             cli.skip_prereq_check,
         ),
-        Commands::Decompose {
-            task,
-            system_prompt,
-            system_prompt_file,
-        } => cmd_decompose(
-            cli.worker_binary.as_deref(),
-            cli.model.as_deref(),
-            &task,
-            system_prompt.as_deref(),
-            system_prompt_file.as_deref(),
-            cli.skip_prereq_check,
-        ),
-        Commands::Orchestrate {
-            task,
-            priority,
-            system_prompt,
-            system_prompt_file,
-        } => cmd_orchestrate(
-            &store,
-            cli.worker_binary.as_deref(),
-            cli.model.as_deref(),
-            &task,
-            priority,
-            system_prompt.as_deref(),
-            system_prompt_file.as_deref(),
-            cli.skip_prereq_check,
-        ),
-        Commands::Tasks { status } => cmd_tasks(&store, status.as_deref()),
-        Commands::Status { id } => cmd_status(&store, &id),
-        Commands::Review => cmd_review(&store),
-        Commands::Legacy { action } => cmd_legacy(
-            &store,
-            cli.worker_binary.as_deref(),
-            cli.model.as_deref(),
-            action,
-            cli.skip_prereq_check,
-        ),
         Commands::Plan {
             description,
             file,
@@ -856,7 +711,6 @@ fn main() -> anyhow::Result<()> {
                 cmd_daemon_status(&daemon_config, dirs::home_dir().as_deref())
             } else {
                 cmd_daemon_start(
-                    &store,
                     &state_dir,
                     daemon_config,
                     project.as_deref(),
@@ -1033,64 +887,6 @@ fn apply_daemon_settings(
     }
     if let Some(tick_interval_ms) = settings.tick_interval_ms {
         daemon_config.tick_interval_ms = tick_interval_ms;
-    }
-}
-
-fn cmd_legacy(
-    store: &TaskStore,
-    worker_binary: Option<&str>,
-    model: Option<&str>,
-    action: LegacyAction,
-    skip_prereq_check: bool,
-) -> anyhow::Result<()> {
-    match action {
-        LegacyAction::Run {
-            task,
-            priority,
-            queue,
-            system_prompt,
-            system_prompt_file,
-        } => cmd_legacy_run(
-            store,
-            worker_binary,
-            model,
-            &task,
-            priority,
-            queue,
-            system_prompt.as_deref(),
-            system_prompt_file.as_deref(),
-            skip_prereq_check,
-        ),
-        LegacyAction::Decompose {
-            task,
-            system_prompt,
-            system_prompt_file,
-        } => cmd_decompose(
-            worker_binary,
-            model,
-            &task,
-            system_prompt.as_deref(),
-            system_prompt_file.as_deref(),
-            skip_prereq_check,
-        ),
-        LegacyAction::Orchestrate {
-            task,
-            priority,
-            system_prompt,
-            system_prompt_file,
-        } => cmd_orchestrate(
-            store,
-            worker_binary,
-            model,
-            &task,
-            priority,
-            system_prompt.as_deref(),
-            system_prompt_file.as_deref(),
-            skip_prereq_check,
-        ),
-        LegacyAction::Tasks { status } => cmd_tasks(store, status.as_deref()),
-        LegacyAction::Status { id } => cmd_status(store, &id),
-        LegacyAction::Review => cmd_review(store),
     }
 }
 
@@ -1492,300 +1288,6 @@ fn cmd_execute_orb(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn cmd_legacy_run(
-    store: &TaskStore,
-    worker_binary: Option<&str>,
-    model: Option<&str>,
-    description: &str,
-    priority: u8,
-    queue: bool,
-    system_prompt: Option<&str>,
-    system_prompt_file: Option<&std::path::Path>,
-    skip_prereq_check: bool,
-) -> anyhow::Result<()> {
-    let mut task = Task::new(description, description).with_priority(priority);
-    store.append(&task)?;
-    println!("Created task {}", task.id);
-    println!("  priority: {}", task.priority);
-
-    if queue {
-        println!("  status:   pending (queued)");
-        return Ok(());
-    }
-
-    let project_dir = std::env::current_dir().ok();
-    let (mut config, _) = resolved_worker_config(
-        project_dir.as_deref(),
-        worker_binary,
-        model,
-        config::ModelRole::Worker("execute"),
-        skip_prereq_check,
-    )?;
-    let default_system_prompt =
-        "You are a helpful assistant. Complete the task described in the user message.";
-    let resolved_override =
-        orboros::prompt::resolve_cli_system_prompt(system_prompt, system_prompt_file)?;
-    let resolved_system_prompt = resolved_override
-        .as_ref()
-        .map_or(default_system_prompt, |resolved| {
-            resolved.system_prompt.as_str()
-        });
-    config.system_prompt = resolved_system_prompt.into();
-
-    println!("  status:   executing...");
-    println!();
-
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(async {
-        match execute_task(store, &mut task, &config).await {
-            Ok(()) => {
-                println!("Task completed: {:?}", task.status);
-                if let Some(ref result) = task.result {
-                    println!();
-                    println!("{result}");
-                }
-            }
-            Err(e) => {
-                eprintln!("Task failed: {e}");
-                if let Some(ref result) = task.result {
-                    eprintln!("  detail: {result}");
-                }
-            }
-        }
-    });
-    Ok(())
-}
-
-fn cmd_decompose(
-    worker_binary: Option<&str>,
-    model: Option<&str>,
-    description: &str,
-    system_prompt: Option<&str>,
-    system_prompt_file: Option<&std::path::Path>,
-    skip_prereq_check: bool,
-) -> anyhow::Result<()> {
-    let project_dir = std::env::current_dir().ok();
-    let (config, orb_config) = resolved_worker_config(
-        project_dir.as_deref(),
-        worker_binary,
-        model,
-        config::ModelRole::Coordinator("decompose"),
-        skip_prereq_check,
-    )?;
-    let prompt_config = orb_config.prompts;
-    let cli_override =
-        orboros::prompt::resolve_cli_system_prompt(system_prompt, system_prompt_file)?;
-    let prompt_resolver =
-        orboros::prompt::PromptResolver::from_config(prompt_config, project_dir.as_deref())
-            .with_cli_override(cli_override);
-
-    let rt = tokio::runtime::Runtime::new()?;
-    let result = rt.block_on(decompose_with_prompt_resolver(
-        description,
-        &config,
-        &prompt_resolver,
-    ))?;
-
-    println!("Decomposed into {} subtask(s):\n", result.subtasks.len());
-    for (i, sub) in result.subtasks.iter().enumerate() {
-        println!(
-            "  {}. [{}] {} (order: {})",
-            i + 1,
-            sub.worker_type,
-            sub.title,
-            sub.order
-        );
-        println!("     {}", sub.description);
-        if !sub.tools_needed.is_empty() {
-            println!("     tools: {}", sub.tools_needed.join(", "));
-        }
-        println!();
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn cmd_orchestrate(
-    store: &TaskStore,
-    worker_binary: Option<&str>,
-    model: Option<&str>,
-    description: &str,
-    priority: u8,
-    system_prompt: Option<&str>,
-    system_prompt_file: Option<&std::path::Path>,
-    skip_prereq_check: bool,
-) -> anyhow::Result<()> {
-    let state_dir = store.path().parent();
-    let project_dir = state_dir.and_then(project_dir_for_state_dir);
-    let (config, orb_config) = resolved_worker_config(
-        project_dir.as_deref(),
-        worker_binary,
-        model,
-        config::ModelRole::Coordinator("decompose"),
-        skip_prereq_check,
-    )?;
-    let prompt_config = orb_config.prompts.clone();
-    let cli_override =
-        orboros::prompt::resolve_cli_system_prompt(system_prompt, system_prompt_file)?;
-    let prompt_resolver =
-        orboros::prompt::PromptResolver::from_config(prompt_config.clone(), project_dir.as_deref())
-            .with_cli_override(cli_override);
-
-    // Create parent task
-    let mut parent = Task::new(description, description).with_priority(priority);
-    store.append(&parent)?;
-    println!("Created parent task {}", parent.id);
-    println!();
-
-    let rt = tokio::runtime::Runtime::new()?;
-
-    // Decompose
-    println!("Decomposing task...");
-    let decomposition = rt.block_on(decompose_with_prompt_resolver(
-        description,
-        &config,
-        &prompt_resolver,
-    ))?;
-    println!("  → {} subtask(s)\n", decomposition.subtasks.len());
-
-    // Print subtask plan
-    for (i, sub) in decomposition.subtasks.iter().enumerate() {
-        println!(
-            "  {}. [{}] {} (order: {})",
-            i + 1,
-            sub.worker_type,
-            sub.title,
-            sub.order
-        );
-    }
-    println!();
-
-    let max_concurrency = orb_config.max_concurrency;
-    let orch_config = OrchestrateConfig {
-        worker_binary: config.command.clone(),
-        worker_args: vec![],
-        worker_cwd: None,
-        worker_env: vec![],
-        tool_profiles: orb_config.tool_profiles.clone(),
-        model_config: Some(orb_config),
-        worker_default_model: config.model.clone(),
-        prompt_resolver,
-        max_concurrency,
-        context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
-        task_timeout: None,
-        budget_limit: None,
-    };
-
-    // Run orchestration
-    println!("Executing subtasks...");
-    let outcome = rt.block_on(orchestrate(
-        store,
-        &mut parent,
-        &decomposition.subtasks,
-        &orch_config,
-    ))?;
-
-    // Print results
-    println!();
-    for result in &outcome.subtask_results {
-        let status_icon = if result.status == TaskStatus::Done {
-            "✓"
-        } else {
-            "✗"
-        };
-        println!("  {status_icon} {} — {:?}", result.title, result.status);
-        if let Some(ref response) = result.response {
-            let preview = if response.len() > 200 {
-                format!("{}...", &response[..200])
-            } else {
-                response.clone()
-            };
-            println!("    {preview}");
-        }
-    }
-    println!();
-
-    println!("Orchestration complete: {:?}", outcome.parent_status);
-    if let Some(ref result) = parent.result {
-        let preview = if result.len() > 500 {
-            format!("{}...", &result[..500])
-        } else {
-            result.clone()
-        };
-        println!();
-        println!("{preview}");
-    }
-
-    Ok(())
-}
-
-fn cmd_tasks(store: &TaskStore, status_filter: Option<&str>) -> anyhow::Result<()> {
-    let tasks = if let Some(status_str) = status_filter {
-        let status = parse_status(status_str)?;
-        store.load_by_status(status)?
-    } else {
-        store.load_all()?
-    };
-
-    if tasks.is_empty() {
-        println!("No tasks found.");
-    } else {
-        for task in &tasks {
-            println!(
-                "[{:?}] {} — {} (p{})",
-                task.status, task.id, task.title, task.priority
-            );
-        }
-        println!("\n{} task(s)", tasks.len());
-    }
-    Ok(())
-}
-
-fn cmd_status(store: &TaskStore, id: &str) -> anyhow::Result<()> {
-    let uuid = id.parse::<uuid::Uuid>()?;
-    match store.load_by_id(uuid)? {
-        Some(task) => {
-            println!("Task:     {}", task.id);
-            println!("Title:    {}", task.title);
-            println!("Status:   {:?}", task.status);
-            println!("Priority: {}", task.priority);
-            println!("Created:  {}", task.created_at);
-            println!("Updated:  {}", task.updated_at);
-            if let Some(ref result) = task.result {
-                println!("Result:   {result}");
-            }
-            if let Some(ref model) = task.worker_model {
-                println!("Model:    {model}");
-            }
-            if let Some(parent) = task.parent_id {
-                println!("Parent:   {parent}");
-            }
-        }
-        None => {
-            println!("Task {id} not found.");
-        }
-    }
-    Ok(())
-}
-
-fn cmd_review(store: &TaskStore) -> anyhow::Result<()> {
-    let tasks = store.load_by_status(TaskStatus::Review)?;
-    if tasks.is_empty() {
-        println!("No tasks awaiting review.");
-    } else {
-        for task in &tasks {
-            println!("[Review] {} — {}", task.id, task.title);
-            if let Some(ref result) = task.result {
-                println!("  Result: {result}");
-            }
-        }
-        println!("\n{} task(s) awaiting review", tasks.len());
-    }
-    Ok(())
-}
-
 fn cmd_plan(
     state_dir: &std::path::Path,
     description: Option<&str>,
@@ -1820,7 +1322,6 @@ fn cmd_plan(
 }
 
 fn cmd_daemon_start(
-    _store: &TaskStore,
     state_dir: &std::path::Path,
     daemon_config: DaemonConfig,
     project: Option<&str>,
@@ -2097,67 +1598,10 @@ fn cmd_config(action: ConfigAction, project_dir: Option<&Path>) -> anyhow::Resul
     }
 }
 
-fn parse_status(s: &str) -> anyhow::Result<TaskStatus> {
-    match s.to_lowercase().as_str() {
-        "pending" => Ok(TaskStatus::Pending),
-        "active" => Ok(TaskStatus::Active),
-        "review" => Ok(TaskStatus::Review),
-        "done" => Ok(TaskStatus::Done),
-        "failed" => Ok(TaskStatus::Failed),
-        other => {
-            anyhow::bail!("unknown status: {other}. Use: pending, active, review, done, failed")
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
-
-    #[test]
-    fn parses_legacy_tasks_namespace() {
-        let cli = Cli::parse_from(["orboros", "legacy", "tasks", "--status", "done"]);
-
-        match cli.command {
-            Commands::Legacy {
-                action: LegacyAction::Tasks { status },
-            } => assert_eq!(status.as_deref(), Some("done")),
-            _ => panic!("expected legacy tasks command"),
-        }
-    }
-
-    #[test]
-    fn parses_legacy_run_namespace() {
-        let cli = Cli::parse_from([
-            "orboros",
-            "--model",
-            "openrouter/free",
-            "legacy",
-            "run",
-            "do the thing",
-            "--priority",
-            "2",
-            "--queue",
-        ]);
-
-        match cli.command {
-            Commands::Legacy {
-                action:
-                    LegacyAction::Run {
-                        task,
-                        priority,
-                        queue,
-                        ..
-                    },
-            } => {
-                assert_eq!(task, "do the thing");
-                assert_eq!(priority, 2);
-                assert!(queue);
-            }
-            _ => panic!("expected legacy run command"),
-        }
-    }
 
     #[test]
     fn top_level_run_parses_as_orb_backed_command() {
@@ -2234,15 +1678,5 @@ mod tests {
             project_dir_for_state_dir(&state).as_deref(),
             Some(Path::new("/tmp/project"))
         );
-    }
-
-    #[test]
-    fn top_level_tasks_remains_compat_alias() {
-        let cli = Cli::parse_from(["orboros", "tasks"]);
-
-        match cli.command {
-            Commands::Tasks { status } => assert!(status.is_none()),
-            _ => panic!("expected top-level tasks compatibility alias"),
-        }
     }
 }

@@ -82,65 +82,6 @@ orboros execute orb-k4f --wait --max-ticks 50
 | `--max-ticks <N>` | 20 | Maximum foreground queue cycles |
 | `--interval-ms <MS>` | 100 | Delay between foreground queue cycles |
 
-### `legacy run <TASK>`
-
-Execute a single legacy `tasks.jsonl` task directly via a worker.
-
-```bash
-orboros legacy run "Explain how JWT works" --priority 2
-orboros legacy run "Fix the bug" --queue  # queue only, don't execute
-```
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--priority, -p <N>` | 3 | Priority 1-5 |
-| `--queue` | false | Queue without executing |
-| `--system-prompt <TEXT>` | built-in | Override the worker system prompt |
-| `--system-prompt-file <PATH>` | built-in | Read the worker system prompt override from a file |
-
----
-
-### `decompose <TASK>`
-
-Legacy compatibility alias for `legacy decompose`.
-
-### `legacy decompose <TASK>`
-
-Break a legacy task into subtasks using the coordinator LLM. Prints the plan without executing.
-
-```bash
-orboros legacy decompose "Add error handling to the REST API"
-orboros legacy decompose "Add error handling" --system-prompt-file prompts/decompose-v2.md
-```
-
-| Option | Description |
-|--------|-------------|
-| `--system-prompt <TEXT>` | Override the decomposition system prompt |
-| `--system-prompt-file <PATH>` | Read the decomposition system prompt override from a file |
-
----
-
-### `orchestrate <TASK>`
-
-Legacy compatibility alias for `legacy orchestrate`.
-
-### `legacy orchestrate <TASK>`
-
-Legacy full orchestration: decompose into subtasks, route to models, execute,
-aggregate results in `tasks.jsonl`.
-
-```bash
-orboros legacy orchestrate "Refactor the authentication module" --priority 2
-```
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--priority, -p <N>` | 3 | Priority for subtasks |
-| `--system-prompt <TEXT>` | configured/built-in | Override all system prompts used by this orchestration |
-| `--system-prompt-file <PATH>` | configured/built-in | Read the orchestration system prompt override from a file |
-
----
-
 ### `plan`
 
 Create an epic with shallow decomposition into subtasks.
@@ -303,35 +244,6 @@ orboros daemon --stop
 | `--project <NAME>` | — | Supervise one registered project |
 
 ---
-
-### `tasks`
-
-Legacy compatibility alias for `legacy tasks`.
-
-### `legacy tasks`
-
-List legacy tasks (from `tasks.jsonl`).
-
-```bash
-orboros legacy tasks
-orboros legacy tasks --status done
-```
-
-### `status <ID>`
-
-Legacy compatibility alias for `legacy status`.
-
-### `legacy status <ID>`
-
-Show details for a legacy task by UUID.
-
-### `review`
-
-Legacy compatibility alias for `legacy review`.
-
-### `legacy review`
-
-List legacy tasks awaiting review.
 
 ## Edge Types
 
