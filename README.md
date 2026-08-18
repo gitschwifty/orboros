@@ -351,6 +351,7 @@ just bench-list ../orboros-bench # list benchmark cases
 just bench-run t1 ../orboros-bench
 just bench-run-model kimi t1 kimi-smoke ../orboros-bench
 orboros bench --bench-root ../orboros-bench --bench-config ../orboros-bench/config.toml run --tier t1
+orboros bench --bench-root ../orboros-bench list-runs --exclude-dynamic-models --limit 20
 orboros bench --bench-root ../orboros-bench details <run-id>
 ```
 
@@ -377,6 +378,12 @@ at a different file; explicit paths must exist. Benchmark config is applied
 before CLI flags such as `--worker-binary`, `bench run --model`, and
 `bench run --variant`. Run metadata records the Orboros git commit and the
 benchmark corpus git commit when each root is a git worktree.
+
+`bench list-runs` supports `--model`, `--exclude-model`, `--variant`,
+`--tier`, `--suite`, `--prompt-set`, `--since`, and `--limit`. Use
+`--exclude-dynamic-models` to omit `openrouter/free` and `openrouter/auto`
+runs from higher-signal historical comparisons; those selectors do not identify
+a guaranteed provider backend model.
 
 Tests use mock worker scripts (`test-fixtures/mock-worker*.sh`) for fast unit tests. Set `HEDDLE_BINARY` for integration tests against a real heddle instance.
 

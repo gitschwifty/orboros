@@ -273,6 +273,13 @@ enum BenchAction {
         /// Match configured or resolved worker model text.
         #[arg(long)]
         model: Option<String>,
+        /// Exclude a configured or resolved worker model text.
+        #[arg(long)]
+        exclude_model: Option<String>,
+        /// Exclude dynamic OpenRouter selectors such as `openrouter/free` and
+        /// `openrouter/auto`, whose actual backend model is not identified.
+        #[arg(long)]
+        exclude_dynamic_models: bool,
         /// Match a tier (`t1`, `t2`, or `t3`).
         #[arg(long)]
         tier: Option<String>,
@@ -1030,6 +1037,8 @@ fn cmd_bench(
         BenchAction::ListRuns {
             variant,
             model,
+            exclude_model,
+            exclude_dynamic_models,
             tier,
             suite,
             prompt_set,
@@ -1050,6 +1059,8 @@ fn cmd_bench(
                 &bench_cmd::BenchRunFilter {
                     variant: variant.as_deref(),
                     model: model.as_deref(),
+                    exclude_model: exclude_model.as_deref(),
+                    exclude_dynamic_models,
                     tier,
                     suite: suite.as_deref(),
                     prompt_set: prompt_set.as_deref(),

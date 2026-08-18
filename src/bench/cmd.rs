@@ -1385,6 +1385,8 @@ pub fn cmd_bench_compare(store: &BenchStore, run_a: &str, run_b: &str) -> anyhow
 pub struct BenchRunFilter<'a> {
     pub variant: Option<&'a str>,
     pub model: Option<&'a str>,
+    pub exclude_model: Option<&'a str>,
+    pub exclude_dynamic_models: bool,
     pub tier: Option<BenchTier>,
     pub suite: Option<&'a str>,
     pub prompt_set: Option<&'a str>,
@@ -1398,6 +1400,8 @@ pub fn cmd_bench_list_runs(store: &BenchStore) -> anyhow::Result<()> {
         &BenchRunFilter {
             variant: None,
             model: None,
+            exclude_model: None,
+            exclude_dynamic_models: false,
             tier: None,
             suite: None,
             prompt_set: None,
@@ -1425,7 +1429,7 @@ pub fn cmd_bench_list_runs_filtered(
     }
 
     println!(
-        "run           started              variant                 suite         tier  model                         pass fail err  cost         guidance"
+        "run           started              variant                 suite         tier  configured → resolved model            pass fail err  cost         guidance"
     );
     for run in &runs {
         let results = store.read_results(&run.run_id)?;
@@ -1445,7 +1449,7 @@ pub fn cmd_bench_list_runs_filtered(
                 .as_ref()
                 .map_or("legacy", |suite| short_hash(&suite.fingerprint)),
             tier = run_tier_label(run),
-            model = run.worker_model.as_deref().unwrap_or("-"),
+            model = model_display(run),
             passed = run.passed,
             failed = run.failed,
             errored = run.errored,
@@ -1464,17 +1468,17 @@ fn run_matches_filter(run: &BenchRun, filter: &BenchRunFilter<'_>) -> bool {
         }
     }
     if let Some(model) = filter.model {
-        let matches = [
-            run.model_selector.as_deref(),
-            run.worker_model.as_deref(),
-            run.model_key.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|candidate| candidate.contains(model));
-        if !matches {
+        if !run_model_candidates(run).any(|candidate| candidate.contains(model)) {
             return false;
         }
+    }
+    if let Some(model) = filter.exclude_model {
+        if run_model_candidates(run).any(|candidate| candidate.contains(model)) {
+            return false;
+        }
+    }
+    if filter.exclude_dynamic_models && run_uses_dynamic_selector(run) {
+        return false;
     }
     if let Some(tier) = filter.tier {
         if !run.tiers.contains(&tier) && run.tier != Some(tier) {
@@ -1498,6 +1502,35 @@ fn run_matches_filter(run: &BenchRun, filter: &BenchRunFilter<'_>) -> bool {
     filter
         .since
         .is_none_or(|since| run.started_at.date_naive() >= since)
+}
+
+fn run_model_candidates(run: &BenchRun) -> impl Iterator<Item = &str> {
+    [
+        run.model_selector.as_deref(),
+        run.worker_model.as_deref(),
+        run.model_key.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+}
+
+fn run_uses_dynamic_selector(run: &BenchRun) -> bool {
+    matches!(
+        run.model_selector.as_deref(),
+        Some("openrouter/free" | "openrouter/auto")
+    )
+}
+
+fn model_display(run: &BenchRun) -> String {
+    let configured = run.model_selector.as_deref().unwrap_or("-");
+    let resolved = run.worker_model.as_deref().unwrap_or("-");
+    if configured == resolved || configured == "-" {
+        resolved.to_string()
+    } else if run_uses_dynamic_selector(run) {
+        format!("{configured} (dynamic) → {resolved}")
+    } else {
+        format!("{configured} → {resolved}")
+    }
 }
 
 fn stored_resource_target_counts(results: &[BenchResult]) -> (u32, u32, u32) {
@@ -2739,6 +2772,8 @@ text = "x"
         let matching = BenchRunFilter {
             variant: Some("reliability-check"),
             model: None,
+            exclude_model: None,
+            exclude_dynamic_models: false,
             tier: None,
             suite: None,
             prompt_set: None,
@@ -2752,6 +2787,47 @@ text = "x"
             ..matching
         };
         assert!(!run_matches_filter(&run, &different));
+    }
+
+    #[test]
+    fn run_filter_excludes_configured_dynamic_selectors() {
+        let mut dynamic = sample_run("run-dynamic");
+        dynamic.model_selector = Some("openrouter/free".into());
+        dynamic.worker_model = Some("openrouter/free".into());
+        let filter = BenchRunFilter {
+            variant: None,
+            model: None,
+            exclude_model: None,
+            exclude_dynamic_models: true,
+            tier: None,
+            suite: None,
+            prompt_set: None,
+            since: None,
+            limit: None,
+        };
+        assert!(!run_matches_filter(&dynamic, &filter));
+
+        dynamic.model_selector = Some("openai/gpt-5".into());
+        assert!(run_matches_filter(&dynamic, &filter));
+    }
+
+    #[test]
+    fn run_filter_excludes_selector_or_resolved_model() {
+        let mut run = sample_run("run-model");
+        run.model_selector = Some("balanced".into());
+        run.worker_model = Some("openai/gpt-5".into());
+        let filter = BenchRunFilter {
+            variant: None,
+            model: None,
+            exclude_model: Some("gpt-5"),
+            exclude_dynamic_models: false,
+            tier: None,
+            suite: None,
+            prompt_set: None,
+            since: None,
+            limit: None,
+        };
+        assert!(!run_matches_filter(&run, &filter));
     }
 
     #[test]
