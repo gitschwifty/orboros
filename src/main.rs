@@ -18,7 +18,7 @@ use orboros::orb_cmd;
 use orboros::orchestrator::{orchestrate, OrchestrateConfig, CONTEXT_RESULT_MAX_CHARS};
 use orboros::plan::{self, PlanConfig};
 use orboros::queue_loop::{DrainResult, QueueLoop};
-use orboros::routing::profile::{builtin_tools, ToolProfile};
+use orboros::routing::profile::builtin_tools;
 use orboros::runner::execute_task;
 use orboros::state::store::TaskStore;
 use orboros::state::task::{Task, TaskStatus};
@@ -45,9 +45,9 @@ struct Cli {
     #[arg(long, env = "HEDDLE_BINARY")]
     worker_binary: Option<String>,
 
-    /// Model to use for workers.
-    #[arg(long, default_value = "openrouter/free")]
-    model: String,
+    /// Model catalog key or raw provider/model override for workers.
+    #[arg(long)]
+    model: Option<String>,
 
     /// Skip startup validation of worker binary, model string, and
     /// provider credentials. Use when running against a local proxy or
@@ -148,6 +148,11 @@ enum Commands {
     },
     /// Initialize a new project in the current directory.
     Init,
+    /// Create, upgrade, or inspect the layered Orboros configuration.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// Run or manage the daemon process.
     Daemon {
         /// Stop a running daemon.
@@ -216,6 +221,32 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+enum ConfigAction {
+    /// Write an annotated starter config (project by default).
+    Init {
+        /// Target ~/.orboros/config.toml instead of .orbs/config.toml.
+        #[arg(long)]
+        global: bool,
+        /// Replace an existing config file.
+        #[arg(long)]
+        force: bool,
+        /// Write only the version marker so settings inherit from lower layers.
+        #[arg(long)]
+        minimal: bool,
+    },
+    /// Preview or apply a schema/default upgrade (project by default).
+    Upgrade {
+        #[arg(long)]
+        global: bool,
+        /// Persist the previewed upgrade. Without this flag no files change.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Print effective configuration values and their layered sources.
+    Show,
+}
+
+#[derive(Subcommand)]
 enum BenchAction {
     /// List every case in the corpus, grouped by tier.
     List,
@@ -240,8 +271,8 @@ enum BenchAction {
         #[arg(long)]
         no_budget: bool,
         /// Maximum benchmark cases to run concurrently. Defaults to serial execution.
-        #[arg(long, default_value_t = 1)]
-        jobs: usize,
+        #[arg(long)]
+        jobs: Option<usize>,
     },
     /// Print every result row in a saved run.
     Show {
@@ -284,6 +315,9 @@ enum BenchAction {
     Compare { run_a: String, run_b: String },
     /// List recorded runs, with optional comparability filters.
     ListRuns {
+        /// Match the human-readable experiment variant label.
+        #[arg(long)]
+        variant: Option<String>,
         /// Match configured or resolved worker model text.
         #[arg(long)]
         model: Option<String>,
@@ -615,7 +649,12 @@ fn require_binary(worker_binary: Option<&str>) -> anyhow::Result<&str> {
 /// unless `skip_prereq_check` is true.
 ///
 /// Returns the resolved binary path for the caller to keep using.
-fn prereq_check(worker_binary: Option<&str>, model: &str, skip: bool) -> anyhow::Result<String> {
+fn prereq_check(
+    worker_binary: Option<&str>,
+    model: &str,
+    router: Option<&str>,
+    skip: bool,
+) -> anyhow::Result<String> {
     let binary = require_binary(worker_binary)?;
     if skip {
         tracing::warn!("--skip-prereq-check set; trusting caller for binary/model/credentials");
@@ -624,7 +663,7 @@ fn prereq_check(worker_binary: Option<&str>, model: &str, skip: bool) -> anyhow:
     orboros::startup_check::validate_worker_prereqs(&orboros::startup_check::PrereqCheck {
         worker_binary: binary,
         model,
-        router: Some("openrouter"),
+        router,
         require_credentials: true,
     })?;
     Ok(orboros::startup_check::resolve_binary(binary)?
@@ -632,27 +671,25 @@ fn prereq_check(worker_binary: Option<&str>, model: &str, skip: bool) -> anyhow:
         .to_string())
 }
 
-fn load_legacy_tool_profiles(
-    state_dir: Option<&std::path::Path>,
-) -> std::collections::BTreeMap<String, ToolProfile> {
-    if let Some(dir) = state_dir {
-        let config_path = dir.join("routing.toml");
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            match orboros::routing::rules::parse_routing_config(&content) {
-                Ok(config) => {
-                    tracing::info!("Loaded legacy tool profiles from {}", config_path.display());
-                    return config.profiles.into_iter().collect();
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to parse routing config at {}: {e}",
-                        config_path.display()
-                    );
-                }
-            }
-        }
-    }
-    std::collections::BTreeMap::new()
+fn resolved_worker_config(
+    project_dir: Option<&Path>,
+    worker_binary: Option<&str>,
+    model: Option<&str>,
+    role: config::ModelRole<'_>,
+    skip_prereq_check: bool,
+) -> anyhow::Result<(WorkerConfig, config::OrbConfig)> {
+    let resolver = config::RuntimeConfigResolver::load(project_dir, model, worker_binary)?;
+    let resolved_model = resolver.model_for(role)?;
+    let binary = prereq_check(
+        Some(resolver.worker_binary()?),
+        &resolved_model.model,
+        resolved_model.router.as_deref(),
+        skip_prereq_check,
+    )?;
+    Ok((
+        make_worker_config(&binary, &resolved_model.model, ""),
+        resolver.config,
+    ))
 }
 
 fn make_worker_config(binary: &str, model: &str, system_prompt: &str) -> WorkerConfig {
@@ -727,7 +764,7 @@ fn main() -> anyhow::Result<()> {
             priority,
             queue,
             cli.worker_binary.as_deref(),
-            &cli.model,
+            cli.model.as_deref(),
             max_ticks,
             interval_ms,
             cli.skip_prereq_check,
@@ -743,7 +780,7 @@ fn main() -> anyhow::Result<()> {
             &id,
             wait,
             cli.worker_binary.as_deref(),
-            &cli.model,
+            cli.model.as_deref(),
             max_ticks,
             interval_ms,
             cli.skip_prereq_check,
@@ -754,7 +791,7 @@ fn main() -> anyhow::Result<()> {
             system_prompt_file,
         } => cmd_decompose(
             cli.worker_binary.as_deref(),
-            &cli.model,
+            cli.model.as_deref(),
             &task,
             system_prompt.as_deref(),
             system_prompt_file.as_deref(),
@@ -768,7 +805,7 @@ fn main() -> anyhow::Result<()> {
         } => cmd_orchestrate(
             &store,
             cli.worker_binary.as_deref(),
-            &cli.model,
+            cli.model.as_deref(),
             &task,
             priority,
             system_prompt.as_deref(),
@@ -781,7 +818,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Legacy { action } => cmd_legacy(
             &store,
             cli.worker_binary.as_deref(),
-            &cli.model,
+            cli.model.as_deref(),
             action,
             cli.skip_prereq_check,
         ),
@@ -791,6 +828,7 @@ fn main() -> anyhow::Result<()> {
             shallow,
         } => cmd_plan(&state_dir, description.as_deref(), file.as_deref(), shallow),
         Commands::Init => cmd_init(),
+        Commands::Config { action } => cmd_config(action, effective_state.project_dir.as_deref()),
         Commands::Daemon {
             stop,
             status,
@@ -940,8 +978,9 @@ fn main() -> anyhow::Result<()> {
             link_orb,
         } => cmd_chat(
             &state_dir,
+            effective_state.project_dir.as_deref(),
             cli.worker_binary.as_deref(),
-            chat_model.as_deref().unwrap_or(&cli.model),
+            chat_model.as_deref().or(cli.model.as_deref()),
             &system_prompt,
             link_orb.as_deref(),
             cli.skip_prereq_check,
@@ -980,7 +1019,7 @@ fn main() -> anyhow::Result<()> {
 fn cmd_legacy(
     store: &TaskStore,
     worker_binary: Option<&str>,
-    model: &str,
+    model: Option<&str>,
     action: LegacyAction,
     skip_prereq_check: bool,
 ) -> anyhow::Result<()> {
@@ -1107,8 +1146,12 @@ fn cmd_bench(
                     .ok_or_else(|| anyhow::anyhow!("worker_binary is unset in OrbConfig"))?;
                 &binary_owned
             };
-            let binary =
-                bench_prereq_check(Some(binary), &resolved_model.model, skip_prereq_check)?;
+            let binary = bench_prereq_check(
+                Some(binary),
+                &resolved_model.model,
+                resolved_model.router.as_deref(),
+                skip_prereq_check,
+            )?;
             let worker_config = make_worker_config(&binary, &resolved_model.model, "");
             let prompt_set = prompt_set
                 .as_deref()
@@ -1147,7 +1190,7 @@ fn cmd_bench(
                 case_id: case.as_deref(),
                 worker_config: &worker_config,
                 no_budget,
-                jobs,
+                jobs: jobs.or(cfg.bench.jobs).unwrap_or(1),
                 timeout_s: cfg.bench.timeout_s,
                 max_iterations: cfg.bench.max_iterations,
                 run_config: &run_config,
@@ -1169,6 +1212,7 @@ fn cmd_bench(
             bench_cmd::cmd_bench_compare(&store, &run_a, &run_b)
         }
         BenchAction::ListRuns {
+            variant,
             model,
             tier,
             suite,
@@ -1188,6 +1232,7 @@ fn cmd_bench(
             bench_cmd::cmd_bench_list_runs_filtered(
                 &store,
                 &bench_cmd::BenchRunFilter {
+                    variant: variant.as_deref(),
                     model: model.as_deref(),
                     tier,
                     suite: suite.as_deref(),
@@ -1206,24 +1251,10 @@ fn cmd_bench(
 fn bench_prereq_check(
     worker_binary: Option<&str>,
     model: &str,
+    router: Option<&str>,
     skip: bool,
 ) -> anyhow::Result<String> {
-    let binary = require_binary(worker_binary)?;
-    if skip {
-        tracing::warn!("--skip-prereq-check set; trusting caller for binary/model/credentials");
-        return Ok(binary.to_string());
-    }
-    orboros::startup_check::check_binary(binary)?;
-    orboros::startup_check::check_model_string_for_router(Some("openrouter"), model)?;
-    if std::env::var("OPENROUTER_API_KEY").map_or(true, |s| s.trim().is_empty()) {
-        anyhow::bail!(
-            "missing credentials for bench OpenRouter route: set OPENROUTER_API_KEY \
-             (looked at .env and process env)"
-        );
-    }
-    Ok(orboros::startup_check::resolve_binary(binary)?
-        .display()
-        .to_string())
+    prereq_check(worker_binary, model, router, skip)
 }
 
 fn cmd_sessions(state_dir: &std::path::Path, action: Option<SessionsAction>) -> anyhow::Result<()> {
@@ -1266,13 +1297,21 @@ fn parse_session_status(s: &str) -> anyhow::Result<orbs::session::SessionStatus>
 
 fn cmd_chat(
     state_dir: &std::path::Path,
+    project_dir: Option<&Path>,
     worker_binary: Option<&str>,
-    model: &str,
+    model: Option<&str>,
     system_prompt: &str,
     link_orb: Option<&str>,
     skip_prereq_check: bool,
 ) -> anyhow::Result<()> {
-    let binary = prereq_check(worker_binary, model, skip_prereq_check)?;
+    let (mut worker_config, _) = resolved_worker_config(
+        project_dir,
+        worker_binary,
+        model,
+        config::ModelRole::Chat,
+        skip_prereq_check,
+    )?;
+    worker_config.system_prompt = system_prompt.into();
     let sessions_dir = state_dir.join("sessions");
     std::fs::create_dir_all(&sessions_dir)?;
     let session_store = orbs::session_store::SessionStore::new(sessions_dir);
@@ -1280,14 +1319,13 @@ fn cmd_chat(
     let init = orbs::session::SessionInit {
         id: orbs::session::SessionId::new(),
         created_at: chrono::Utc::now(),
-        model: model.into(),
+        model: worker_config.model.clone(),
         system_prompt: Some(system_prompt.into()),
         cwd: std::env::current_dir()
             .ok()
             .map(|p| p.to_string_lossy().into_owned()),
         linked_orb: link_orb.map(orbs::id::OrbId::from_raw),
     };
-    let worker_config = make_worker_config(&binary, model, system_prompt);
     let runtime = orboros::convo::ConvoRuntime::new(session_store);
     let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
 
@@ -1303,22 +1341,17 @@ fn cmd_chat(
 fn foreground_worker_config(
     project_dir: Option<&std::path::Path>,
     worker_binary: Option<&str>,
-    model: &str,
+    model: Option<&str>,
     skip_prereq_check: bool,
 ) -> anyhow::Result<WorkerConfig> {
-    let cfg = config::load_config(project_dir)?;
-    let binary_owned;
-    let binary = if let Some(binary) = worker_binary {
-        binary
-    } else {
-        binary_owned = cfg
-            .worker_binary
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("worker_binary is unset in OrbConfig"))?;
-        &binary_owned
-    };
-    let binary = prereq_check(Some(binary), model, skip_prereq_check)?;
-    Ok(make_worker_config(&binary, model, ""))
+    resolved_worker_config(
+        project_dir,
+        worker_binary,
+        model,
+        config::ModelRole::Worker("execute"),
+        skip_prereq_check,
+    )
+    .map(|(worker_config, _)| worker_config)
 }
 
 fn foreground_queue_with_project(
@@ -1369,7 +1402,7 @@ fn cmd_run_orb(
     priority: u8,
     queue_only: bool,
     worker_binary: Option<&str>,
-    model: &str,
+    model: Option<&str>,
     max_ticks: u32,
     interval_ms: u64,
     skip_prereq_check: bool,
@@ -1414,7 +1447,7 @@ fn cmd_execute_orb(
     id: &str,
     wait: bool,
     worker_binary: Option<&str>,
-    model: &str,
+    model: Option<&str>,
     max_ticks: u32,
     interval_ms: u64,
     skip_prereq_check: bool,
@@ -1443,7 +1476,7 @@ fn cmd_execute_orb(
 fn cmd_legacy_run(
     store: &TaskStore,
     worker_binary: Option<&str>,
-    model: &str,
+    model: Option<&str>,
     description: &str,
     priority: u8,
     queue: bool,
@@ -1461,7 +1494,14 @@ fn cmd_legacy_run(
         return Ok(());
     }
 
-    let binary = prereq_check(worker_binary, model, skip_prereq_check)?;
+    let project_dir = std::env::current_dir().ok();
+    let (mut config, _) = resolved_worker_config(
+        project_dir.as_deref(),
+        worker_binary,
+        model,
+        config::ModelRole::Worker("execute"),
+        skip_prereq_check,
+    )?;
     let default_system_prompt =
         "You are a helpful assistant. Complete the task described in the user message.";
     let resolved_override =
@@ -1471,7 +1511,7 @@ fn cmd_legacy_run(
         .map_or(default_system_prompt, |resolved| {
             resolved.system_prompt.as_str()
         });
-    let config = make_worker_config(&binary, model, resolved_system_prompt);
+    config.system_prompt = resolved_system_prompt.into();
 
     println!("  status:   executing...");
     println!();
@@ -1499,19 +1539,26 @@ fn cmd_legacy_run(
 
 fn cmd_decompose(
     worker_binary: Option<&str>,
-    model: &str,
+    model: Option<&str>,
     description: &str,
     system_prompt: Option<&str>,
     system_prompt_file: Option<&std::path::Path>,
     skip_prereq_check: bool,
 ) -> anyhow::Result<()> {
-    let binary = prereq_check(worker_binary, model, skip_prereq_check)?;
-    let config = make_worker_config(&binary, model, ""); // system prompt set by decompose()
-    let prompt_config = config::load_config(None)?.prompts;
+    let project_dir = std::env::current_dir().ok();
+    let (config, orb_config) = resolved_worker_config(
+        project_dir.as_deref(),
+        worker_binary,
+        model,
+        config::ModelRole::Coordinator("decompose"),
+        skip_prereq_check,
+    )?;
+    let prompt_config = orb_config.prompts;
     let cli_override =
         orboros::prompt::resolve_cli_system_prompt(system_prompt, system_prompt_file)?;
-    let prompt_resolver = orboros::prompt::PromptResolver::from_config(prompt_config, None)
-        .with_cli_override(cli_override);
+    let prompt_resolver =
+        orboros::prompt::PromptResolver::from_config(prompt_config, project_dir.as_deref())
+            .with_cli_override(cli_override);
 
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(decompose_with_prompt_resolver(
@@ -1543,22 +1590,27 @@ fn cmd_decompose(
 fn cmd_orchestrate(
     store: &TaskStore,
     worker_binary: Option<&str>,
-    model: &str,
+    model: Option<&str>,
     description: &str,
     priority: u8,
     system_prompt: Option<&str>,
     system_prompt_file: Option<&std::path::Path>,
     skip_prereq_check: bool,
 ) -> anyhow::Result<()> {
-    let binary = prereq_check(worker_binary, model, skip_prereq_check)?;
-    let config = make_worker_config(&binary, model, ""); // system prompt set per step
-    let project_dir = store.path().parent();
-    let orb_config = config::load_config(project_dir)?;
+    let state_dir = store.path().parent();
+    let project_dir = state_dir.and_then(project_dir_for_state_dir);
+    let (config, orb_config) = resolved_worker_config(
+        project_dir.as_deref(),
+        worker_binary,
+        model,
+        config::ModelRole::Coordinator("decompose"),
+        skip_prereq_check,
+    )?;
     let prompt_config = orb_config.prompts.clone();
     let cli_override =
         orboros::prompt::resolve_cli_system_prompt(system_prompt, system_prompt_file)?;
     let prompt_resolver =
-        orboros::prompt::PromptResolver::from_config(prompt_config.clone(), project_dir)
+        orboros::prompt::PromptResolver::from_config(prompt_config.clone(), project_dir.as_deref())
             .with_cli_override(cli_override);
 
     // Create parent task
@@ -1590,20 +1642,17 @@ fn cmd_orchestrate(
     }
     println!();
 
-    // Prefer first-class tool profiles from OrbConfig, with routing.toml
-    // retained only as a legacy fallback for existing profile files.
-    let mut tool_profiles = load_legacy_tool_profiles(project_dir);
-    tool_profiles.extend(orb_config.tool_profiles.clone());
+    let max_concurrency = orb_config.max_concurrency;
     let orch_config = OrchestrateConfig {
-        worker_binary: binary.clone(),
+        worker_binary: config.command.clone(),
         worker_args: vec![],
         worker_cwd: None,
         worker_env: vec![],
-        tool_profiles,
+        tool_profiles: orb_config.tool_profiles.clone(),
         model_config: Some(orb_config),
-        worker_default_model: model.to_string(),
+        worker_default_model: config.model.clone(),
         prompt_resolver,
-        max_concurrency: 4,
+        max_concurrency,
         context_result_max_chars: CONTEXT_RESULT_MAX_CHARS,
         task_timeout: None,
         budget_limit: None,
@@ -1943,6 +1992,108 @@ fn cmd_init() -> anyhow::Result<()> {
             .unwrap_or("unnamed")
     );
     Ok(())
+}
+
+fn config_target(global: bool, project_dir: Option<&Path>) -> anyhow::Result<PathBuf> {
+    if global {
+        let home = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+        return Ok(home.join(".orboros/config.toml"));
+    }
+    let project = project_dir
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())
+        .ok_or_else(|| anyhow::anyhow!("could not determine project directory"))?;
+    Ok(project.join(".orbs/config.toml"))
+}
+
+fn cmd_config(action: ConfigAction, project_dir: Option<&Path>) -> anyhow::Result<()> {
+    match action {
+        ConfigAction::Init {
+            global,
+            force,
+            minimal,
+        } => {
+            let target = config_target(global, project_dir)?;
+            if target.exists() && !force {
+                anyhow::bail!(
+                    "config already exists: {} (use --force to replace it)",
+                    target.display()
+                );
+            }
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&target, config::starter_config_template(minimal))?;
+            println!(
+                "Wrote {} config: {}",
+                if minimal { "minimal" } else { "starter" },
+                target.display()
+            );
+            Ok(())
+        }
+        ConfigAction::Upgrade { global, apply } => {
+            let target = config_target(global, project_dir)?;
+            let content = std::fs::read_to_string(&target)
+                .map_err(|e| anyhow::anyhow!("reading {}: {e}", target.display()))?;
+            let (mut upgraded, mut added) = config::upgrade_config_toml(&content)?;
+
+            if !global {
+                let routing = target.with_file_name("routing.toml");
+                if routing.exists() {
+                    let legacy = orboros::routing::rules::parse_routing_config(
+                        &std::fs::read_to_string(&routing)?,
+                    )?;
+                    if !legacy.profiles.is_empty() {
+                        let mut table: toml::value::Table = toml::from_str(&upgraded)?;
+                        let profiles = table
+                            .entry("tool_profiles")
+                            .or_insert_with(|| toml::Value::Table(Default::default()));
+                        let profiles = profiles
+                            .as_table_mut()
+                            .ok_or_else(|| anyhow::anyhow!("tool_profiles must be a TOML table"))?;
+                        for (name, profile) in legacy.profiles {
+                            if !profiles.contains_key(&name) {
+                                profiles.insert(name.clone(), toml::Value::try_from(profile)?);
+                                added.push(format!(
+                                    "tool_profiles.{name} (imported from routing.toml)"
+                                ));
+                            }
+                        }
+                        upgraded = toml::to_string_pretty(&table)?;
+                    }
+                    println!("note: legacy routing model rules are not migrated; configure [models] instead");
+                }
+            }
+            if added.is_empty() {
+                println!("{} is already current", target.display());
+            } else {
+                println!("{} would add:\n  {}", target.display(), added.join("\n  "));
+            }
+            if apply && !added.is_empty() {
+                std::fs::write(&target, upgraded)?;
+                println!("Applied config upgrade.");
+            } else if !apply && !added.is_empty() {
+                println!("Dry run only; re-run with --apply to write changes.");
+            }
+            Ok(())
+        }
+        ConfigAction::Show => {
+            let cfg = config::load_config(project_dir)?;
+            let resolver = cfg.model_resolver();
+            let worker = resolver.resolve(config::ModelRole::Worker("execute"))?;
+            let chat = resolver.resolve(config::ModelRole::Chat)?;
+            println!("config_version: {}", cfg.config_version);
+            println!(
+                "worker_binary: {}",
+                cfg.worker_binary.as_deref().unwrap_or("<unset>")
+            );
+            println!("max_concurrency: {}", cfg.max_concurrency);
+            println!("worker model: {} ({})", worker.model, worker.source);
+            println!("chat model: {} ({})", chat.model, chat.source);
+            Ok(())
+        }
+    }
 }
 
 fn parse_status(s: &str) -> anyhow::Result<TaskStatus> {

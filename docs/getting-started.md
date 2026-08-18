@@ -41,6 +41,14 @@ cargo run -- --worker-binary /path/to/heddle-headless run "Hello"
 
 ### 4. Configuration (optional)
 
+Write a complete, commented project policy (or use `--minimal` to inherit
+global settings until you add overrides):
+
+```bash
+orboros config init
+orboros config init --minimal
+```
+
 Edit `.orbs/config.toml` in your project:
 
 ```toml
@@ -50,12 +58,16 @@ max_concurrency = 4
 [review]
 requires_approval_by_default = false
 
-[notifications]
+[notification]
 enabled = true
-desktop = true
+desktop_enabled = true
 ```
 
-Global defaults go in `~/.orboros/config.toml`. Project config overrides global.
+Global defaults go in `~/.orboros/config.toml`; use `orboros config init --global`
+to create its annotated template. Effective precedence is built-in defaults,
+global config, project config, then explicitly supplied CLI flags. Run
+`orboros config show` to inspect active settings and `orboros config upgrade`
+to preview schema additions before applying them.
 
 ## Basic Usage
 
@@ -168,24 +180,17 @@ The daemon loop:
 
 ## Model Routing
 
-Place `routing.toml` in your state directory to route subtask types to different models:
+Configure model roles in `.orbs/config.toml`; `routing.toml` is no longer read
+at runtime. `orboros config upgrade --apply` can import its legacy tool profiles.
 
 ```toml
-default_model = "openrouter/auto"
+[models.workers]
+research = "google/gemini-2.0-flash-001"
+edit = "anthropic/claude-sonnet-4-20250514"
 
-[[rules]]
-worker_type = "research"
-model = "google/gemini-2.0-flash-001"
-
-[[rules]]
-worker_type = "edit"
-model = "anthropic/claude-sonnet-4-20250514"
-
-[profiles.edit]
+[tool_profiles.edit]
 allowed_tools = ["read_file", "write_file", "edit_file", "glob", "grep", "bash"]
 ```
-
-See `examples/routing.toml` for a complete example.
 
 ## What Happens During Orchestration
 

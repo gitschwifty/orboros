@@ -872,13 +872,13 @@ pub fn cmd_bench_report(
 }
 
 /// Aggregates canonical dispatch ledgers across historical runs that share a
-/// suite, prompt, worker-model, and config identity. Runs without a retained
+/// suite, variant, prompt, worker-model, and config identity. Runs without a retained
 /// suite identity stay in their own compatibility group rather than being
 /// silently compared to newer data.
 pub fn cmd_bench_report_history(store: &BenchStore) -> anyhow::Result<()> {
     let runs = store.read_runs()?;
     let mut groups = BTreeMap::<
-        (String, String, String, String),
+        (String, String, String, String, String),
         Vec<(BenchRun, Vec<BenchDispatchRecord>)>,
     >::new();
     for run in runs {
@@ -890,10 +890,11 @@ pub fn cmd_bench_report_history(store: &BenchStore) -> anyhow::Result<()> {
             || format!("historical:{}", run.run_id),
             |manifest| manifest.fingerprint.clone(),
         );
+        let variant = run.variant.clone().unwrap_or_else(|| "-".into());
         let prompt = run.prompt_variant.clone().unwrap_or_else(|| "-".into());
         let model = run.worker_model.clone().unwrap_or_else(|| "-".into());
         groups
-            .entry((suite, prompt, model, run.config_hash.clone()))
+            .entry((suite, variant, prompt, model, run.config_hash.clone()))
             .or_default()
             .push((run, records));
     }
@@ -902,15 +903,16 @@ pub fn cmd_bench_report_history(store: &BenchStore) -> anyhow::Result<()> {
     }
 
     println!("== historical dispatch report ==");
-    for ((suite, prompt, model, config), runs) in groups {
+    for ((suite, variant, prompt, model, config), runs) in groups {
         let mut records = Vec::new();
         for (_, run_records) in &runs {
             records.extend(run_records.iter().cloned());
         }
         println!(
-            "\n-- runs={} suite={} prompt={} model={} config={} dispatches={} --",
+            "\n-- runs={} suite={} variant={} prompt={} model={} config={} dispatches={} --",
             runs.len(),
             short_hash(&suite),
+            variant,
             prompt,
             model,
             short_hash(&config),
@@ -1381,6 +1383,7 @@ pub fn cmd_bench_compare(store: &BenchStore, run_a: &str, run_b: &str) -> anyhow
 ///
 /// Returns an error if the store can't be read.
 pub struct BenchRunFilter<'a> {
+    pub variant: Option<&'a str>,
     pub model: Option<&'a str>,
     pub tier: Option<BenchTier>,
     pub suite: Option<&'a str>,
@@ -1393,6 +1396,7 @@ pub fn cmd_bench_list_runs(store: &BenchStore) -> anyhow::Result<()> {
     cmd_bench_list_runs_filtered(
         store,
         &BenchRunFilter {
+            variant: None,
             model: None,
             tier: None,
             suite: None,
@@ -1421,7 +1425,7 @@ pub fn cmd_bench_list_runs_filtered(
     }
 
     println!(
-        "run           started              suite         tier  model                         pass fail err  cost         guidance"
+        "run           started              variant                 suite         tier  model                         pass fail err  cost         guidance"
     );
     for run in &runs {
         let results = store.read_results(&run.run_id)?;
@@ -1432,9 +1436,10 @@ pub fn cmd_bench_list_runs_filtered(
             format!("{under}U {over}O {investigate}I")
         };
         println!(
-            "{run_id:<12}  {started:<19}  {suite:<12}  {tier:<4}  {model:<28}  {passed:>4} {failed:>4} {errored:>3}  {cost:<11}  {guidance}",
+            "{run_id:<12}  {started:<19}  {variant:<22}  {suite:<12}  {tier:<4}  {model:<28}  {passed:>4} {failed:>4} {errored:>3}  {cost:<11}  {guidance}",
             run_id = run_display_label(&run.run_id),
             started = run.started_at.format("%Y-%m-%d %H:%M:%S"),
+            variant = run.variant.as_deref().unwrap_or("-"),
             suite = run
                 .suite_manifest
                 .as_ref()
@@ -1453,6 +1458,11 @@ pub fn cmd_bench_list_runs_filtered(
 }
 
 fn run_matches_filter(run: &BenchRun, filter: &BenchRunFilter<'_>) -> bool {
+    if let Some(variant) = filter.variant {
+        if run.variant.as_deref() != Some(variant) {
+            return false;
+        }
+    }
     if let Some(model) = filter.model {
         let matches = [
             run.model_selector.as_deref(),
@@ -2720,6 +2730,28 @@ text = "x"
         let dir = tempfile::tempdir().unwrap();
         let store = BenchStore::new(dir.path().join("bench"));
         cmd_bench_list_runs(&store).unwrap();
+    }
+
+    #[test]
+    fn run_filter_matches_normalized_variant_exactly() {
+        let mut run = sample_run("run-variant");
+        run.variant = Some("reliability-check".into());
+        let matching = BenchRunFilter {
+            variant: Some("reliability-check"),
+            model: None,
+            tier: None,
+            suite: None,
+            prompt_set: None,
+            since: None,
+            limit: None,
+        };
+        assert!(run_matches_filter(&run, &matching));
+
+        let different = BenchRunFilter {
+            variant: Some("baseline"),
+            ..matching
+        };
+        assert!(!run_matches_filter(&run, &different));
     }
 
     #[test]

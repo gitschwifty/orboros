@@ -84,7 +84,7 @@ orboros daemon
 |------|---------|---------|-------------|
 | `--state-dir` | — | nearest ancestor `.orbs`, then `~/.orboros/default` | Project state directory |
 | `--worker-binary` | `HEDDLE_BINARY` | — | Path to heddle-headless binary |
-| `--model` | — | `openrouter/free` | Default model |
+| `--model` | — | configured role default | Explicit model override |
 
 ## Orb Schema
 
@@ -156,6 +156,9 @@ Layered config with TOML:
 .orbs/config.toml               # Project overrides
 CLI flags                       # Per-invocation overrides
 ```
+
+See the [configuration reference](docs/configuration.md) for the full schema,
+including benchmark overlays and concurrency settings.
 
 ```toml
 # Example .orbs/config.toml
@@ -310,8 +313,8 @@ worker context. Orboros records each dispatch's resolved inventory in the
 execution ledger so benchmark evidence can distinguish the permitted policy
 from a worker's attempted tool calls.
 
-`routing.toml` is legacy and remains only as a fallback reader for old tool
-profile files.
+`routing.toml` is not read at runtime. Use `orboros config upgrade --apply` to
+import its legacy tool profiles into the canonical config before removing it.
 
 ```toml
 # preferred: .orbs/config.toml

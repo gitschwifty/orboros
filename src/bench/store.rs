@@ -454,6 +454,9 @@ impl BenchStore {
             }
         }
         runs.sort_by_key(|run| run.started_at);
+        for run in &mut runs {
+            normalize_legacy_variant(run);
+        }
         Ok(runs)
     }
 
@@ -605,6 +608,18 @@ fn dedupe_runs_last_wins(runs: Vec<BenchRun>) -> Vec<BenchRun> {
         }
     }
     deduped
+}
+
+/// Repairs labels written by older `just` recipes that passed shell quotes as
+/// literal argument data. Persisted JSON stays readable without mutating
+/// append-only history; new recipes write the normalized value directly.
+fn normalize_legacy_variant(run: &mut BenchRun) {
+    let Some(variant) = run.variant.as_deref() else {
+        return;
+    };
+    if variant.len() >= 2 && variant.starts_with('"') && variant.ends_with('"') {
+        run.variant = Some(variant[1..variant.len() - 1].into());
+    }
 }
 
 fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Vec<T>, StoreError> {
@@ -780,6 +795,18 @@ mod tests {
         let read = store.read_runs().unwrap();
         assert_eq!(read.len(), 1);
         assert_eq!(read[0], r);
+    }
+
+    #[test]
+    fn read_runs_normalizes_legacy_quoted_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BenchStore::new(dir.path().join("bench"));
+        let mut run = sample_run(DATED_RUN_ID);
+        run.variant = Some("\"reliability-check\"".into());
+        store.append_run(&run).unwrap();
+
+        let read = store.read_runs().unwrap();
+        assert_eq!(read[0].variant.as_deref(), Some("reliability-check"));
     }
 
     #[test]

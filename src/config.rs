@@ -13,6 +13,10 @@ use crate::routing::profile::{validate_profiles, ToolProfile};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct OrbConfig {
+    /// On-disk schema version. Missing values read as the current compatible
+    /// version so existing hand-written configs remain readable.
+    #[serde(default = "current_config_version")]
+    pub config_version: u32,
     pub default_model: String,
     pub max_concurrency: usize,
     pub worker_binary: Option<String>,
@@ -25,10 +29,15 @@ pub struct OrbConfig {
     pub notification: NotificationConfig,
 }
 
+const fn current_config_version() -> u32 {
+    1
+}
+
 impl Default for OrbConfig {
     fn default() -> Self {
         Self {
             default_model: "openrouter/free".to_string(),
+            config_version: 1,
             max_concurrency: 4,
             worker_binary: None,
             models: ModelConfig::default(),
@@ -47,6 +56,7 @@ impl Default for OrbConfig {
 pub struct BenchConfig {
     pub timeout_s: Option<u32>,
     pub max_iterations: Option<u32>,
+    pub jobs: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,6 +78,7 @@ pub struct ModelDefaults {
     pub phase: Option<String>,
     pub reviewer: Option<String>,
     pub bench: Option<String>,
+    pub chat: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,6 +107,7 @@ pub enum ModelRole<'a> {
     Reviewer,
     BenchDefault,
     BenchGrader,
+    Chat,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +160,7 @@ impl ModelConfig {
             ("models.default.phase", self.default.phase.as_deref()),
             ("models.default.reviewer", self.default.reviewer.as_deref()),
             ("models.default.bench", self.default.bench.as_deref()),
+            ("models.default.chat", self.default.chat.as_deref()),
             ("models.bench.default", self.bench.default.as_deref()),
             ("models.bench.grader", self.bench.grader.as_deref()),
         ] {
@@ -275,6 +288,11 @@ impl ModelResolver<'_> {
                         .as_deref()
                         .map(|selector| (selector, "models.default.bench".to_string()))
                 }),
+            ModelRole::Chat => models
+                .default
+                .chat
+                .as_deref()
+                .map(|selector| (selector, "models.default.chat".to_string())),
         }
         .unwrap_or((&self.config.default_model, "default_model".to_string()));
 
@@ -325,6 +343,51 @@ impl ModelResolver<'_> {
         }
 
         anyhow::bail!("unknown model option `{selector}` referenced by {source}");
+    }
+}
+
+/// The runtime view of layered configuration. It deliberately carries only
+/// explicit invocation overrides: absent flags must not mask project policy.
+#[derive(Debug, Clone)]
+pub struct RuntimeConfigResolver {
+    pub config: OrbConfig,
+    cli_model: Option<String>,
+    cli_worker_binary: Option<String>,
+}
+
+impl RuntimeConfigResolver {
+    pub fn load(
+        project_dir: Option<&Path>,
+        cli_model: Option<&str>,
+        cli_worker_binary: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            config: load_config(project_dir)?,
+            cli_model: cli_model.map(str::to_owned),
+            cli_worker_binary: cli_worker_binary.map(str::to_owned),
+        })
+    }
+
+    pub fn model_for(&self, role: ModelRole<'_>) -> anyhow::Result<ResolvedModel> {
+        let resolver = self.config.model_resolver();
+        if let Some(selector) = &self.cli_model {
+            return resolver.resolve_selector(selector, "--model".to_string());
+        }
+        resolver.resolve(role)
+    }
+
+    pub fn worker_binary(&self) -> anyhow::Result<&str> {
+        self.cli_worker_binary
+            .as_deref()
+            .or(self.config.worker_binary.as_deref())
+            .ok_or_else(|| {
+                anyhow::anyhow!("worker_binary is unset; set it in config or pass --worker-binary")
+            })
+    }
+
+    #[must_use]
+    pub fn max_concurrency(&self) -> usize {
+        self.config.max_concurrency
     }
 }
 
@@ -471,6 +534,89 @@ fn merge_toml_tables(base: &mut toml::value::Table, overlay: &toml::value::Table
             _ => {
                 base.insert(key.clone(), value.clone());
             }
+        }
+    }
+}
+
+/// A valid, annotated config users can commit and review. The minimal form is
+/// intentionally just a version marker so project settings inherit global
+/// policy until an override is added.
+#[must_use]
+pub fn starter_config_template(minimal: bool) -> String {
+    if minimal {
+        return "# Project overrides. Omitted values inherit global and built-in defaults.\nconfig_version = 1\n".to_string();
+    }
+    r#"# Orboros project execution policy. Secrets belong in the environment, never here.
+# Precedence: built-in defaults < ~/.orboros/config.toml < this file < explicit CLI flags.
+# Set provider credentials such as OPENROUTER_API_KEY in the environment, not this file.
+config_version = 1
+default_model = "openrouter/free"
+max_concurrency = 4
+# worker_binary = "/absolute/path/to/heddle-headless"
+# HEDDLE_BINARY is also accepted as an invocation-level worker-binary override.
+
+[models.default]
+# worker = "balanced"
+# coordinator = "balanced"
+# chat = "balanced"
+
+# Named models are optional; selectors above may also be raw provider/model strings.
+[models.options.balanced]
+model = "openrouter/free"
+description = "Replace with this project's default worker model."
+router = "openrouter"
+
+[bench]
+# timeout_s = 600
+# max_iterations = 20
+# jobs = 1
+
+[review]
+requires_approval_by_default = false
+review_on_completion = true
+
+[notification]
+enabled = true
+desktop_enabled = false
+
+# Tool profiles are allowlists. An empty allowed_tools array explicitly grants no tools.
+[tool_profiles.edit]
+allowed_tools = ["read_file", "write_file", "edit_file", "glob", "grep", "bash"]
+"#
+    .to_string()
+}
+
+/// Inserts fields introduced by the current schema without replacing any
+/// existing value. Returns the paths that would be added.
+pub fn upgrade_config_toml(content: &str) -> anyhow::Result<(String, Vec<String>)> {
+    let mut target: toml::value::Table = toml::from_str(content)?;
+    let defaults: toml::value::Table = toml::from_str(&toml::to_string(&OrbConfig::default())?)?;
+    let mut added = Vec::new();
+    merge_missing_tables(&mut target, &defaults, "", &mut added);
+    Ok((toml::to_string_pretty(&target)?, added))
+}
+
+fn merge_missing_tables(
+    target: &mut toml::value::Table,
+    defaults: &toml::value::Table,
+    prefix: &str,
+    added: &mut Vec<String>,
+) {
+    for (key, default) in defaults {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match (target.get_mut(key), default) {
+            (Some(toml::Value::Table(target_sub)), toml::Value::Table(default_sub)) => {
+                merge_missing_tables(target_sub, default_sub, &path, added);
+            }
+            (None, _) => {
+                target.insert(key.clone(), default.clone());
+                added.push(path);
+            }
+            _ => {}
         }
     }
 }
@@ -764,6 +910,42 @@ mod tests {
         assert!((cfg.second_opinion.confidence_threshold - 0.7).abs() < f32::EPSILON);
         assert!((cfg.second_opinion.sampling_rate - 0.1).abs() < f32::EPSILON);
         assert!(cfg.second_opinion.reviewer_model.is_none());
+        assert_eq!(cfg.config_version, 1);
+    }
+
+    #[test]
+    fn starter_templates_parse_and_minimal_preserves_inheritance_shape() {
+        let full: OrbConfig = toml::from_str(&starter_config_template(false)).unwrap();
+        let minimal: OrbConfig = toml::from_str(&starter_config_template(true)).unwrap();
+        assert_eq!(full.config_version, 1);
+        assert_eq!(minimal.config_version, 1);
+        assert!(minimal.worker_binary.is_none());
+        assert!(minimal.models.options.is_empty());
+    }
+
+    #[test]
+    fn upgrade_inserts_missing_defaults_without_replacing_existing_values() {
+        let (upgraded, added) = upgrade_config_toml("default_model = \"custom/model\"\n").unwrap();
+        let cfg: OrbConfig = toml::from_str(&upgraded).unwrap();
+        assert_eq!(cfg.default_model, "custom/model");
+        assert!(added.iter().any(|path| path == "config_version"));
+        assert!(added.iter().any(|path| path == "max_concurrency"));
+    }
+
+    #[test]
+    fn runtime_resolver_prefers_explicit_model_and_binary() {
+        let resolver = RuntimeConfigResolver {
+            config: OrbConfig {
+                worker_binary: Some("config-worker".into()),
+                ..Default::default()
+            },
+            cli_model: Some("openai/gpt-5".into()),
+            cli_worker_binary: Some("cli-worker".into()),
+        };
+        let model = resolver.model_for(ModelRole::Worker("execute")).unwrap();
+        assert_eq!(model.model, "openai/gpt-5");
+        assert_eq!(model.source, "--model");
+        assert_eq!(resolver.worker_binary().unwrap(), "cli-worker");
     }
 
     #[test]
@@ -1417,6 +1599,7 @@ system = "project speccing"
     #[test]
     fn config_roundtrips_through_toml() {
         let cfg = OrbConfig {
+            config_version: 1,
             default_model: "test-model".to_string(),
             max_concurrency: 16,
             worker_binary: Some("/usr/bin/heddle".to_string()),
@@ -1440,6 +1623,7 @@ system = "project speccing"
             bench: BenchConfig {
                 timeout_s: Some(300),
                 max_iterations: Some(8),
+                jobs: None,
             },
             tool_profiles: [(
                 "edit".into(),

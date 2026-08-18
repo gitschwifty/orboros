@@ -10,7 +10,7 @@ orboros [OPTIONS] <COMMAND>
 |--------|---------|---------|-------------|
 | `--state-dir <PATH>` | — | nearest ancestor `.orbs`, then `~/.orboros/default` | Project state directory |
 | `--worker-binary <PATH>` | `HEDDLE_BINARY` | — | Path to heddle-headless binary |
-| `--model <MODEL>` | — | `openrouter/free` | Default model for workers |
+| `--model <MODEL>` | — | configured role default | Explicit model override for workers |
 
 ## Commands
 
@@ -27,6 +27,21 @@ Creates `.orbs/` with `config.toml` and `orbs.jsonl`. Registers the project in `
 When `--state-dir` is omitted, Orboros searches upward from the current
 directory for a `.orbs` directory, stopping at home. If none is found, it falls
 back to `~/.orboros/default`.
+
+---
+
+### `config`
+
+Manage the versioned layered configuration without implicit startup rewrites.
+
+```bash
+orboros config init                 # annotated project template
+orboros config init --global        # ~/.orboros/config.toml
+orboros config init --minimal       # inherit global defaults
+orboros config upgrade              # preview additions/imports
+orboros config upgrade --apply      # write the previewed changes
+orboros config show                 # effective worker/chat settings
+```
 
 ---
 
