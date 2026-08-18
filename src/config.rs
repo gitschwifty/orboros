@@ -27,6 +27,7 @@ pub struct OrbConfig {
     pub review: ReviewConfig,
     pub second_opinion: SecondOpinionConfig,
     pub notification: NotificationConfig,
+    pub daemon: DaemonSettingsConfig,
 }
 
 const fn current_config_version() -> u32 {
@@ -60,8 +61,21 @@ impl Default for OrbConfig {
             review: ReviewConfig::default(),
             second_opinion: SecondOpinionConfig::default(),
             notification: NotificationConfig::default(),
+            daemon: DaemonSettingsConfig::default(),
         }
     }
+}
+
+/// Optional daemon process settings. Worker dispatch concurrency remains the
+/// project-level `max_concurrency` setting; these values configure the daemon
+/// process itself.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DaemonSettingsConfig {
+    pub pid_file: Option<String>,
+    pub log_file: Option<String>,
+    pub log_max_size: Option<u64>,
+    pub tick_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1690,6 +1704,12 @@ system = "project speccing"
             notification: NotificationConfig {
                 enabled: false,
                 desktop_enabled: true,
+            },
+            daemon: DaemonSettingsConfig {
+                pid_file: Some("/tmp/orboros.pid".into()),
+                log_file: Some("/tmp/orboros.log".into()),
+                log_max_size: Some(42),
+                tick_interval_ms: Some(500),
             },
         };
         let serialized = toml::to_string_pretty(&cfg).unwrap();

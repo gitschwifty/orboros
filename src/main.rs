@@ -838,6 +838,8 @@ fn main() -> anyhow::Result<()> {
             project,
         } => {
             let mut daemon_config = DaemonConfig::default();
+            let orb_config = config::load_config(effective_state.project_dir.as_deref())?;
+            apply_daemon_settings(&mut daemon_config, &orb_config.daemon);
             if let Some(pf) = pid_file {
                 daemon_config.pid_file = resolve_state_dir(&pf);
             }
@@ -1013,6 +1015,24 @@ fn main() -> anyhow::Result<()> {
             cli.worker_binary.as_deref(),
             cli.skip_prereq_check,
         ),
+    }
+}
+
+fn apply_daemon_settings(
+    daemon_config: &mut DaemonConfig,
+    settings: &config::DaemonSettingsConfig,
+) {
+    if let Some(pid_file) = &settings.pid_file {
+        daemon_config.pid_file = PathBuf::from(pid_file);
+    }
+    if let Some(log_file) = &settings.log_file {
+        daemon_config.log_file = Some(PathBuf::from(log_file));
+    }
+    if let Some(log_max_size) = settings.log_max_size {
+        daemon_config.log_max_size = log_max_size;
+    }
+    if let Some(tick_interval_ms) = settings.tick_interval_ms {
+        daemon_config.tick_interval_ms = tick_interval_ms;
     }
 }
 
@@ -1841,13 +1861,14 @@ fn cmd_daemon_start(
     // worker_binary. When absent, the daemon stays pure
     // state-machine — workers never spawn. Lets users opt in
     // to autonomous dispatch without making it mandatory.
+    let project_max_concurrency = config::load_config(Some(state_dir))?.max_concurrency;
     let dispatch = match orboros::worker::dispatcher::default_worker_config(
         dirs::home_dir().as_deref(),
         Some(state_dir),
     ) {
         Ok(base_worker_config) => Some(orboros::daemon::DispatchSettings {
             base_worker_config,
-            max_concurrency: daemon_config.max_concurrency,
+            max_concurrency: project_max_concurrency,
         }),
         Err(e) => {
             tracing::warn!(
@@ -1905,13 +1926,15 @@ fn cmd_supervisor_start(
         {
             queue = queue.with_hooks(sink);
         }
+        let project_max_concurrency =
+            config::load_config(Some(&project_state_dir))?.max_concurrency;
         let dispatch = match orboros::worker::dispatcher::default_worker_config(
             Some(home),
             Some(&project_state_dir),
         ) {
             Ok(base_worker_config) => Some(orboros::daemon::DispatchSettings {
                 base_worker_config,
-                max_concurrency: daemon_config.max_concurrency,
+                max_concurrency: project_max_concurrency,
             }),
             Err(error) => {
                 tracing::warn!(project = %entry.name, %error, "project dispatch disabled — worker_binary unconfigured");

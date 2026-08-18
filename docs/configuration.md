@@ -209,6 +209,9 @@ packaged template defines `read_only`, `research`, `test`, `edit`, and
 - `[second_opinion]`: `mode` (`off`, `always`, `confidence`, or `sampling`),
   `confidence_threshold`, `sampling_rate`, and optional `reviewer_model`.
 - `[notification]`: `enabled` and `desktop_enabled`.
+- `[daemon]`: optional `pid_file`, `log_file`, `log_max_size`, and
+  `tick_interval_ms` process settings. Project `max_concurrency` controls that
+  project's dispatch cap; explicit daemon CLI flags override these settings.
 
 Hooks intentionally use a separate schema and files: `~/.orboros/hooks.toml`
 followed by `<state-dir>/hooks.toml`. They are ordered global first, then
