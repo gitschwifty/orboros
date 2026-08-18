@@ -31,8 +31,8 @@ what `config init --global` installs for a new user-wide configuration.
 user-wide and built-in values until it adds an override. Use `orboros config
 show` for a small effective-settings summary.
 
-`orboros config upgrade` advances only schema markers and imports unconflicted
-legacy tool profiles; it never fills omitted policy fields. It also previews
+`orboros config upgrade` advances only schema markers; it never fills omitted
+policy fields. It also previews
 new optional fields introduced by each schema version, with their default TOML
 example and explanation, but never writes those examples automatically. This
 preserves a project's deliberate inheritance from global configuration. To
@@ -216,10 +216,3 @@ packaged template defines `read_only`, `research`, `test`, `edit`, and
 Hooks intentionally use a separate schema and files: `~/.orboros/hooks.toml`
 followed by `<state-dir>/hooks.toml`. They are ordered global first, then
 project; they are not fields in `config.toml`.
-
-## Legacy routing migration
-
-`routing.toml` is no longer a runtime model-routing source. Before deleting an
-old state-dir file, run `orboros config upgrade --apply` from the project: it
-imports unconflicted legacy `[profiles]` entries as `[tool_profiles.*]` and
-reports that old model rules must be replaced with `[models]` mappings.

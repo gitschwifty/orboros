@@ -313,9 +313,6 @@ worker context. Orboros records each dispatch's resolved inventory in the
 execution ledger so benchmark evidence can distinguish the permitted policy
 from a worker's attempted tool calls.
 
-`routing.toml` is not read at runtime. Use `orboros config upgrade --apply` to
-import its legacy tool profiles into the canonical config before removing it.
-
 ```toml
 # preferred: .orbs/config.toml
 [tool_profiles.edit]
@@ -341,7 +338,7 @@ src/
   bench/                  # Benchmark corpus harness
   coordinator/            # LLM-powered decomposition + aggregation
   ipc/                    # JSON-line protocol with heddle workers
-  routing/                # Legacy tool profile compatibility
+  routing/                # Tool capability policy
   worker/                 # Process lifecycle, pool, budget, FSM
   phases/                 # Pipeline phase implementations
     speccing.rs

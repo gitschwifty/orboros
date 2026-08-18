@@ -180,8 +180,7 @@ The daemon loop:
 
 ## Model Routing
 
-Configure model roles in `.orbs/config.toml`; `routing.toml` is no longer read
-at runtime. `orboros config upgrade --apply` can import its legacy tool profiles.
+Configure model roles and tool profiles in `.orbs/config.toml`.
 
 ```toml
 [models.workers]

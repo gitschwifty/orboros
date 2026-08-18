@@ -2059,35 +2059,7 @@ fn cmd_config(action: ConfigAction, project_dir: Option<&Path>) -> anyhow::Resul
             let target = config_target(global, project_dir)?;
             let content = std::fs::read_to_string(&target)
                 .map_err(|e| anyhow::anyhow!("reading {}: {e}", target.display()))?;
-            let (mut upgraded, mut added, examples) = config::upgrade_config_toml(&content)?;
-
-            if !global {
-                let routing = target.with_file_name("routing.toml");
-                if routing.exists() {
-                    let legacy = orboros::routing::rules::parse_routing_config(
-                        &std::fs::read_to_string(&routing)?,
-                    )?;
-                    if !legacy.profiles.is_empty() {
-                        let mut table: toml::value::Table = toml::from_str(&upgraded)?;
-                        let profiles = table
-                            .entry("tool_profiles")
-                            .or_insert_with(|| toml::Value::Table(Default::default()));
-                        let profiles = profiles
-                            .as_table_mut()
-                            .ok_or_else(|| anyhow::anyhow!("tool_profiles must be a TOML table"))?;
-                        for (name, profile) in legacy.profiles {
-                            if !profiles.contains_key(&name) {
-                                profiles.insert(name.clone(), toml::Value::try_from(profile)?);
-                                added.push(format!(
-                                    "tool_profiles.{name} (imported from routing.toml)"
-                                ));
-                            }
-                        }
-                        upgraded = toml::to_string_pretty(&table)?;
-                    }
-                    println!("note: legacy routing model rules are not migrated; configure [models] instead");
-                }
-            }
+            let (upgraded, added, examples) = config::upgrade_config_toml(&content)?;
             if added.is_empty() {
                 println!("{} is already current", target.display());
             } else {
