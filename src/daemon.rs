@@ -17,8 +17,6 @@ pub struct DaemonConfig {
     pub log_max_size: u64,
     /// Tick interval in milliseconds (default: 1000).
     pub tick_interval_ms: u64,
-    /// Max concurrent worker dispatches per tick (default: 4).
-    pub max_concurrency: usize,
 }
 
 impl Default for DaemonConfig {
@@ -32,7 +30,6 @@ impl Default for DaemonConfig {
             log_file: None,
             log_max_size: 10 * 1024 * 1024, // 10 MB
             tick_interval_ms: 1000,
-            max_concurrency: 4,
         }
     }
 }
@@ -406,7 +403,6 @@ mod tests {
             log_file: None,
             log_max_size: 10 * 1024 * 1024,
             tick_interval_ms: 1000,
-            max_concurrency: 4,
         }
     }
 
