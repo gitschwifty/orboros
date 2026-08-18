@@ -137,6 +137,22 @@ bench-runs root="bench" variant="":
         cargo run -- bench --bench-root "{{root}}" list-runs; \
     fi
 
+# List historical runs with optional metadata and exclusion filters. Example:
+# `just bench-runs-filter ../bench "" "" "" true t2 "" 20` excludes
+# dynamic router selections, keeps T2 runs, and shows the newest 20.
+bench-runs-filter root="bench" variant="" model="" exclude_model="" exclude_dynamic_models="false" tier="" since="" limit="" suite="" prompt_set="":
+    @set -- cargo run -- bench --bench-root "{{root}}" list-runs; \
+    if [ -n "{{variant}}" ]; then set -- "$@" --variant "{{variant}}"; fi; \
+    if [ -n "{{model}}" ]; then set -- "$@" --model "{{model}}"; fi; \
+    if [ -n "{{exclude_model}}" ]; then set -- "$@" --exclude-model "{{exclude_model}}"; fi; \
+    if [ "{{exclude_dynamic_models}}" = "true" ]; then set -- "$@" --exclude-dynamic-models; fi; \
+    if [ -n "{{tier}}" ]; then set -- "$@" --tier "{{tier}}"; fi; \
+    if [ -n "{{since}}" ]; then set -- "$@" --since "{{since}}"; fi; \
+    if [ -n "{{limit}}" ]; then set -- "$@" --limit "{{limit}}"; fi; \
+    if [ -n "{{suite}}" ]; then set -- "$@" --suite "{{suite}}"; fi; \
+    if [ -n "{{prompt_set}}" ]; then set -- "$@" --prompt-set "{{prompt_set}}"; fi; \
+    "$@"
+
 # Show confidence calibration for a saved benchmark run.
 bench-calibration run_id buckets="10" root="bench":
     cargo run -- bench --bench-root "{{root}}" calibration "{{run_id}}" --buckets "{{buckets}}"
