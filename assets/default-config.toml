@@ -1,0 +1,48 @@
+# Orboros execution policy. Secrets belong in the environment, never here.
+# Precedence: built-in defaults < ~/.orboros/config.toml < this file < explicit CLI flags.
+# Set provider credentials such as OPENROUTER_API_KEY in the environment, not this file.
+config_version = 2
+default_model = "openrouter/free"
+max_concurrency = 4
+# worker_binary = "/absolute/path/to/heddle-headless"
+# HEDDLE_BINARY is also accepted as an invocation-level worker-binary override.
+
+[models.default]
+# worker = "balanced"
+# coordinator = "balanced"
+# chat = "balanced"
+
+# Named models are optional; selectors above may also be raw provider/model strings.
+[models.options.balanced]
+model = "openrouter/free"
+description = "Replace with this project's default worker model."
+router = "openrouter"
+
+[bench]
+# timeout_s = 600
+# max_iterations = 20
+# jobs = 1
+
+[review]
+requires_approval_by_default = false
+review_on_completion = true
+
+[notification]
+enabled = true
+desktop_enabled = false
+
+# Tool profiles are allowlists. An empty allowed_tools array explicitly grants no tools.
+[tool_profiles.read_only]
+allowed_tools = ["read_file", "glob", "grep"]
+
+[tool_profiles.research]
+allowed_tools = ["read_file", "glob", "grep", "web_fetch", "write_file"]
+
+[tool_profiles.test]
+allowed_tools = ["read_file", "glob", "grep", "bash"]
+
+[tool_profiles.edit]
+allowed_tools = ["read_file", "write_file", "edit_file", "glob", "grep", "bash"]
+
+[tool_profiles.execute]
+allowed_tools = ["read_file", "write_file", "edit_file", "glob", "grep", "bash"]

@@ -38,7 +38,7 @@ Manage the versioned layered configuration without implicit startup rewrites.
 orboros config init                 # annotated project template
 orboros config init --global        # ~/.orboros/config.toml
 orboros config init --minimal       # inherit global defaults
-orboros config upgrade              # preview additions/imports
+orboros config upgrade              # preview schema changes, field examples, and imports
 orboros config upgrade --apply      # write the previewed changes
 orboros config show                 # effective worker/chat settings
 ```

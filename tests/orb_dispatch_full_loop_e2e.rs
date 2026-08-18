@@ -99,7 +99,10 @@ async fn full_loop_pending_to_done_via_tick_and_dispatch() {
     let dep_store = DepStore::new(base.join("deps.jsonl"));
 
     // Create a Pending task orb.
-    let orb = Orb::new("Implement feature", "Build it").with_type(OrbType::Task);
+    let mut orb = Orb::new("Implement feature", "Build it").with_type(OrbType::Task);
+    // The queue resolves project and user-wide model policy. Pin this fixture's
+    // explicit per-orb model so its mock-worker assertion is environment-free.
+    orb.preferred_model = Some("mock/full-loop".into());
     orb_store.append(&orb).unwrap();
 
     let ql = QueueLoop::new(orb_store.clone(), dep_store, base);

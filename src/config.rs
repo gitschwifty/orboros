@@ -30,14 +30,29 @@ pub struct OrbConfig {
 }
 
 const fn current_config_version() -> u32 {
-    1
+    2
 }
+
+/// A newly available setting shown by `config upgrade`. Examples are advisory:
+/// users decide whether to add them, and upgrades never write them implicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigFieldExample {
+    pub version: u32,
+    pub toml: &'static str,
+    pub description: &'static str,
+}
+
+const CONFIG_FIELD_EXAMPLES: &[ConfigFieldExample] = &[ConfigFieldExample {
+    version: 2,
+    toml: "[bench]\njobs = 1",
+    description: "Maximum isolated benchmark cases to run concurrently (serial by default).",
+}];
 
 impl Default for OrbConfig {
     fn default() -> Self {
         Self {
             default_model: "openrouter/free".to_string(),
-            config_version: 1,
+            config_version: current_config_version(),
             max_concurrency: 4,
             worker_binary: None,
             models: ModelConfig::default(),
@@ -544,81 +559,59 @@ fn merge_toml_tables(base: &mut toml::value::Table, overlay: &toml::value::Table
 #[must_use]
 pub fn starter_config_template(minimal: bool) -> String {
     if minimal {
-        return "# Project overrides. Omitted values inherit global and built-in defaults.\nconfig_version = 1\n".to_string();
+        return format!(
+            "# Project overrides. Omitted values inherit global and built-in defaults.\nconfig_version = {}\n",
+            current_config_version()
+        );
     }
-    r#"# Orboros project execution policy. Secrets belong in the environment, never here.
-# Precedence: built-in defaults < ~/.orboros/config.toml < this file < explicit CLI flags.
-# Set provider credentials such as OPENROUTER_API_KEY in the environment, not this file.
-config_version = 1
-default_model = "openrouter/free"
-max_concurrency = 4
-# worker_binary = "/absolute/path/to/heddle-headless"
-# HEDDLE_BINARY is also accepted as an invocation-level worker-binary override.
-
-[models.default]
-# worker = "balanced"
-# coordinator = "balanced"
-# chat = "balanced"
-
-# Named models are optional; selectors above may also be raw provider/model strings.
-[models.options.balanced]
-model = "openrouter/free"
-description = "Replace with this project's default worker model."
-router = "openrouter"
-
-[bench]
-# timeout_s = 600
-# max_iterations = 20
-# jobs = 1
-
-[review]
-requires_approval_by_default = false
-review_on_completion = true
-
-[notification]
-enabled = true
-desktop_enabled = false
-
-# Tool profiles are allowlists. An empty allowed_tools array explicitly grants no tools.
-[tool_profiles.edit]
-allowed_tools = ["read_file", "write_file", "edit_file", "glob", "grep", "bash"]
-"#
-    .to_string()
+    include_str!("../assets/default-config.toml").to_string()
 }
 
-/// Inserts fields introduced by the current schema without replacing any
-/// existing value. Returns the paths that would be added.
-pub fn upgrade_config_toml(content: &str) -> anyhow::Result<(String, Vec<String>)> {
+/// Upgrades only schema markers. Policy fields remain omitted so a project
+/// keeps inheriting global policy and built-in compatible defaults.
+///
+/// Returns the fields that would change. Full starter policy is an explicit
+/// `config init` choice; an upgrade must never snapshot today's defaults into
+/// a partial config file.
+pub fn upgrade_config_toml(
+    content: &str,
+) -> anyhow::Result<(String, Vec<String>, Vec<ConfigFieldExample>)> {
     let mut target: toml::value::Table = toml::from_str(content)?;
-    let defaults: toml::value::Table = toml::from_str(&toml::to_string(&OrbConfig::default())?)?;
     let mut added = Vec::new();
-    merge_missing_tables(&mut target, &defaults, "", &mut added);
-    Ok((toml::to_string_pretty(&target)?, added))
-}
-
-fn merge_missing_tables(
-    target: &mut toml::value::Table,
-    defaults: &toml::value::Table,
-    prefix: &str,
-    added: &mut Vec<String>,
-) {
-    for (key, default) in defaults {
-        let path = if prefix.is_empty() {
-            key.clone()
-        } else {
-            format!("{prefix}.{key}")
-        };
-        match (target.get_mut(key), default) {
-            (Some(toml::Value::Table(target_sub)), toml::Value::Table(default_sub)) => {
-                merge_missing_tables(target_sub, default_sub, &path, added);
-            }
-            (None, _) => {
-                target.insert(key.clone(), default.clone());
-                added.push(path);
-            }
-            _ => {}
+    let existing_version = target
+        .get("config_version")
+        .and_then(toml::Value::as_integer)
+        .and_then(|version| u32::try_from(version).ok())
+        .unwrap_or(0);
+    let examples = CONFIG_FIELD_EXAMPLES
+        .iter()
+        .copied()
+        .filter(|example| example.version > existing_version)
+        .collect();
+    match target
+        .get("config_version")
+        .and_then(toml::Value::as_integer)
+    {
+        None => {
+            target.insert(
+                "config_version".to_string(),
+                toml::Value::Integer(i64::from(current_config_version())),
+            );
+            added.push("config_version".to_string());
         }
+        Some(version) if version < i64::from(current_config_version()) => {
+            target.insert(
+                "config_version".to_string(),
+                toml::Value::Integer(i64::from(current_config_version())),
+            );
+            added.push(format!(
+                "config_version ({version} → {})",
+                current_config_version()
+            ));
+        }
+        _ => {}
     }
+    Ok((toml::to_string_pretty(&target)?, added, examples))
 }
 
 /// Load config with hierarchy: global (`~/.orboros/config.toml`) then project
@@ -910,26 +903,51 @@ mod tests {
         assert!((cfg.second_opinion.confidence_threshold - 0.7).abs() < f32::EPSILON);
         assert!((cfg.second_opinion.sampling_rate - 0.1).abs() < f32::EPSILON);
         assert!(cfg.second_opinion.reviewer_model.is_none());
-        assert_eq!(cfg.config_version, 1);
+        assert_eq!(cfg.config_version, current_config_version());
     }
 
     #[test]
     fn starter_templates_parse_and_minimal_preserves_inheritance_shape() {
         let full: OrbConfig = toml::from_str(&starter_config_template(false)).unwrap();
         let minimal: OrbConfig = toml::from_str(&starter_config_template(true)).unwrap();
-        assert_eq!(full.config_version, 1);
-        assert_eq!(minimal.config_version, 1);
+        assert_eq!(full.config_version, current_config_version());
+        assert_eq!(minimal.config_version, current_config_version());
         assert!(minimal.worker_binary.is_none());
         assert!(minimal.models.options.is_empty());
+        assert_eq!(
+            full.tool_profiles["read_only"].allowed_tools,
+            vec!["read_file", "glob", "grep"]
+        );
+        assert_eq!(
+            full.tool_profiles["execute"].allowed_tools,
+            vec![
+                "read_file",
+                "write_file",
+                "edit_file",
+                "glob",
+                "grep",
+                "bash"
+            ]
+        );
     }
 
     #[test]
-    fn upgrade_inserts_missing_defaults_without_replacing_existing_values() {
-        let (upgraded, added) = upgrade_config_toml("default_model = \"custom/model\"\n").unwrap();
+    fn upgrade_adds_only_schema_marker_and_preserves_inheritance() {
+        let (upgraded, added, examples) =
+            upgrade_config_toml("default_model = \"custom/model\"\n").unwrap();
         let cfg: OrbConfig = toml::from_str(&upgraded).unwrap();
         assert_eq!(cfg.default_model, "custom/model");
         assert!(added.iter().any(|path| path == "config_version"));
-        assert!(added.iter().any(|path| path == "max_concurrency"));
+        assert!(!upgraded.contains("max_concurrency"));
+        assert!(!upgraded.contains("[review]"));
+        assert_eq!(examples[0].toml, "[bench]\njobs = 1");
+    }
+
+    #[test]
+    fn upgrade_does_not_repeat_examples_already_in_the_schema_version() {
+        let (_, added, examples) = upgrade_config_toml("config_version = 2\n").unwrap();
+        assert!(added.is_empty());
+        assert!(examples.is_empty());
     }
 
     #[test]

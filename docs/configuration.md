@@ -25,11 +25,19 @@ orboros config init --global
 orboros config init --minimal
 ```
 
-The normal template is a complete, reviewable project policy. `--minimal`
-creates only `config_version = 1`, allowing the project to inherit user-wide
-and built-in values until it adds an override. Use `orboros config show` for a
-small effective-settings summary. `orboros config upgrade` previews missing
-current defaults and `orboros config upgrade --apply` writes them.
+The normal template is the packaged, complete, reviewable policy; it is also
+what `config init --global` installs for a new user-wide configuration.
+`--minimal` creates only `config_version = 2`, allowing the project to inherit
+user-wide and built-in values until it adds an override. Use `orboros config
+show` for a small effective-settings summary.
+
+`orboros config upgrade` advances only schema markers and imports unconflicted
+legacy tool profiles; it never fills omitted policy fields. It also previews
+new optional fields introduced by each schema version, with their default TOML
+example and explanation, but never writes those examples automatically. This
+preserves a project's deliberate inheritance from global configuration. To
+regenerate the complete packaged template, use `config init --force` only after
+reviewing or backing up the current file.
 
 Never put provider credentials in TOML. Set `OPENROUTER_API_KEY`,
 `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` in the process environment (or a
@@ -38,7 +46,7 @@ loaded `.env` file) as required by the resolved router.
 ## Complete example
 
 ```toml
-config_version = 1
+config_version = 2
 worker_binary = "/path/to/heddle-headless"
 default_model = "openrouter/free"
 max_concurrency = 4
@@ -130,7 +138,7 @@ Omit any optional section or field to inherit the lower-precedence value.
 
 | Field | Default | Meaning |
 |---|---:|---|
-| `config_version` | `1` | Configuration schema marker. Existing unversioned configs remain compatible. |
+| `config_version` | `2` | Configuration schema marker. Existing unversioned configs remain compatible. |
 | `worker_binary` | unset | Heddle worker executable. Required for worker-spawning commands unless overridden. |
 | `default_model` | `openrouter/free` | Final fallback model selector. |
 | `max_concurrency` | `4` | Default concurrent worker dispatch limit. |
@@ -191,7 +199,9 @@ Command-level system-prompt flags override these settings for their invocation.
 
 `[tool_profiles.<worker_type>]` has `allowed_tools = ["..."]`. This is a
 capability allowlist; `allowed_tools = []` explicitly grants no tools. A
-`default` profile applies when there is no exact worker-type profile.
+`default` profile applies when there is no exact worker-type profile. The
+packaged template defines `read_only`, `research`, `test`, `edit`, and
+`execute`; runtime code still intersects policy with its safety ceiling.
 
 ## Review, notifications, and hooks
 

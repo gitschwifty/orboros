@@ -2036,7 +2036,7 @@ fn cmd_config(action: ConfigAction, project_dir: Option<&Path>) -> anyhow::Resul
             let target = config_target(global, project_dir)?;
             let content = std::fs::read_to_string(&target)
                 .map_err(|e| anyhow::anyhow!("reading {}: {e}", target.display()))?;
-            let (mut upgraded, mut added) = config::upgrade_config_toml(&content)?;
+            let (mut upgraded, mut added, examples) = config::upgrade_config_toml(&content)?;
 
             if !global {
                 let routing = target.with_file_name("routing.toml");
@@ -2069,6 +2069,12 @@ fn cmd_config(action: ConfigAction, project_dir: Option<&Path>) -> anyhow::Resul
                 println!("{} is already current", target.display());
             } else {
                 println!("{} would add:\n  {}", target.display(), added.join("\n  "));
+            }
+            if !examples.is_empty() {
+                println!("New optional config fields (not written automatically):");
+                for example in examples {
+                    println!("\n{}\n# {}", example.toml, example.description);
+                }
             }
             if apply && !added.is_empty() {
                 std::fs::write(&target, upgraded)?;
