@@ -30,7 +30,7 @@ pub struct OrbConfig {
 }
 
 const fn current_config_version() -> u32 {
-    2
+    1
 }
 
 /// A newly available setting shown by `config upgrade`. Examples are advisory:
@@ -42,11 +42,9 @@ pub struct ConfigFieldExample {
     pub description: &'static str,
 }
 
-const CONFIG_FIELD_EXAMPLES: &[ConfigFieldExample] = &[ConfigFieldExample {
-    version: 2,
-    toml: "[bench]\njobs = 1",
-    description: "Maximum isolated benchmark cases to run concurrently (serial by default).",
-}];
+// Add entries here only when a real schema version introduces a new optional
+// field. Its example is previewed by `config upgrade`, never written.
+const CONFIG_FIELD_EXAMPLES: &[ConfigFieldExample] = &[];
 
 impl Default for OrbConfig {
     fn default() -> Self {
@@ -583,11 +581,7 @@ pub fn upgrade_config_toml(
         .and_then(toml::Value::as_integer)
         .and_then(|version| u32::try_from(version).ok())
         .unwrap_or(0);
-    let examples = CONFIG_FIELD_EXAMPLES
-        .iter()
-        .copied()
-        .filter(|example| example.version > existing_version)
-        .collect();
+    let examples = field_examples_since(existing_version, CONFIG_FIELD_EXAMPLES);
     match target
         .get("config_version")
         .and_then(toml::Value::as_integer)
@@ -612,6 +606,17 @@ pub fn upgrade_config_toml(
         _ => {}
     }
     Ok((toml::to_string_pretty(&target)?, added, examples))
+}
+
+fn field_examples_since(
+    existing_version: u32,
+    examples: &[ConfigFieldExample],
+) -> Vec<ConfigFieldExample> {
+    examples
+        .iter()
+        .copied()
+        .filter(|example| example.version > existing_version)
+        .collect()
 }
 
 /// Load config with hierarchy: global (`~/.orboros/config.toml`) then project
@@ -940,14 +945,25 @@ mod tests {
         assert!(added.iter().any(|path| path == "config_version"));
         assert!(!upgraded.contains("max_concurrency"));
         assert!(!upgraded.contains("[review]"));
-        assert_eq!(examples[0].toml, "[bench]\njobs = 1");
+        assert!(examples.is_empty());
     }
 
     #[test]
     fn upgrade_does_not_repeat_examples_already_in_the_schema_version() {
-        let (_, added, examples) = upgrade_config_toml("config_version = 2\n").unwrap();
+        let (_, added, examples) = upgrade_config_toml("config_version = 1\n").unwrap();
         assert!(added.is_empty());
         assert!(examples.is_empty());
+    }
+
+    #[test]
+    fn upgrade_examples_are_available_only_after_their_schema_version() {
+        let example = ConfigFieldExample {
+            version: 2,
+            toml: "[bench]\njobs = 1",
+            description: "Maximum isolated benchmark cases to run concurrently.",
+        };
+        assert_eq!(field_examples_since(1, &[example]), vec![example]);
+        assert!(field_examples_since(2, &[example]).is_empty());
     }
 
     #[test]

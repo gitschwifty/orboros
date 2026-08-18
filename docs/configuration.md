@@ -27,7 +27,7 @@ orboros config init --minimal
 
 The normal template is the packaged, complete, reviewable policy; it is also
 what `config init --global` installs for a new user-wide configuration.
-`--minimal` creates only `config_version = 2`, allowing the project to inherit
+`--minimal` creates only `config_version = 1`, allowing the project to inherit
 user-wide and built-in values until it adds an override. Use `orboros config
 show` for a small effective-settings summary.
 
@@ -46,7 +46,7 @@ loaded `.env` file) as required by the resolved router.
 ## Complete example
 
 ```toml
-config_version = 2
+config_version = 1
 worker_binary = "/path/to/heddle-headless"
 default_model = "openrouter/free"
 max_concurrency = 4
@@ -138,7 +138,7 @@ Omit any optional section or field to inherit the lower-precedence value.
 
 | Field | Default | Meaning |
 |---|---:|---|
-| `config_version` | `2` | Configuration schema marker. Existing unversioned configs remain compatible. |
+| `config_version` | `1` | Configuration schema marker. Existing unversioned configs remain compatible. |
 | `worker_binary` | unset | Heddle worker executable. Required for worker-spawning commands unless overridden. |
 | `default_model` | `openrouter/free` | Final fallback model selector. |
 | `max_concurrency` | `4` | Default concurrent worker dispatch limit. |
