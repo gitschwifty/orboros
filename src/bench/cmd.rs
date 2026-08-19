@@ -1428,8 +1428,21 @@ pub fn cmd_bench_list_runs_filtered(
         return Ok(());
     }
 
+    let model_width = runs
+        .iter()
+        .map(model_display)
+        .map(|model| model.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("configured → resolved model".chars().count());
     println!(
-        "run           started              variant                 suite         tier  configured → resolved model            pass fail err  cost         guidance"
+        "{:<12}  {:<19}  {:<22}  {:<12}  {:<4}  {:<model_width$}  pass fail err  cost         guidance",
+        "run",
+        "started",
+        "variant",
+        "suite",
+        "tier",
+        "configured → resolved model",
     );
     for run in &runs {
         let results = store.read_results(&run.run_id)?;
@@ -1440,7 +1453,7 @@ pub fn cmd_bench_list_runs_filtered(
             format!("{under}U {over}O {investigate}I")
         };
         println!(
-            "{run_id:<12}  {started:<19}  {variant:<22}  {suite:<12}  {tier:<4}  {model:<28}  {passed:>4} {failed:>4} {errored:>3}  {cost:<11}  {guidance}",
+            "{run_id:<12}  {started:<19}  {variant:<22}  {suite:<12}  {tier:<4}  {model:<model_width$}  {passed:>4} {failed:>4} {errored:>3}  {cost:<11}  {guidance}",
             run_id = run_display_label(&run.run_id),
             started = run.started_at.format("%Y-%m-%d %H:%M:%S"),
             variant = run.variant.as_deref().unwrap_or("-"),
@@ -1450,6 +1463,7 @@ pub fn cmd_bench_list_runs_filtered(
                 .map_or("legacy", |suite| short_hash(&suite.fingerprint)),
             tier = run_tier_label(run),
             model = model_display(run),
+            model_width = model_width,
             passed = run.passed,
             failed = run.failed,
             errored = run.errored,
