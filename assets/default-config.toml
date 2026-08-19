@@ -7,6 +7,11 @@ max_concurrency = 4
 # worker_binary = "/absolute/path/to/heddle-headless"
 # HEDDLE_BINARY is also accepted as an invocation-level worker-binary override.
 
+[models]
+# Set true to let decomposition coordinators choose from named catalog options
+# for individual generated child tasks. Disabled by default.
+coordinator_model_choice = false
+
 [models.default]
 # worker = "balanced"
 # coordinator = "balanced"

@@ -89,6 +89,9 @@ pub struct BenchConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ModelConfig {
+    /// Lets decomposition coordinators choose an approved catalog key for a
+    /// generated child. Disabled unless a project explicitly opts in.
+    pub coordinator_model_choice: bool,
     pub default: ModelDefaults,
     pub options: BTreeMap<String, ModelOption>,
     pub workers: BTreeMap<String, String>,
@@ -913,6 +916,7 @@ mod tests {
         assert_eq!(cfg.max_concurrency, 4);
         assert!(cfg.worker_binary.is_none());
         assert!(cfg.models.options.is_empty());
+        assert!(!cfg.models.coordinator_model_choice);
         assert!(cfg.tool_profiles.is_empty());
         assert!(!cfg.review.requires_approval_by_default);
         assert!(cfg.review.review_on_completion);
@@ -933,6 +937,7 @@ mod tests {
         assert_eq!(minimal.config_version, current_config_version());
         assert!(minimal.worker_binary.is_none());
         assert!(minimal.models.options.is_empty());
+        assert!(!full.models.coordinator_model_choice);
         assert_eq!(
             full.tool_profiles["read_only"].allowed_tools,
             vec!["read_file", "glob", "grep"]
@@ -1001,6 +1006,9 @@ mod tests {
         let toml_str = r#"
 default_model = "openrouter/free"
 
+[models]
+coordinator_model_choice = true
+
 [models.default]
 worker = "balanced"
 coordinator = "planner"
@@ -1039,6 +1047,7 @@ grader = "fast"
 
         let parsed: OrbConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(parsed.models.default.worker.as_deref(), Some("balanced"));
+        assert!(parsed.models.coordinator_model_choice);
         assert_eq!(
             parsed.models.options["balanced"].description.as_deref(),
             Some("Default coding model")

@@ -156,6 +156,10 @@ including benchmark overlays and concurrency settings.
 default_model = "anthropic/claude-sonnet-4-20250514"
 max_concurrency = 4
 
+[models]
+# Opt in before coordinators may select catalog keys for generated children.
+coordinator_model_choice = true
+
 [models.default]
 worker = "balanced"
 coordinator = "planner"
@@ -256,6 +260,11 @@ system = "You are refining an Orboros plan. Return only the requested JSON shape
 Projects are registered in `~/.orboros/projects.toml` automatically on `orboros init`.
 
 Model catalog entries are optional; configs with only `default_model` still work.
+Set `[models] coordinator_model_choice = true` to let decomposition
+coordinators select an approved catalog key for an individual generated child;
+the default is `false`, so normal role mappings remain in control. The
+coordinator is shown only catalog keys and their descriptions, never raw model
+strings.
 Role mappings may reference a named catalog option or a raw `provider/model`
 string. Model strings are sent to Heddle exactly as configured; no
 `openrouter/` prefix is added or removed. Selectors default to

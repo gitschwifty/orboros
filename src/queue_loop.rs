@@ -1101,6 +1101,7 @@ async fn dispatch_one_owned(
         .map_err(std::io::Error::other)?;
     if outcome.status == crate::worker::dispatcher::DispatchStatus::Done
         && target == DispatchTarget::Decomposing
+        && model_config.models.coordinator_model_choice
     {
         if let Some(response) = outcome.response.as_deref() {
             if let Some(plan) = crate::phases::decompose::parse_response(response) {

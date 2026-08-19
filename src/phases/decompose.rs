@@ -235,9 +235,13 @@ siblings. A child may leave an intentionally unreferenced or incomplete \
 intermediate artifact when a later child is explicitly responsible for wiring \
 or integration."
         .to_string();
-    if models.options.is_empty() {
-        system.push_str("\n\nNo approved model catalog options are available. Omit `model_option` and `model_reason`.");
-    } else {
+    if !models.coordinator_model_choice || models.options.is_empty() {
+        system = system.replace(
+            ", \"model_option\": \"<optional approved key>\", \"model_reason\": \"<brief reason>\"",
+            "",
+        );
+    }
+    if models.coordinator_model_choice && !models.options.is_empty() {
         system.push_str("\n\nWhen a child benefits from a different approved model, set `model_option` to exactly one catalog key and give a short `model_reason`. Omit both fields when the normal role default is appropriate. Approved options:\n");
         for (key, option) in &models.options {
             let description = option
@@ -626,7 +630,7 @@ mod tests {
 
     #[test]
     fn decomposition_model_options_are_catalog_keys() {
-        let config = crate::config::ModelConfig {
+        let mut config = crate::config::ModelConfig {
             options: std::collections::BTreeMap::from([(
                 "fast".to_string(),
                 crate::config::ModelOption {
@@ -645,6 +649,13 @@ mod tests {
             plan.subtasks[0].model_reason.as_deref(),
             Some("Small focused change")
         );
+        assert!(!build_prompt(&feature_orb("X", "Y"), &config)
+            .0
+            .contains("Approved options"));
+        assert!(!build_prompt(&feature_orb("X", "Y"), &config)
+            .0
+            .contains("model_option"));
+        config.coordinator_model_choice = true;
         assert!(validate_model_options(&plan, &config).is_ok());
         assert!(build_prompt(&feature_orb("X", "Y"), &config)
             .0
