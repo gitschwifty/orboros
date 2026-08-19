@@ -724,6 +724,7 @@ fn append_decomposition_plan(
         child.parent_id = Some(root.id.clone());
         child.root_id = Some(root_id.clone());
         child.priority = u8::try_from(subtask.order.min(u32::from(u8::MAX))).unwrap_or(u8::MAX);
+        decompose::apply_model_option(&mut child, subtask);
         child.update_content_hash();
         orb_store.append(&child)?;
         dep_store

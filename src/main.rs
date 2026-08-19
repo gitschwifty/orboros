@@ -172,7 +172,7 @@ enum Commands {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone, Copy)]
 enum ConfigAction {
     /// Write an annotated starter config (project by default).
     Init {
@@ -276,7 +276,7 @@ enum BenchAction {
         /// Exclude a configured or resolved worker model text.
         #[arg(long)]
         exclude_model: Option<String>,
-        /// Exclude dynamic OpenRouter selectors such as `openrouter/free` and
+        /// Exclude dynamic `OpenRouter` selectors such as `openrouter/free` and
         /// `openrouter/auto`, whose actual backend model is not identified.
         #[arg(long)]
         exclude_dynamic_models: bool,

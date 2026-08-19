@@ -172,6 +172,14 @@ pub struct DecomposedSubtask {
     /// in parallel; smaller numbers run first.
     #[serde(default = "default_order")]
     pub order: u32,
+    /// Optional approved catalog key selected by the coordinator for this
+    /// child. This is stored on the child as `preferred_model`.
+    #[serde(default)]
+    pub model_option: Option<String>,
+    /// Brief explanation of why the selected catalog option fits the work.
+    /// It guides coordinator output without becoming persisted execution data.
+    #[serde(default)]
+    pub model_reason: Option<String>,
 }
 
 fn default_order() -> u32 {
@@ -191,12 +199,12 @@ pub struct DecompositionPlan {
 /// System prompt locks the output to strict JSON with a `subtasks`
 /// array of objects.
 #[must_use]
-pub fn build_prompt(orb: &Orb) -> (String, String) {
-    let system = "You are a task decomposer. Break the work below into a small set of \
+pub fn build_prompt(orb: &Orb, models: &crate::config::ModelConfig) -> (String, String) {
+    let mut system = "You are a task decomposer. Break the work below into a small set of \
 ordered subtasks. Respond with exactly one JSON object — no surrounding prose, \
 no code fences — in this shape:\n\
   {\"subtasks\": [\n\
-    {\"title\": \"<short subtask title>\", \"description\": \"<what to do>\", \"order\": 1},\n\
+    {\"title\": \"<short subtask title>\", \"description\": \"<what to do>\", \"order\": 1, \"model_option\": \"<optional approved key>\", \"model_reason\": \"<brief reason>\"},\n\
     ...\n\
   ], \"has_parent_final_work\": false}\n\
 Use the `order` field to express sequencing: subtasks with the same order may \
@@ -227,6 +235,19 @@ siblings. A child may leave an intentionally unreferenced or incomplete \
 intermediate artifact when a later child is explicitly responsible for wiring \
 or integration."
         .to_string();
+    if models.options.is_empty() {
+        system.push_str("\n\nNo approved model catalog options are available. Omit `model_option` and `model_reason`.");
+    } else {
+        system.push_str("\n\nWhen a child benefits from a different approved model, set `model_option` to exactly one catalog key and give a short `model_reason`. Omit both fields when the normal role default is appropriate. Approved options:\n");
+        for (key, option) in &models.options {
+            let description = option
+                .description
+                .as_deref()
+                .unwrap_or("No description provided");
+            let _ = writeln!(system, "- {key} — {description}");
+        }
+        system.push_str("Do not use raw provider/model strings or invent option names.");
+    }
     let mut user = format!(
         "Title: {}\n\nDescription:\n{}\n",
         orb.title, orb.description
@@ -238,6 +259,37 @@ or integration."
         let _ = write!(user, "\nAcceptance criteria:\n{ac}\n");
     }
     (system, user)
+}
+
+/// Ensures coordinator-selected model options are keys in the configured
+/// catalog. A decomposition response is untrusted, so raw model selectors are
+/// intentionally not accepted here even though manual orb overrides retain
+/// legacy raw-selector compatibility.
+///
+/// # Errors
+///
+/// Returns an error naming the child and unknown catalog key.
+pub fn validate_model_options(
+    plan: &DecompositionPlan,
+    models: &crate::config::ModelConfig,
+) -> anyhow::Result<()> {
+    for subtask in &plan.subtasks {
+        if let Some(key) = subtask.model_option.as_deref() {
+            anyhow::ensure!(
+                models.options.contains_key(key),
+                "subtask `{}` selected unknown model option `{key}`",
+                subtask.title
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Persists a validated coordinator choice as the child's model preference.
+/// The stored value remains the catalog key so later configuration resolution
+/// can map it to the current provider/model details.
+pub fn apply_model_option(child: &mut Orb, subtask: &DecomposedSubtask) {
+    child.preferred_model.clone_from(&subtask.model_option);
 }
 
 /// Parses the worker's response into a `DecompositionPlan`. Accepts
@@ -542,7 +594,7 @@ mod tests {
     fn build_prompt_includes_description_and_design() {
         let mut orb = Orb::new("Build auth", "Make it work").with_type(OrbType::Feature);
         orb.design = Some("Use PKCE flow".into());
-        let (system, user) = build_prompt(&orb);
+        let (system, user) = build_prompt(&orb, &crate::config::ModelConfig::default());
         assert!(system.contains("subtasks"));
         assert!(system.contains("order"));
         assert!(system.contains("actual concrete task"));
@@ -556,7 +608,7 @@ mod tests {
     #[test]
     fn build_prompt_omits_design_when_absent() {
         let orb = Orb::new("X", "Y").with_type(OrbType::Feature);
-        let (_system, user) = build_prompt(&orb);
+        let (_system, user) = build_prompt(&orb, &crate::config::ModelConfig::default());
         assert!(!user.contains("\nDesign:"));
     }
 
@@ -570,6 +622,49 @@ mod tests {
         assert_eq!(plan.subtasks.len(), 2);
         assert_eq!(plan.subtasks[0].title, "Step 1");
         assert_eq!(plan.subtasks[1].order, 2);
+    }
+
+    #[test]
+    fn decomposition_model_options_are_catalog_keys() {
+        let config = crate::config::ModelConfig {
+            options: std::collections::BTreeMap::from([(
+                "fast".to_string(),
+                crate::config::ModelOption {
+                    model: "openai/gpt-4.1-mini".to_string(),
+                    description: Some("Fast implementation model".to_string()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let text = r#"{"subtasks":[{"title":"Implement","description":"Add it","model_option":"fast","model_reason":"Small focused change"}]}"#;
+
+        let plan = parse_response(text).unwrap();
+        assert_eq!(plan.subtasks[0].model_option.as_deref(), Some("fast"));
+        assert_eq!(
+            plan.subtasks[0].model_reason.as_deref(),
+            Some("Small focused change")
+        );
+        assert!(validate_model_options(&plan, &config).is_ok());
+        assert!(build_prompt(&feature_orb("X", "Y"), &config)
+            .0
+            .contains("fast — Fast implementation model"));
+
+        let mut child = Orb::new("Implement", "Add it");
+        apply_model_option(&mut child, &plan.subtasks[0]);
+        assert_eq!(child.preferred_model.as_deref(), Some("fast"));
+    }
+
+    #[test]
+    fn decomposition_rejects_unknown_model_option() {
+        let plan = parse_response(
+            r#"{"subtasks":[{"title":"Implement","description":"Add it","model_option":"not-approved"}]}"#,
+        )
+        .unwrap();
+
+        let error =
+            validate_model_options(&plan, &crate::config::ModelConfig::default()).unwrap_err();
+        assert!(error.to_string().contains("not-approved"));
     }
 
     #[test]

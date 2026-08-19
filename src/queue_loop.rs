@@ -1030,7 +1030,9 @@ async fn dispatch_one_owned(
 
     let (built_in_system, user) = match target {
         DispatchTarget::Speccing => crate::phases::speccing::build_prompt(&orb),
-        DispatchTarget::Decomposing => crate::phases::decompose::build_prompt(&orb),
+        DispatchTarget::Decomposing => {
+            crate::phases::decompose::build_prompt(&orb, &model_config.models)
+        }
         DispatchTarget::Refining => crate::phases::refinement::build_prompt(&orb),
         DispatchTarget::Reevaluating => crate::phases::re_evaluation::build_prompt(&orb, &[]),
         DispatchTarget::Execute => (
@@ -1094,9 +1096,23 @@ async fn dispatch_one_owned(
         "dispatching ready orb",
     );
 
-    let outcome = dispatch_orb(&orb, &user, &wc, hooks.as_deref())
+    let mut outcome = dispatch_orb(&orb, &user, &wc, hooks.as_deref())
         .await
         .map_err(std::io::Error::other)?;
+    if outcome.status == crate::worker::dispatcher::DispatchStatus::Done
+        && target == DispatchTarget::Decomposing
+    {
+        if let Some(response) = outcome.response.as_deref() {
+            if let Some(plan) = crate::phases::decompose::parse_response(response) {
+                if let Err(error) =
+                    crate::phases::decompose::validate_model_options(&plan, &model_config.models)
+                {
+                    outcome.status = crate::worker::dispatcher::DispatchStatus::Failed;
+                    outcome.error = Some(format!("invalid coordinator model choice: {error}"));
+                }
+            }
+        }
+    }
     let outcome = crate::worker::dispatcher::with_prompt_metadata(
         outcome,
         prompt_category.clone(),
