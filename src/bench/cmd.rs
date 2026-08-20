@@ -85,6 +85,47 @@ pub fn cmd_bench_list(bench_root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Prints low-cost filesystem measurements for benchmark retention review.
+pub fn cmd_bench_storage(store: &BenchStore) -> anyhow::Result<()> {
+    let report = store.storage_report()?;
+    println!("Benchmark storage");
+    println!("  active:   {}", format_bytes(report.active_bytes));
+    println!("  archived: {}", format_bytes(report.archived_bytes));
+    println!(
+        "  total:    {} ({} files)",
+        format_bytes(report.total_bytes()),
+        report.file_count
+    );
+    match report.oldest_modified {
+        Some(oldest) => {
+            let oldest: DateTime<Utc> = oldest.into();
+            println!("  oldest modified: {}", oldest.format("%Y-%m-%d"));
+        }
+        None => println!("  oldest modified: none"),
+    }
+    for warning in report.warnings(std::time::SystemTime::now()) {
+        println!("warning: {warning}");
+    }
+    Ok(())
+}
+
+/// Moves a completed run to the recoverable archive without removing its
+/// index row or detailed historical lookup capability.
+pub fn cmd_bench_archive(store: &BenchStore, run_id: &str) -> anyhow::Result<()> {
+    let destination = store.archive_run(run_id)?;
+    println!("Archived {run_id} to {}", destination.display());
+    Ok(())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if bytes < MIB {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    }
+}
+
 /// Runs every case of the given tier (or all tiers when `tier` is
 /// `None`). Writes per-case results AND the run summary to the
 /// store, then prints a short outcome table.

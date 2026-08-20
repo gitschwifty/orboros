@@ -15,6 +15,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -284,6 +285,52 @@ pub enum StoreError {
     },
     #[error("failed to serialize entry: {0}")]
     Encode(#[from] serde_json::Error),
+    #[error("benchmark run `{run_id}` was not found in the active store")]
+    RunNotFound { run_id: String },
+    #[error("archive destination already exists: {path}")]
+    ArchiveExists { path: PathBuf },
+}
+
+/// Read-only storage measurements for a benchmark results root.
+///
+/// These are intentionally cheap filesystem metadata measurements: no JSONL
+/// needs to be replayed merely to decide whether maintenance is needed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BenchStorageReport {
+    pub active_bytes: u64,
+    pub archived_bytes: u64,
+    pub file_count: u64,
+    pub oldest_modified: Option<SystemTime>,
+}
+
+impl BenchStorageReport {
+    #[must_use]
+    pub fn total_bytes(&self) -> u64 {
+        self.active_bytes.saturating_add(self.archived_bytes)
+    }
+
+    /// Storage warning thresholds deliberately sit below sizes where a normal
+    /// laptop's backup, directory scan, or JSONL replay becomes unpleasant.
+    #[must_use]
+    pub fn warnings(&self, now: SystemTime) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.total_bytes() >= 512 * 1024 * 1024 {
+            warnings.push("benchmark evidence exceeds 512 MiB; archive completed runs".into());
+        }
+        if self.archived_bytes >= 2 * 1024 * 1024 * 1024 {
+            warnings.push(
+                "benchmark archive exceeds 2 GiB; verify backup and database criteria".into(),
+            );
+        }
+        if self.oldest_modified.is_some_and(|oldest| {
+            now.duration_since(oldest)
+                .map_or(false, |age| age.as_secs() >= 90 * 24 * 60 * 60)
+        }) {
+            warnings
+                .push("benchmark evidence is older than 90 days; review retention policy".into());
+        }
+        warnings
+    }
 }
 
 impl BenchStore {
@@ -306,6 +353,16 @@ impl BenchStore {
     #[must_use]
     pub fn run_dir(&self, run_id: &str) -> PathBuf {
         self.bench_dir.join(run_date_dir(run_id)).join(run_id)
+    }
+
+    /// Recoverable archive location for a completed run. Archived run
+    /// directories retain their `run.json` and all detailed evidence.
+    #[must_use]
+    pub fn archive_run_dir(&self, run_id: &str, started_at: DateTime<Utc>) -> PathBuf {
+        self.bench_dir
+            .join("archive")
+            .join(started_at.format("%Y-%m").to_string())
+            .join(run_id)
     }
 
     /// Path to one run's summary copy.
@@ -439,6 +496,49 @@ impl BenchStore {
         write_json(&self.run_summary_path(&run.run_id), run)
     }
 
+    /// Atomically moves one completed run's evidence to the recoverable
+    /// archive. The append-only `runs.jsonl` index is left in place, so normal
+    /// history and lookup continue to work. This operation never deletes or
+    /// overwrites data; callers can move the directory back to restore it.
+    pub fn archive_run(&self, run_id: &str) -> Result<PathBuf, StoreError> {
+        let source = self.run_dir(run_id);
+        if !source.is_dir() {
+            return Err(StoreError::RunNotFound {
+                run_id: run_id.into(),
+            });
+        }
+        let run = read_json_file::<BenchRun>(&source.join("run.json"))?.ok_or_else(|| {
+            StoreError::RunNotFound {
+                run_id: run_id.into(),
+            }
+        })?;
+        let destination = self.archive_run_dir(run_id, run.started_at);
+        if destination.exists() {
+            return Err(StoreError::ArchiveExists { path: destination });
+        }
+        let parent = destination
+            .parent()
+            .expect("archive run paths have a parent");
+        ensure_dir(parent)?;
+        std::fs::rename(&source, &destination).map_err(|source_err| StoreError::Io {
+            path: source,
+            source: source_err,
+        })?;
+        Ok(destination)
+    }
+
+    /// Measures active and archived evidence without reading its JSONL.
+    pub fn storage_report(&self) -> Result<BenchStorageReport, StoreError> {
+        let active = measure_tree(&self.bench_dir, true)?;
+        let archived = measure_tree(&self.bench_dir.join("archive"), false)?;
+        Ok(BenchStorageReport {
+            active_bytes: active.0,
+            archived_bytes: archived.0,
+            file_count: active.1 + archived.1,
+            oldest_modified: active.2.into_iter().chain(archived.2).min(),
+        })
+    }
+
     /// Reads all run summaries (oldest first). Skips malformed lines
     /// — old rows from a prior schema shouldn't crash the CLI.
     ///
@@ -466,7 +566,7 @@ impl BenchStore {
     ///
     /// As [`Self::read_runs`].
     pub fn read_results(&self, run_id: &str) -> Result<Vec<BenchResult>, StoreError> {
-        read_jsonl(&self.results_path(run_id))
+        read_jsonl(&self.run_dir_for_read(run_id).join("results.jsonl"))
     }
 
     /// Reads durable per-dispatch telemetry for one run. Historical runs that
@@ -476,7 +576,7 @@ impl BenchStore {
     ///
     /// As [`Self::read_runs`].
     pub fn read_dispatches(&self, run_id: &str) -> Result<Vec<BenchDispatchRecord>, StoreError> {
-        read_jsonl(&self.dispatches_path(run_id))
+        read_jsonl(&self.run_dir_for_read(run_id).join("dispatches.jsonl"))
     }
 
     /// Reads durable prompt snapshots for one run.
@@ -485,8 +585,74 @@ impl BenchStore {
     ///
     /// As [`Self::read_runs`].
     pub fn read_prompts(&self, run_id: &str) -> Result<Vec<BenchPromptRecord>, StoreError> {
-        read_jsonl(&self.prompts_path(run_id))
+        read_jsonl(&self.run_dir_for_read(run_id).join("prompts.jsonl"))
     }
+
+    fn run_dir_for_read(&self, run_id: &str) -> PathBuf {
+        let active = self.run_dir(run_id);
+        if active.exists() {
+            return active;
+        }
+        let archive = self.bench_dir.join("archive");
+        let Ok(months) = std::fs::read_dir(archive) else {
+            return active;
+        };
+        for month in months.flatten() {
+            let candidate = month.path().join(run_id);
+            if candidate.is_dir() {
+                return candidate;
+            }
+        }
+        active
+    }
+}
+
+/// Returns (bytes, regular-file count, oldest modification time). When
+/// `skip_archive` is true the archive subtree is excluded from the root walk.
+fn measure_tree(
+    path: &Path,
+    skip_archive: bool,
+) -> Result<(u64, u64, Option<SystemTime>), StoreError> {
+    if !path.exists() {
+        return Ok((0, 0, None));
+    }
+    let mut bytes = 0;
+    let mut files = 0;
+    let mut oldest = None;
+    for entry in std::fs::read_dir(path).map_err(|source| StoreError::Io {
+        path: path.into(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| StoreError::Io {
+            path: path.into(),
+            source,
+        })?;
+        if skip_archive && entry.file_name() == "archive" {
+            continue;
+        }
+        let entry_path = entry.path();
+        let file_type = entry.file_type().map_err(|source| StoreError::Io {
+            path: entry_path.clone(),
+            source,
+        })?;
+        if file_type.is_dir() {
+            let child = measure_tree(&entry_path, false)?;
+            bytes += child.0;
+            files += child.1;
+            oldest = oldest.into_iter().chain(child.2).min();
+        } else if file_type.is_file() {
+            let metadata = entry.metadata().map_err(|source| StoreError::Io {
+                path: entry_path,
+                source,
+            })?;
+            bytes += metadata.len();
+            files += 1;
+            if let Ok(modified) = metadata.modified() {
+                oldest = Some(oldest.map_or(modified, |current| current.min(modified)));
+            }
+        }
+    }
+    Ok((bytes, files, oldest))
 }
 
 fn run_date_dir(run_id: &str) -> String {
@@ -588,7 +754,18 @@ fn discover_run_summaries(bench_dir: &Path) -> Result<Vec<BenchRun>, StoreError>
             if !file_type.is_dir() {
                 continue;
             }
-            if let Some(run) = read_json_file(&run_entry.path().join("run.json"))? {
+            let run_path = run_entry.path();
+            if date_entry.file_name() == "archive" {
+                let archived_runs = std::fs::read_dir(&run_path).map_err(|e| StoreError::Io {
+                    path: run_path.clone(),
+                    source: e,
+                })?;
+                for archived_run in archived_runs.flatten() {
+                    if let Some(run) = read_json_file(&archived_run.path().join("run.json"))? {
+                        runs.push(run);
+                    }
+                }
+            } else if let Some(run) = read_json_file(&run_path.join("run.json"))? {
                 runs.push(run);
             }
         }
@@ -795,6 +972,44 @@ mod tests {
         let read = store.read_runs().unwrap();
         assert_eq!(read.len(), 1);
         assert_eq!(read[0], r);
+    }
+
+    #[test]
+    fn archiving_is_recoverable_and_historical_reads_continue_to_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BenchStore::new(dir.path().join("bench"));
+        let run = sample_run(DATED_RUN_ID);
+        let result = sample_result(DATED_RUN_ID, "case-a");
+        store.append_run(&run).unwrap();
+        store.append_result(&result).unwrap();
+
+        let archive = store.archive_run(DATED_RUN_ID).unwrap();
+        assert!(archive.join("run.json").exists());
+        assert!(!store.run_dir(DATED_RUN_ID).exists());
+        assert_eq!(store.read_runs().unwrap(), vec![run]);
+        assert_eq!(store.read_results(DATED_RUN_ID).unwrap(), vec![result]);
+    }
+
+    #[test]
+    fn storage_report_separates_active_and_archived_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BenchStore::new(dir.path().join("bench"));
+        let run = sample_run(DATED_RUN_ID);
+        store.append_run(&run).unwrap();
+        store
+            .append_result(&sample_result(DATED_RUN_ID, "case-a"))
+            .unwrap();
+        let active = store.storage_report().unwrap();
+        assert!(active.active_bytes > 0);
+        assert_eq!(active.archived_bytes, 0);
+
+        store.archive_run(DATED_RUN_ID).unwrap();
+        let archived = store.storage_report().unwrap();
+        // The compact append-only `runs.jsonl` index intentionally remains
+        // active so historical run discovery does not require archive scans.
+        assert!(archived.active_bytes > 0);
+        assert!(archived.archived_bytes > 0);
+        assert!(archived.file_count >= 2);
     }
 
     #[test]
