@@ -92,7 +92,9 @@ assert_eq!(child_id.parent_id(), Some(id.clone()));
 
 ## Persistence
 
-All stores use append-only JSONL. Latest entry per ID wins on read.
+All stores use append-only JSONL. Latest entry per ID wins on read. See
+[data retention and JSONL operations](data-retention.md) for compaction,
+archival, backup, and single-writer expectations.
 
 ### OrbStore
 

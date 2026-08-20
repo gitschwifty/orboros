@@ -307,6 +307,13 @@ enum BenchAction {
         #[arg(long, default_value_t = 10)]
         buckets: usize,
     },
+    /// Measure active and archived benchmark evidence and show maintenance warnings.
+    Storage,
+    /// Move a completed benchmark run to the recoverable local archive.
+    Archive {
+        /// Run id, as printed by `bench list-runs`.
+        run_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1077,6 +1084,8 @@ fn cmd_bench(
         BenchAction::Calibration { run_id, buckets } => {
             orboros::bench::calibration::cmd_bench_calibration(&store, &run_id, buckets)
         }
+        BenchAction::Storage => bench_cmd::cmd_bench_storage(&store),
+        BenchAction::Archive { run_id } => bench_cmd::cmd_bench_archive(&store, &run_id),
     }
 }
 
