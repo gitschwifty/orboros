@@ -387,6 +387,11 @@ repository diff-type labels plus the identity of a task-specific grader. The
 the taxonomy, private-corpus case plan, reproducibility metadata, and reporting
 requirements. Keep the benchmark prompt set fixed while comparing models.
 
+Benchmark-proven prompts are promoted into packaged defaults only through the
+[documented review workflow](docs/benchmark-prompt-promotion.md). The public
+promotion ledger stores hashes and evidence references, never private benchmark
+content or a CI dependency on the private corpus.
+
 Bench runs load normal Orboros config first, then overlay
 `<bench-root>/config.toml` when it exists. Use `--bench-config <path>` to point
 at a different file; explicit paths must exist. Benchmark config is applied
