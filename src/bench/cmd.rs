@@ -30,6 +30,8 @@ pub struct BenchRunRequest<'a> {
     pub store: &'a BenchStore,
     pub tier: Option<BenchTier>,
     pub case_id: Option<&'a str>,
+    /// Every supplied tag must be present on a selected case.
+    pub tags: &'a [String],
     pub worker_config: &'a WorkerConfig,
     pub no_budget: bool,
     /// Maximum independent benchmark cases in flight. One preserves the
@@ -72,8 +74,13 @@ pub fn cmd_bench_list(bench_root: &Path) -> anyhow::Result<()> {
         }
         let cost = case.max_cost_cents;
         let timeout = case.timeout_s.unwrap_or(DEFAULT_TIMEOUT_S);
+        let tags = if case.tags.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", case.tags.join(", "))
+        };
         println!(
-            "  {selector:<id_width$} {name}  ({id}; max ${cost_dollars:.2}, {timeout}s)",
+            "  {selector:<id_width$} {name}{tags}  ({id}; max ${cost_dollars:.2}, {timeout}s)",
             selector = case.selector,
             id = case.id,
             name = case.name,
@@ -107,6 +114,9 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
         if cases.is_empty() {
             anyhow::bail!("no case found with id or selector `{id}`");
         }
+    }
+    if !req.tags.is_empty() {
+        cases.retain(|case| case_matches_tags(case, req.tags));
     }
     if cases.is_empty() {
         println!("No matching cases.");
@@ -352,6 +362,11 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
         println!("\nRun id: {id}");
     }
     Ok(())
+}
+
+fn case_matches_tags(case: &BenchCase, tags: &[String]) -> bool {
+    tags.iter()
+        .all(|tag| case.tags.iter().any(|case_tag| case_tag == tag))
 }
 
 async fn cmd_bench_run_parallel(
@@ -2473,6 +2488,7 @@ done
             description: "test".into(),
             prompt: "reply ok".into(),
             expected: BenchExpected::Exact { text: "ok".into() },
+            tags: Vec::new(),
             taxonomy: crate::bench::case::BenchTaxonomy::default(),
             grader: None,
             runner: None,
@@ -2511,6 +2527,7 @@ done
             store: &store,
             tier: Some(BenchTier::T1),
             case_id: None,
+            tags: &[],
             worker_config: &worker_config,
             no_budget: false,
             jobs: 2,
@@ -2549,6 +2566,40 @@ done
                 .collect::<Vec<_>>(),
             ["case-a", "case-b"],
         );
+    }
+
+    #[test]
+    fn tag_filter_requires_every_requested_tag() {
+        let case = BenchCase {
+            id: "graded".into(),
+            tier: BenchTier::T3,
+            name: "graded".into(),
+            description: "test".into(),
+            prompt: "test".into(),
+            expected: BenchExpected::Rubric {
+                criteria: vec!["quality".into()],
+            },
+            tags: vec!["ai-graded".into(), "pilot-82".into()],
+            taxonomy: crate::bench::case::BenchTaxonomy::default(),
+            grader: None,
+            runner: None,
+            timeout_s: None,
+            max_iterations: None,
+            max_cost_cents: 100,
+            tool_policy: None,
+            process: None,
+            resource_guidance: None,
+            selector: "t3.001".into(),
+            case_dir: PathBuf::new(),
+            fixture_dir: None,
+            test_overlay_dir: None,
+        };
+        assert!(case_matches_tags(&case, &["ai-graded".into()]));
+        assert!(case_matches_tags(
+            &case,
+            &["ai-graded".into(), "pilot-82".into()]
+        ));
+        assert!(!case_matches_tags(&case, &["smoke".into()]));
     }
 
     #[test]

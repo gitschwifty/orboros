@@ -386,6 +386,8 @@ repository diff-type labels plus the identity of a task-specific grader. The
 [model-by-diff-type pilot protocol](docs/model-by-diff-type-pilot.md) defines
 the taxonomy, private-corpus case plan, reproducibility metadata, and reporting
 requirements. Keep the benchmark prompt set fixed while comparing models.
+Use repeatable `bench run --tag <tag>` filters to run a labelled subset; for
+example, the Task 82 AI-graded pilot uses `--tag ai-graded --tag pilot-82`.
 
 Benchmark-proven prompts are promoted into packaged defaults only through the
 [documented review workflow](docs/benchmark-prompt-promotion.md). The public

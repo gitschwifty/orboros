@@ -200,6 +200,11 @@ pub struct BenchCase {
     /// Prompt sent to the worker as the user message.
     pub prompt: String,
     pub expected: BenchExpected,
+    /// Stable labels for selecting a coherent subset of the private corpus.
+    /// Tags are orthogonal to tier, taxonomy, and expectation: for example, a
+    /// T3 execution case can be tagged `ai-graded` and `pilot-82`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     /// Independent work and diff-type labels used for grouped model reports.
     #[serde(default, skip_serializing_if = "BenchTaxonomy::is_empty")]
     pub taxonomy: BenchTaxonomy,
@@ -540,6 +545,8 @@ name = "Review a bug fix"
 description = "Review a targeted fix for correctness and scope."
 prompt = "Review the proposed fix."
 
+tags = ["ai-graded", "pilot-82"]
+
 [taxonomy]
 work_types = ["execution", "review"]
 diff_types = ["bugfix"]
@@ -560,6 +567,7 @@ criteria = ["identifies the regression", "does not request unrelated refactors"]
             vec![BenchWorkType::Execution, BenchWorkType::Review]
         );
         assert_eq!(case.taxonomy.diff_types, vec![BenchDiffType::Bugfix]);
+        assert_eq!(case.tags, ["ai-graded", "pilot-82"]);
         assert_eq!(case.grader.unwrap().rubric_version, "v1");
     }
 

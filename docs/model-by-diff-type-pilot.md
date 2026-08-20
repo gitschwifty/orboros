@@ -62,6 +62,18 @@ scope adherence, reasoning/review quality, and completeness.
 Changing a case, taxonomy, rubric version, or grader prompt hash is a suite
 change. It requires a new comparable cohort, not an append to an old result.
 
+Tag every rubric-scored pilot case with `ai-graded` and `pilot-82`. This makes
+the AI-graded subset explicit and runnable without maintaining a fragile list
+of IDs:
+
+```bash
+orboros bench run --tag ai-graded --tag pilot-82 --model <catalog-key>
+```
+
+Repeated `--tag` filters are conjunctive: a selected case must have every
+requested tag. Tags are selection labels only; the task taxonomy and grader
+identity remain the recorded evaluation metadata.
+
 ## Initial corpus: 12-case pilot
 
 Create two small, self-contained private cases for each selected category.

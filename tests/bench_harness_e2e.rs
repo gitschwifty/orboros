@@ -110,6 +110,7 @@ fn t1_case(id: &str, prompt: &str, expected: BenchExpected) -> BenchCase {
         description: "test".into(),
         prompt: prompt.into(),
         expected,
+        tags: Vec::new(),
         taxonomy: orboros::bench::case::BenchTaxonomy::default(),
         grader: None,
         runner: None,

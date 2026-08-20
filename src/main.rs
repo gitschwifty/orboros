@@ -210,6 +210,9 @@ enum BenchAction {
         /// Single case id to run (overrides --tier filtering).
         #[arg(long)]
         case: Option<String>,
+        /// Require a case tag. Repeat to require multiple tags, e.g. `--tag ai-graded`.
+        #[arg(long)]
+        tag: Vec<String>,
         /// Model catalog key or raw provider/model string for benchmark workers.
         #[arg(long)]
         model: Option<String>,
@@ -919,6 +922,7 @@ fn cmd_bench(
         BenchAction::Run {
             tier,
             case,
+            tag,
             model,
             variant,
             prompt_set,
@@ -1011,6 +1015,7 @@ fn cmd_bench(
                 store: &store,
                 tier,
                 case_id: case.as_deref(),
+                tags: &tag,
                 worker_config: &worker_config,
                 no_budget,
                 jobs: jobs.or(cfg.bench.jobs).unwrap_or(1),

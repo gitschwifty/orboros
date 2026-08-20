@@ -1353,6 +1353,7 @@ mod tests {
             expected: BenchExpected::TestsPass {
                 command: command.into(),
             },
+            tags: Vec::new(),
             taxonomy: crate::bench::case::BenchTaxonomy::default(),
             grader: None,
             runner: None,
@@ -1845,6 +1846,7 @@ done
             expected: BenchExpected::Rubric {
                 criteria: vec!["builds".into()],
             },
+            tags: Vec::new(),
             taxonomy: crate::bench::case::BenchTaxonomy::default(),
             grader: None,
             runner: None,
