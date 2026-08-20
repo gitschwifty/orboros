@@ -381,6 +381,12 @@ Benchmark results default to `<bench-root>/results`; use
 different store, including older runs under `~/.orboros/default/bench`. Each new
 run writes under `<bench-root>/results/YYYY-MM-DD/<run-id>/`.
 
+For model selection experiments, cases can record independent Orboros work and
+repository diff-type labels plus the identity of a task-specific grader. The
+[model-by-diff-type pilot protocol](docs/model-by-diff-type-pilot.md) defines
+the taxonomy, private-corpus case plan, reproducibility metadata, and reporting
+requirements. Keep the benchmark prompt set fixed while comparing models.
+
 Bench runs load normal Orboros config first, then overlay
 `<bench-root>/config.toml` when it exists. Use `--bench-config <path>` to point
 at a different file; explicit paths must exist. Benchmark config is applied

@@ -1353,6 +1353,8 @@ mod tests {
             expected: BenchExpected::TestsPass {
                 command: command.into(),
             },
+            taxonomy: crate::bench::case::BenchTaxonomy::default(),
+            grader: None,
             runner: None,
             timeout_s: Some(60),
             max_iterations: None,
@@ -1843,6 +1845,8 @@ done
             expected: BenchExpected::Rubric {
                 criteria: vec!["builds".into()],
             },
+            taxonomy: crate::bench::case::BenchTaxonomy::default(),
+            grader: None,
             runner: None,
             timeout_s: Some(60),
             max_iterations: None,

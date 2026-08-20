@@ -595,6 +595,8 @@ fn build_suite_manifest(
                 .as_deref()
                 .map(hash_tree)
                 .transpose()?,
+            taxonomy: case.taxonomy.clone(),
+            grader: case.grader.clone(),
         });
     }
     suite_cases.sort_by(|a, b| a.selector.cmp(&b.selector));
@@ -2471,6 +2473,8 @@ done
             description: "test".into(),
             prompt: "reply ok".into(),
             expected: BenchExpected::Exact { text: "ok".into() },
+            taxonomy: crate::bench::case::BenchTaxonomy::default(),
+            grader: None,
             runner: None,
             timeout_s: Some(10),
             max_iterations: Some(1),

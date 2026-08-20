@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::bench::case::{BenchResourceGuidance, BenchTier};
+use crate::bench::case::{BenchGrader, BenchResourceGuidance, BenchTaxonomy, BenchTier};
 use crate::bench::prompts::PromptManifest;
 
 /// Deterministic identity for the evaluated benchmark suite, deliberately
@@ -42,6 +42,13 @@ pub struct BenchSuiteCase {
     pub fixture_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_sha256: Option<String>,
+    /// Classification snapshot from the case definition. This permits results
+    /// repositories to group historical runs after the private corpus changes.
+    #[serde(default, skip_serializing_if = "BenchTaxonomy::is_empty")]
+    pub taxonomy: BenchTaxonomy,
+    /// Rubric identity snapshot for task-specific AI grading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grader: Option<BenchGrader>,
 }
 
 /// A per-dispatch execution record retained at benchmark run scope.

@@ -27,6 +27,55 @@ pub enum BenchTier {
     T3,
 }
 
+/// The primary kind of Orboros work a case evaluates. Cases may have more
+/// than one value when, for example, an execution task also asks for review.
+/// Keep this deliberately about agent work, rather than the shape of the
+/// repository change; [`BenchDiffType`] captures the latter axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchWorkType {
+    Speccing,
+    Decomposition,
+    Exploration,
+    Execution,
+    Refinement,
+    Review,
+}
+
+/// The primary repository-change shape exercised by a case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchDiffType {
+    Bugfix,
+    Feature,
+    Refactor,
+    Tests,
+    DocumentationConfiguration,
+    CrossCutting,
+}
+
+/// Two independent classification axes used by the model-by-diff-type pilot.
+/// Empty axes are valid for older or intentionally unclassified cases.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchTaxonomy {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub work_types: Vec<BenchWorkType>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diff_types: Vec<BenchDiffType>,
+}
+
+/// Identity of a task-specific AI grader. The actual rubric remains in the
+/// private corpus; this metadata makes the evaluated rubric reproducible
+/// without copying private prompt text into Orboros artifacts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BenchGrader {
+    pub rubric_id: String,
+    pub rubric_version: String,
+    pub prompt_sha256: String,
+}
+
 impl BenchTier {
     /// Lowercase string used in CLI args and result store paths.
     #[must_use]
@@ -151,6 +200,13 @@ pub struct BenchCase {
     /// Prompt sent to the worker as the user message.
     pub prompt: String,
     pub expected: BenchExpected,
+    /// Independent work and diff-type labels used for grouped model reports.
+    #[serde(default, skip_serializing_if = "BenchTaxonomy::is_empty")]
+    pub taxonomy: BenchTaxonomy,
+    /// Stable identity of the task-specific AI rubric, when the case needs
+    /// quality/scope evaluation beyond deterministic checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grader: Option<BenchGrader>,
     /// Optional runner override. Defaults to `single_task`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner: Option<BenchRunner>,
@@ -190,6 +246,12 @@ pub struct BenchCase {
     /// Optional grading overlay at `<case_dir>/overlay`.
     #[serde(skip)]
     pub test_overlay_dir: Option<PathBuf>,
+}
+
+impl BenchTaxonomy {
+    pub fn is_empty(&self) -> bool {
+        self.work_types.is_empty() && self.diff_types.is_empty()
+    }
 }
 
 fn default_max_cost_cents() -> u32 {
@@ -466,6 +528,39 @@ command = "cargo test"
             policy.phases["speccing"].allowed_tools,
             Some(vec!["read_file".into(), "glob".into()])
         );
+    }
+
+    #[test]
+    fn load_case_records_taxonomy_and_grader_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"
+id = "review-bugfix"
+tier = "t3"
+name = "Review a bug fix"
+description = "Review a targeted fix for correctness and scope."
+prompt = "Review the proposed fix."
+
+[taxonomy]
+work_types = ["execution", "review"]
+diff_types = ["bugfix"]
+
+[grader]
+rubric_id = "review-bugfix"
+rubric_version = "v1"
+prompt_sha256 = "4f2e"
+
+[expected]
+kind = "rubric"
+criteria = ["identifies the regression", "does not request unrelated refactors"]
+"#;
+        let p = write_case(dir.path(), "review-bugfix.toml", body);
+        let case = load_case(&p, Some(BenchTier::T3)).unwrap();
+        assert_eq!(
+            case.taxonomy.work_types,
+            vec![BenchWorkType::Execution, BenchWorkType::Review]
+        );
+        assert_eq!(case.taxonomy.diff_types, vec![BenchDiffType::Bugfix]);
+        assert_eq!(case.grader.unwrap().rubric_version, "v1");
     }
 
     #[test]
