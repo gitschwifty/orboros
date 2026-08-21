@@ -82,8 +82,19 @@ pub fn cmd_bench_list(bench_root: &Path) -> anyhow::Result<()> {
         } else {
             format!(" [{}]", case.tags.join(", "))
         };
+        let availability = if case.enabled {
+            String::new()
+        } else {
+            format!(
+                " [disabled{}]",
+                case.disabled_reason
+                    .as_deref()
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            )
+        };
         println!(
-            "  {selector:<id_width$} {name}{tags}  ({id}; max ${cost_dollars:.2}, {timeout}s)",
+            "  {selector:<id_width$} {name}{tags}{availability}  ({id}; max ${cost_dollars:.2}, {timeout}s)",
             selector = case.selector,
             id = case.id,
             name = case.name,
@@ -158,6 +169,22 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
             anyhow::bail!("no case found with id or selector `{id}`");
         }
     }
+    let disabled = cases
+        .iter()
+        .filter(|case| !case.enabled)
+        .collect::<Vec<_>>();
+    if req.case_id.is_some() && disabled.len() == 1 && disabled.len() == cases.len() {
+        let case = disabled[0];
+        anyhow::bail!(
+            "benchmark case `{}` is disabled{}",
+            case.id,
+            case.disabled_reason
+                .as_deref()
+                .map(|reason| format!(": {reason}"))
+                .unwrap_or_default()
+        );
+    }
+    cases.retain(|case| case.enabled);
     if !req.tags.is_empty() {
         cases.retain(|case| case_matches_tags(case, req.tags));
     }
@@ -2559,6 +2586,8 @@ done
         let make_case = |id: &str, selector: &str| BenchCase {
             id: id.into(),
             tier: BenchTier::T1,
+            enabled: true,
+            disabled_reason: None,
             name: id.into(),
             description: "test".into(),
             prompt: "reply ok".into(),
@@ -2650,6 +2679,8 @@ done
         let case = BenchCase {
             id: "graded".into(),
             tier: BenchTier::T3,
+            enabled: true,
+            disabled_reason: None,
             name: "graded".into(),
             description: "test".into(),
             prompt: "test".into(),

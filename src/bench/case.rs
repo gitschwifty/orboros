@@ -193,6 +193,14 @@ pub struct BenchCase {
     /// Stable identifier — used in result store rows and CLI selectors.
     pub id: String,
     pub tier: BenchTier,
+    /// Whether normal benchmark runs should select this case. Disabled cases
+    /// remain visible in `bench list` and can be re-enabled once their runner
+    /// and fixture requirements are available.
+    #[serde(default = "default_case_enabled")]
+    pub enabled: bool,
+    /// Human-readable reason a case is not currently runnable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_reason: Option<String>,
     pub name: String,
     /// Human description of what the case exercises. Not sent to the
     /// worker — `prompt` is.
@@ -251,6 +259,10 @@ pub struct BenchCase {
     /// Optional grading overlay at `<case_dir>/overlay`.
     #[serde(skip)]
     pub test_overlay_dir: Option<PathBuf>,
+}
+
+const fn default_case_enabled() -> bool {
+    true
 }
 
 impl BenchTaxonomy {
@@ -489,11 +501,40 @@ text = "hello"
         assert_eq!(case.tier, BenchTier::T1);
         assert_eq!(case.timeout_s, None, "timeout inherits harness default");
         assert_eq!(case.max_cost_cents, 50, "default cost ceiling applied");
+        assert!(
+            case.enabled,
+            "cases are runnable unless explicitly disabled"
+        );
         assert!(case.fixture_dir.is_none());
         match case.expected {
             BenchExpected::Exact { text } => assert_eq!(text, "hello"),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn load_case_records_disabled_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = r#"
+id = "paused-case"
+tier = "t3"
+enabled = false
+disabled_reason = "waiting for a dedicated runner"
+name = "Paused"
+description = "Not runnable yet."
+prompt = "Do not run"
+
+[expected]
+kind = "rubric"
+criteria = ["unused"]
+"#;
+        let p = write_case(dir.path(), "paused-case.toml", body);
+        let case = load_case(&p, Some(BenchTier::T3)).unwrap();
+        assert!(!case.enabled);
+        assert_eq!(
+            case.disabled_reason.as_deref(),
+            Some("waiting for a dedicated runner")
+        );
     }
 
     #[test]

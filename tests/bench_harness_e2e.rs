@@ -106,6 +106,8 @@ fn t1_case(id: &str, prompt: &str, expected: BenchExpected) -> BenchCase {
     BenchCase {
         id: id.into(),
         tier: BenchTier::T1,
+        enabled: true,
+        disabled_reason: None,
         name: id.into(),
         description: "test".into(),
         prompt: prompt.into(),

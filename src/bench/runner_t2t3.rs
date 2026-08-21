@@ -1543,6 +1543,8 @@ mod tests {
         BenchCase {
             id: id.into(),
             tier: BenchTier::T2,
+            enabled: true,
+            disabled_reason: None,
             name: id.into(),
             description: "test".into(),
             prompt: "p".into(),
@@ -2086,6 +2088,8 @@ done
         let case = BenchCase {
             id: "t3-1".into(),
             tier: BenchTier::T3,
+            enabled: true,
+            disabled_reason: None,
             name: "n".into(),
             description: "d".into(),
             prompt: "p".into(),
