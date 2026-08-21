@@ -25,7 +25,7 @@ use orbs::dep_store::DepStore;
 use orbs::orb::{Orb, OrbPhase, OrbStatus, OrbType};
 use orbs::orb_store::OrbStore;
 use orbs::task::TaskStatus;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::bench::case::{BenchCase, BenchExpected, BenchProcess, BenchRunner, BenchTier};
 use crate::bench::prompts::BenchPromptSet;
@@ -213,6 +213,7 @@ pub async fn run_t2_case(
     run_id: &str,
     base_worker_config: &WorkerConfig,
     grader_worker_config: &WorkerConfig,
+    model_config: &crate::config::OrbConfig,
     opts: &RunOptions,
     artifact_dir: Option<&Path>,
     prompt_set: Option<&BenchPromptSet>,
@@ -222,6 +223,7 @@ pub async fn run_t2_case(
             case,
             run_id,
             base_worker_config,
+            model_config,
             opts,
             artifact_dir,
             prompt_set,
@@ -271,9 +273,12 @@ pub async fn run_t2_case(
     let mut ql = if let Some(set) = prompt_set {
         QueueLoop::new(orb_store.clone(), dep_store, workdir.clone())
             .with_prompt_capture()
+            .with_config(model_config.clone())
             .with_prompt_config(set.prompt_config())
     } else {
-        QueueLoop::new(orb_store.clone(), dep_store, workdir.clone()).with_prompt_capture()
+        QueueLoop::new(orb_store.clone(), dep_store, workdir.clone())
+            .with_prompt_capture()
+            .with_config(model_config.clone())
     };
     if let Some(policy) = case.tool_policy.clone() {
         ql = ql.with_tool_policy(policy);
@@ -475,9 +480,11 @@ async fn grade_t2_change(
     let mut errors = Vec::new();
     let mut last_output = None;
     for attempt in 0..=1 {
+        info!(case = %case.id, model = %config.model, attempt = attempt + 1, "benchmark grader starting");
         let mut worker = match Worker::spawn(&config).await {
             Ok(worker) => worker,
             Err(error) => {
+                warn!(case = %case.id, model = %config.model, attempt = attempt + 1, error = %error, "benchmark grader spawn failed");
                 errors.push(format!(
                     "grader attempt {} spawn failed: {error}",
                     attempt + 1
@@ -492,6 +499,7 @@ async fn grade_t2_change(
         match outcome {
             Ok(outcome) if outcome.status == ResultStatus::Ok => {
                 let output = outcome.response;
+                info!(case = %case.id, model = %config.model, attempt = attempt + 1, passed = ?output.as_deref().and_then(parse_rubric_verdict), "benchmark grader finished");
                 return BenchQualityReview {
                     passed: output.as_deref().and_then(parse_rubric_verdict),
                     model: config.model,
@@ -501,16 +509,23 @@ async fn grade_t2_change(
             }
             Ok(outcome) => {
                 last_output = outcome.response;
+                warn!(case = %case.id, model = %config.model, attempt = attempt + 1, status = ?outcome.status, "benchmark grader returned non-success status");
                 errors.push(format!(
                     "grader attempt {} returned {:?}",
                     attempt + 1,
                     outcome.status
                 ));
             }
-            Err(error) => errors.push(format!(
-                "grader attempt {} send failed: {error}",
-                attempt + 1
-            )),
+            Err(error) => {
+                warn!(case = %case.id, model = %config.model, attempt = attempt + 1, error = %error, "benchmark grader send failed");
+                errors.push(format!(
+                    "grader attempt {} send failed: {error}",
+                    attempt + 1
+                ));
+            }
+        }
+        if attempt == 0 {
+            info!(case = %case.id, model = %config.model, next_attempt = 2, "retrying benchmark grader with fresh worker");
         }
     }
     BenchQualityReview {
@@ -533,6 +548,7 @@ async fn run_t2_decompose_case(
     case: &BenchCase,
     run_id: &str,
     base_worker_config: &WorkerConfig,
+    model_config: &crate::config::OrbConfig,
     opts: &RunOptions,
     artifact_dir: Option<&Path>,
     prompt_set: Option<&BenchPromptSet>,
@@ -579,6 +595,7 @@ async fn run_t2_decompose_case(
     }
     let mut ql = QueueLoop::new(orb_store.clone(), dep_store.clone(), workdir.clone())
         .with_prompt_capture()
+        .with_config(model_config.clone())
         .with_review_config(crate::config::ReviewConfig {
             requires_approval_by_default: false,
             review_on_completion: false,
@@ -1709,6 +1726,7 @@ done
         std::fs::write(fixture.join("README"), "hi").unwrap();
         let script = write_editing_worker(dir.path());
         let wc = worker_config(&script);
+        let model_config = crate::config::OrbConfig::default();
 
         let case = t2_case_with_seed("t2-1", fixture, "test \"$(cat result.txt)\" = done");
         let artifact_dir = dir.path().join("artifacts").join("t2-1");
@@ -1717,6 +1735,7 @@ done
             "run-x",
             &wc,
             &wc,
+            &model_config,
             &RunOptions::default(),
             Some(&artifact_dir),
             None,
@@ -1760,10 +1779,20 @@ done
         let dir = tempfile::tempdir().unwrap();
         let script = write_editing_worker(dir.path());
         let wc = worker_config(&script);
+        let model_config = crate::config::OrbConfig::default();
         let case = t2_case_with_seed("t2-x", dir.path().join("nope"), "true");
-        let err = run_t2_case(&case, "run-x", &wc, &wc, &RunOptions::default(), None, None)
-            .await
-            .unwrap_err();
+        let err = run_t2_case(
+            &case,
+            "run-x",
+            &wc,
+            &wc,
+            &model_config,
+            &RunOptions::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, HarnessError::SeedRepoMissing(_)));
     }
 
@@ -1776,11 +1805,21 @@ done
         let mut wc = worker_config(Path::new("unused"));
         wc.command = "definitely-not-an-orboros-worker".into();
         wc.args = vec![];
+        let model_config = crate::config::OrbConfig::default();
 
         let case = t2_case_with_seed("t2-fail", fixture, "true");
-        let r = run_t2_case(&case, "run-x", &wc, &wc, &RunOptions::default(), None, None)
-            .await
-            .unwrap();
+        let r = run_t2_case(
+            &case,
+            "run-x",
+            &wc,
+            &wc,
+            &model_config,
+            &RunOptions::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(r.status, BenchStatus::Error);
         let err = r.error.unwrap();
         assert!(

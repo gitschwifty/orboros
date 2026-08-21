@@ -988,6 +988,17 @@ fn cmd_bench(
             )?;
             let worker_config = make_worker_config(&binary, &resolved_model.model, "");
             let grader_worker_config = make_worker_config(&binary, &resolved_grader, "");
+            // A benchmark model selection is a single-model baseline unless a
+            // future benchmark phase-assignment surface says otherwise. T2
+            // queue phases must not silently inherit the user's global phase
+            // model from the temporary fixture workspace.
+            let mut benchmark_model_config = cfg.clone();
+            for phase in ["speccing", "decomposing", "refining", "reevaluating"] {
+                benchmark_model_config
+                    .models
+                    .phases
+                    .insert(phase.into(), resolved_model.model.clone());
+            }
             let prompt_set = prompt_set
                 .as_deref()
                 .map(|name| orboros::bench::prompts::BenchPromptSet::load(bench_root, name))
@@ -1026,6 +1037,7 @@ fn cmd_bench(
                 tags: &tag,
                 worker_config: &worker_config,
                 grader_worker_config: &grader_worker_config,
+                model_config: &benchmark_model_config,
                 no_budget,
                 jobs: jobs.or(cfg.bench.jobs).unwrap_or(1),
                 timeout_s: cfg.bench.timeout_s,

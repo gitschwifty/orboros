@@ -84,6 +84,7 @@ pub struct QueueLoop {
     paused: Arc<AtomicBool>,
     hooks: Option<Arc<crate::hooks::HookSink>>,
     review_config: Option<crate::config::ReviewConfig>,
+    config_override: Option<crate::config::OrbConfig>,
     prompt_config: Option<crate::config::PromptConfig>,
     tool_policy: Option<crate::routing::profile::PhaseToolPolicy>,
     execution_store: crate::execution::ExecutionStore,
@@ -106,6 +107,7 @@ impl QueueLoop {
             paused: Arc::new(AtomicBool::new(false)),
             hooks: None,
             review_config: None,
+            config_override: None,
             prompt_config: None,
             tool_policy: None,
             execution_store: crate::execution::ExecutionStore::new(execution_path),
@@ -136,6 +138,14 @@ impl QueueLoop {
     #[must_use]
     pub fn with_review_config(mut self, review_config: crate::config::ReviewConfig) -> Self {
         self.review_config = Some(review_config);
+        self
+    }
+
+    /// Uses an already-resolved configuration for an embedded run. This keeps
+    /// benchmark phase model selection independent of a fixture's/global config.
+    #[must_use]
+    pub fn with_config(mut self, config: crate::config::OrbConfig) -> Self {
+        self.config_override = Some(config);
         self
     }
 
@@ -710,8 +720,12 @@ impl QueueLoop {
             return Ok(0);
         }
 
-        let mut orb_config =
-            crate::config::load_config(Some(&self.base_dir)).map_err(std::io::Error::other)?;
+        let mut orb_config = match &self.config_override {
+            Some(config) => config.clone(),
+            None => {
+                crate::config::load_config(Some(&self.base_dir)).map_err(std::io::Error::other)?
+            }
+        };
         if let Some(review_config) = &self.review_config {
             orb_config.review = review_config.clone();
         }

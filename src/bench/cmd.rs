@@ -23,6 +23,7 @@ use crate::bench::store::{
     BenchDispatchRecord, BenchPromptRecord, BenchResult, BenchRun, BenchStatus, BenchStore,
     BenchSuiteCase, BenchSuiteManifest,
 };
+use crate::config::OrbConfig;
 use crate::worker::process::WorkerConfig;
 
 pub struct BenchRunRequest<'a> {
@@ -34,6 +35,7 @@ pub struct BenchRunRequest<'a> {
     pub tags: &'a [String],
     pub worker_config: &'a WorkerConfig,
     pub grader_worker_config: &'a WorkerConfig,
+    pub model_config: &'a OrbConfig,
     pub no_budget: bool,
     /// Maximum independent benchmark cases in flight. One preserves the
     /// historical serial behavior.
@@ -243,6 +245,7 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
                     &run_id,
                     req.worker_config,
                     req.grader_worker_config,
+                    req.model_config,
                     &opts,
                     Some(&artifact_dir),
                     req.prompt_set,
@@ -456,6 +459,7 @@ async fn cmd_bench_run_parallel(
                 run_id.clone(),
                 req.worker_config.clone(),
                 req.grader_worker_config.clone(),
+                req.model_config.clone(),
                 opts.clone(),
                 artifact_dir,
                 req.prompt_set.cloned(),
@@ -551,6 +555,7 @@ async fn run_case(
     run_id: String,
     worker_config: WorkerConfig,
     grader_worker_config: WorkerConfig,
+    model_config: OrbConfig,
     opts: RunOptions,
     artifact_dir: PathBuf,
     prompt_set: Option<BenchPromptSet>,
@@ -574,6 +579,7 @@ async fn run_case(
                 &run_id,
                 &worker_config,
                 &grader_worker_config,
+                &model_config,
                 &opts,
                 Some(&artifact_dir),
                 prompt_set.as_ref(),
@@ -2580,6 +2586,7 @@ done
             tags: &[],
             worker_config: &worker_config,
             grader_worker_config: &worker_config,
+            model_config: &OrbConfig::default(),
             no_budget: false,
             jobs: 2,
             timeout_s: Some(10),
