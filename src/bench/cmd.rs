@@ -140,9 +140,8 @@ fn format_bytes(bytes: u64) -> String {
 /// `None`). Writes per-case results AND the run summary to the
 /// store, then prints a short outcome table.
 ///
-/// Only T1 actually executes today; T2/T3 use the scaffolded stubs
-/// that record an Error result. Composability of mixed-tier runs
-/// is preserved.
+/// T1 runs a direct worker task; T2 and T3 run isolated Orboros pipelines.
+/// Mixed-tier runs preserve their normal per-tier semantics.
 ///
 /// # Errors
 ///
@@ -294,7 +293,17 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
             },
             BenchTier::T3 => {
                 match tokio::time::timeout(Duration::from_secs(u64::from(timeout_s)), async {
-                    crate::bench::runner_t2t3::run_t3_case_stub(case, &run_id, &opts)
+                    crate::bench::runner_t2t3::run_t3_case(
+                        case,
+                        &run_id,
+                        req.worker_config,
+                        req.grader_worker_config,
+                        req.model_config,
+                        &opts,
+                        Some(&artifact_dir),
+                        req.prompt_set,
+                    )
+                    .await
                 })
                 .await
                 {
@@ -593,7 +602,17 @@ async fn run_case(
         },
         BenchTier::T3 => {
             match tokio::time::timeout(Duration::from_secs(u64::from(timeout_s)), async {
-                crate::bench::runner_t2t3::run_t3_case_stub(&case, &run_id, &opts)
+                crate::bench::runner_t2t3::run_t3_case(
+                    &case,
+                    &run_id,
+                    &worker_config,
+                    &grader_worker_config,
+                    &model_config,
+                    &opts,
+                    Some(&artifact_dir),
+                    prompt_set.as_ref(),
+                )
+                .await
             })
             .await
             {

@@ -19,7 +19,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use chrono::Utc;
 use orbs::dep::{DepEdge, EdgeType};
 use orbs::dep_store::DepStore;
 use orbs::orb::{Orb, OrbPhase, OrbStatus, OrbType};
@@ -1440,66 +1439,100 @@ impl Drop for TempWorkDir {
     }
 }
 
-/// Stub T3 runner. Future implementation should call normal Orboros
-/// execution under benchmark config/result/transcript isolation.
-///
-/// # Errors
-///
-/// Currently only via misshapen expectation or I/O.
-pub fn run_t3_case_stub(
+/// Runs a greenfield T3 case through the normal feature/decomposition queue,
+/// then grades both the final artifact and retained pipeline evidence.
+pub async fn run_t3_case(
     case: &BenchCase,
     run_id: &str,
-    _opts: &RunOptions,
+    base_worker_config: &WorkerConfig,
+    grader_worker_config: &WorkerConfig,
+    model_config: &crate::config::OrbConfig,
+    opts: &RunOptions,
+    artifact_dir: Option<&Path>,
+    prompt_set: Option<&BenchPromptSet>,
 ) -> Result<BenchResult, HarnessError> {
-    let started = Instant::now();
     if case.tier != BenchTier::T3 {
         warn!(
             case = %case.id,
             tier = ?case.tier,
-            "run_t3_case_stub called on non-T3 case"
+            "run_t3_case called on non-T3 case"
         );
     }
-    let _criteria = match &case.expected {
-        BenchExpected::Rubric { criteria } => criteria.clone(),
+    let criteria = match &case.expected {
+        BenchExpected::Rubric { criteria } => criteria,
         _ => return Err(HarnessError::MissingRubric(case.id.clone())),
     };
-    let _ = Utc::now(); // scaffolding placeholder
 
-    Ok(BenchResult {
-        case_id: case.id.clone(),
-        run_id: run_id.into(),
-        tier: BenchTier::T3,
-        status: BenchStatus::Error,
-        score: 0.0,
-        quality_review: None,
-        process_score: None,
-        process_annotations: Vec::new(),
-        resource_guidance: case.resource_guidance.clone(),
-        latency_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        model_latency_ms: None,
-        tool_latency_ms: None,
-        total_latency_ms: None,
-        cost_cents: None,
-        cost_micros: None,
-        iterations: 0,
-        assistant_turns: None,
-        tool_calls: None,
-        prompt_tokens: None,
-        completion_tokens: None,
-        total_tokens: None,
-        cache_read_tokens: None,
-        cache_write_tokens: None,
-        worker_model: String::new(),
-        prompt_hash: prompt_hash(&case.prompt),
-        system_prompt_hash: None,
-        system_prompt_source: None,
-        confidence: None,
-        output: None,
-        error: Some(format!(
-            "T3 runner is scaffolded but not yet wired to normal Orboros execution under benchmark isolation (case {})",
-            case.id
-        )),
-    })
+    // T3 defaults to a genuinely empty project. A case-local fixture remains
+    // optional for the explicitly-existing-project variant.
+    let greenfield = TempWorkDir::new(&format!("{}-greenfield", case.id))?;
+    let seed_dir = if let Some(fixture) = case.fixture_dir.as_deref() {
+        fixture.to_path_buf()
+    } else {
+        let seed = greenfield.path().join("seed");
+        std::fs::create_dir_all(&seed)?;
+        seed
+    };
+    let mut pipeline_case = case.clone();
+    pipeline_case.tier = BenchTier::T2;
+    pipeline_case.fixture_dir = Some(seed_dir.clone());
+    pipeline_case.expected = BenchExpected::TestsPass {
+        command: "true".into(),
+    };
+    let mut result = run_t2_decompose_case(
+        &pipeline_case,
+        run_id,
+        base_worker_config,
+        model_config,
+        opts,
+        artifact_dir,
+        prompt_set,
+    )
+    .await?;
+    result.tier = BenchTier::T3;
+
+    let artifact_workdir = artifact_dir.map(|dir| dir.join("workdir")).ok_or_else(|| {
+        HarnessError::Io(std::io::Error::other("T3 requires an artifact directory"))
+    })?;
+    let pipeline_evidence = result.output.clone().unwrap_or_default();
+    let mut grader_case = case.clone();
+    grader_case.prompt = format!(
+        "{}\n\nPipeline evidence (grade the decomposition/process as well as the final artifact):\n{}",
+        case.prompt,
+        truncate_grader_evidence(&pipeline_evidence)
+    );
+    let tests = TestsPassOutput {
+        passed: result.status == BenchStatus::Pass,
+        stdout: "T3 pipeline reached its terminal evaluation.".into(),
+        stderr: String::new(),
+    };
+    let review = grade_t2_change(
+        &grader_case,
+        &seed_dir,
+        &artifact_workdir,
+        &format!("T3 rubric criteria: {}", criteria.join("; ")),
+        &tests,
+        grader_worker_config,
+        artifact_dir,
+    )
+    .await;
+    let quality_passed = review.passed == Some(true);
+    let pipeline_passed = result.status == BenchStatus::Pass;
+    result.quality_review = Some(review);
+    result.status = if pipeline_passed && quality_passed {
+        BenchStatus::Pass
+    } else {
+        BenchStatus::Fail
+    };
+    result.score = if result.status == BenchStatus::Pass {
+        1.0
+    } else {
+        0.0
+    };
+    if !quality_passed {
+        result.error = Some("T3 AI rubric did not pass the artifact and pipeline evidence".into());
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -2048,16 +2081,16 @@ done
         assert_eq!(diagnostic.repaired_confidence, Some(0.73));
     }
 
-    #[test]
-    fn t3_stub_returns_error_status_with_message() {
+    #[tokio::test]
+    async fn t3_runner_requires_a_rubric() {
         let case = BenchCase {
             id: "t3-1".into(),
             tier: BenchTier::T3,
             name: "n".into(),
             description: "d".into(),
             prompt: "p".into(),
-            expected: BenchExpected::Rubric {
-                criteria: vec!["builds".into()],
+            expected: BenchExpected::TestsPass {
+                command: "true".into(),
             },
             tags: Vec::new(),
             taxonomy: crate::bench::case::BenchTaxonomy::default(),
@@ -2074,8 +2107,20 @@ done
             fixture_dir: None,
             test_overlay_dir: None,
         };
-        let r = run_t3_case_stub(&case, "run-x", &RunOptions::default()).unwrap();
-        assert_eq!(r.status, BenchStatus::Error);
-        assert!(r.error.is_some());
+        let wc = worker_config(Path::new("unused"));
+        let model_config = crate::config::OrbConfig::default();
+        let error = run_t3_case(
+            &case,
+            "run-x",
+            &wc,
+            &wc,
+            &model_config,
+            &RunOptions::default(),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, HarnessError::MissingRubric(_)));
     }
 }
