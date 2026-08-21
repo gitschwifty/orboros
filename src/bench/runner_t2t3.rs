@@ -352,6 +352,7 @@ pub async fn run_t2_case(
                 &command,
                 &tests,
                 grader_worker_config,
+                artifact_dir,
             )
             .await,
         )
@@ -428,6 +429,7 @@ async fn grade_t2_change(
     command: &str,
     tests: &TestsPassOutput,
     base_worker_config: &WorkerConfig,
+    artifact_dir: Option<&Path>,
 ) -> BenchQualityReview {
     let rubric_path = case.case_dir.join("rubric.md");
     let rubric = match std::fs::read_to_string(&rubric_path) {
@@ -469,41 +471,53 @@ async fn grade_t2_change(
     config.tools.clear();
     config.cwd = None;
     config.max_iterations = Some(1);
-    let mut worker = match Worker::spawn(&config).await {
-        Ok(worker) => worker,
-        Err(error) => {
-            return BenchQualityReview {
-                passed: None,
-                model: config.model,
-                output: None,
-                error: Some(format!("grader spawn failed: {error}")),
+    config.runtime = artifact_dir.map(benchmark_runtime_placement);
+    let mut errors = Vec::new();
+    let mut last_output = None;
+    for attempt in 0..=1 {
+        let mut worker = match Worker::spawn(&config).await {
+            Ok(worker) => worker,
+            Err(error) => {
+                errors.push(format!(
+                    "grader attempt {} spawn failed: {error}",
+                    attempt + 1
+                ));
+                continue;
             }
-        }
-    };
-    let outcome = worker.send(&format!("grade-{}", case.id), &user).await;
-    let _ = worker.shutdown().await;
-    match outcome {
-        Ok(outcome) if outcome.status == ResultStatus::Ok => {
-            let output = outcome.response;
-            BenchQualityReview {
-                passed: output.as_deref().and_then(parse_rubric_verdict),
-                model: config.model,
-                output,
-                error: None,
+        };
+        let outcome = worker
+            .send(&format!("grade-{}-{}", case.id, attempt + 1), &user)
+            .await;
+        let _ = worker.shutdown().await;
+        match outcome {
+            Ok(outcome) if outcome.status == ResultStatus::Ok => {
+                let output = outcome.response;
+                return BenchQualityReview {
+                    passed: output.as_deref().and_then(parse_rubric_verdict),
+                    model: config.model,
+                    output,
+                    error: (!errors.is_empty()).then(|| errors.join("; ")),
+                };
             }
+            Ok(outcome) => {
+                last_output = outcome.response;
+                errors.push(format!(
+                    "grader attempt {} returned {:?}",
+                    attempt + 1,
+                    outcome.status
+                ));
+            }
+            Err(error) => errors.push(format!(
+                "grader attempt {} send failed: {error}",
+                attempt + 1
+            )),
         }
-        Ok(outcome) => BenchQualityReview {
-            passed: None,
-            model: config.model,
-            output: outcome.response,
-            error: Some(format!("grader returned {:?}", outcome.status)),
-        },
-        Err(error) => BenchQualityReview {
-            passed: None,
-            model: config.model,
-            output: None,
-            error: Some(format!("grader send failed: {error}")),
-        },
+    }
+    BenchQualityReview {
+        passed: None,
+        model: config.model,
+        output: last_output,
+        error: Some(errors.join("; ")),
     }
 }
 
