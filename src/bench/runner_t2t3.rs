@@ -30,14 +30,16 @@ use tracing::{debug, warn};
 use crate::bench::case::{BenchCase, BenchExpected, BenchProcess, BenchRunner, BenchTier};
 use crate::bench::prompts::BenchPromptSet;
 use crate::bench::runner::{effective_max_iterations, nonzero_u64, prompt_hash, RunOptions};
-use crate::bench::store::{BenchResult, BenchStatus};
+use crate::bench::store::{BenchQualityReview, BenchResult, BenchStatus};
+use crate::ipc::types::ResultStatus;
 use crate::ipc::types::{RuntimeMode, RuntimePlacementConfig};
 use crate::phases::decompose::{self, DecompositionPlan};
 use crate::queue_loop::QueueLoop;
 use crate::routing::profile::builtin_tools;
-use crate::worker::process::WorkerConfig;
+use crate::worker::process::{Worker, WorkerConfig};
 
 const MAX_TEST_OUTPUT_CHARS: usize = 2_000;
+const MAX_GRADER_EVIDENCE_CHARS: usize = 16_000;
 const MAX_DECOMPOSE_STEPS: usize = 32;
 
 /// Errors specific to the T2/T3 scaffolding. These bubble out of
@@ -210,6 +212,7 @@ pub async fn run_t2_case(
     case: &BenchCase,
     run_id: &str,
     base_worker_config: &WorkerConfig,
+    grader_worker_config: &WorkerConfig,
     opts: &RunOptions,
     artifact_dir: Option<&Path>,
     prompt_set: Option<&BenchPromptSet>,
@@ -291,6 +294,7 @@ pub async fn run_t2_case(
             tier: BenchTier::T2,
             status: BenchStatus::Error,
             score: 0.0,
+            quality_review: None,
             process_score: None,
             process_annotations: Vec::new(),
             resource_guidance: case.resource_guidance.clone(),
@@ -338,7 +342,26 @@ pub async fn run_t2_case(
     copy_case_test_overlay(case, &workdir)?;
     let tests = evaluate_tests_pass_output(&workdir, &command)?;
     let artifact_path = snapshot_workdir(seed_dir, &workdir, artifact_dir, &case.id)?;
-    let status = if updated.status == Some(OrbStatus::Done) && tests.passed {
+    let deterministic_passed = updated.status == Some(OrbStatus::Done) && tests.passed;
+    let quality_review = if deterministic_passed && case.grader.is_some() {
+        Some(
+            grade_t2_change(
+                case,
+                seed_dir,
+                &workdir,
+                &command,
+                &tests,
+                grader_worker_config,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let quality_passed = quality_review
+        .as_ref()
+        .is_none_or(|review| review.passed == Some(true));
+    let status = if deterministic_passed && quality_passed {
         BenchStatus::Pass
     } else {
         BenchStatus::Fail
@@ -356,6 +379,7 @@ pub async fn run_t2_case(
         } else {
             0.0
         },
+        quality_review,
         process_score: None,
         process_annotations: Vec::new(),
         resource_guidance: case.resource_guidance.clone(),
@@ -385,7 +409,9 @@ pub async fn run_t2_case(
             Some(&tests),
             artifact_path.as_deref(),
         ),
-        error: if updated.status == Some(OrbStatus::Done) && tests.passed {
+        error: if deterministic_passed && !quality_passed {
+            Some("deterministic checks passed but the AI quality rubric did not".into())
+        } else if deterministic_passed {
             None
         } else if !tests.passed {
             Some(format_tests_pass_error(&command, &tests))
@@ -393,6 +419,99 @@ pub async fn run_t2_case(
             updated.result
         },
     })
+}
+
+async fn grade_t2_change(
+    case: &BenchCase,
+    seed_dir: &Path,
+    workdir: &Path,
+    command: &str,
+    tests: &TestsPassOutput,
+    base_worker_config: &WorkerConfig,
+) -> BenchQualityReview {
+    let rubric_path = case.case_dir.join("rubric.md");
+    let rubric = match std::fs::read_to_string(&rubric_path) {
+        Ok(rubric) => rubric,
+        Err(error) => {
+            return BenchQualityReview {
+                passed: None,
+                model: base_worker_config.model.clone(),
+                output: None,
+                error: Some(format!("could not read {}: {error}", rubric_path.display())),
+            }
+        }
+    };
+    let diff = Command::new("diff")
+        .args([
+            "-ru",
+            &seed_dir.display().to_string(),
+            &workdir.display().to_string(),
+        ])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_else(|error| format!("(could not collect candidate diff: {error})"));
+    let evidence = format!(
+        "Task:\n{}\n\nDeterministic command: {}\nPassed: {}\nOutput:\n{}\n\nCandidate diff:\n{}",
+        case.prompt,
+        command,
+        tests.passed,
+        truncate_grader_evidence(&format!(
+            "stdout:\n{}\n\nstderr:\n{}",
+            tests.stdout, tests.stderr
+        )),
+        truncate_grader_evidence(&diff),
+    );
+    let user = format!(
+        "Evaluate the candidate change against this task-specific rubric. Return a short criterion-level review, then exactly one final line `OVERALL: PASS` or `OVERALL: FAIL`.\n\nRubric:\n{rubric}\n\nEvidence:\n{evidence}"
+    );
+    let mut config = base_worker_config.clone();
+    config.system_prompt = "You are a strict benchmark change reviewer. You have no repository tools; use only the supplied evidence. Do not propose unrelated work.".into();
+    config.tools.clear();
+    config.cwd = None;
+    config.max_iterations = Some(1);
+    let mut worker = match Worker::spawn(&config).await {
+        Ok(worker) => worker,
+        Err(error) => {
+            return BenchQualityReview {
+                passed: None,
+                model: config.model,
+                output: None,
+                error: Some(format!("grader spawn failed: {error}")),
+            }
+        }
+    };
+    let outcome = worker.send(&format!("grade-{}", case.id), &user).await;
+    let _ = worker.shutdown().await;
+    match outcome {
+        Ok(outcome) if outcome.status == ResultStatus::Ok => {
+            let output = outcome.response;
+            BenchQualityReview {
+                passed: output.as_deref().and_then(parse_rubric_verdict),
+                model: config.model,
+                output,
+                error: None,
+            }
+        }
+        Ok(outcome) => BenchQualityReview {
+            passed: None,
+            model: config.model,
+            output: outcome.response,
+            error: Some(format!("grader returned {:?}", outcome.status)),
+        },
+        Err(error) => BenchQualityReview {
+            passed: None,
+            model: config.model,
+            output: None,
+            error: Some(format!("grader send failed: {error}")),
+        },
+    }
+}
+
+fn truncate_grader_evidence(text: &str) -> String {
+    if text.len() <= MAX_GRADER_EVIDENCE_CHARS {
+        return text.into();
+    }
+    format!("{}\n… [truncated]", &text[..MAX_GRADER_EVIDENCE_CHARS])
 }
 
 #[allow(clippy::too_many_lines)]
@@ -812,6 +931,7 @@ impl T2DecomposeResultCtx<'_> {
             } else {
                 0.0
             },
+            quality_review: None,
             process_score: process.as_ref().map(|evaluation| evaluation.score),
             process_annotations: process.map_or_else(Vec::new, |evaluation| evaluation.annotations),
             resource_guidance: self.case.resource_guidance.clone(),
@@ -1309,6 +1429,7 @@ pub fn run_t3_case_stub(
         tier: BenchTier::T3,
         status: BenchStatus::Error,
         score: 0.0,
+        quality_review: None,
         process_score: None,
         process_annotations: Vec::new(),
         resource_guidance: case.resource_guidance.clone(),
@@ -1581,6 +1702,7 @@ done
             &case,
             "run-x",
             &wc,
+            &wc,
             &RunOptions::default(),
             Some(&artifact_dir),
             None,
@@ -1625,7 +1747,7 @@ done
         let script = write_editing_worker(dir.path());
         let wc = worker_config(&script);
         let case = t2_case_with_seed("t2-x", dir.path().join("nope"), "true");
-        let err = run_t2_case(&case, "run-x", &wc, &RunOptions::default(), None, None)
+        let err = run_t2_case(&case, "run-x", &wc, &wc, &RunOptions::default(), None, None)
             .await
             .unwrap_err();
         assert!(matches!(err, HarnessError::SeedRepoMissing(_)));
@@ -1642,7 +1764,7 @@ done
         wc.args = vec![];
 
         let case = t2_case_with_seed("t2-fail", fixture, "true");
-        let r = run_t2_case(&case, "run-x", &wc, &RunOptions::default(), None, None)
+        let r = run_t2_case(&case, "run-x", &wc, &wc, &RunOptions::default(), None, None)
             .await
             .unwrap();
         assert_eq!(r.status, BenchStatus::Error);

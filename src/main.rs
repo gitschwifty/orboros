@@ -987,6 +987,7 @@ fn cmd_bench(
                 skip_prereq_check,
             )?;
             let worker_config = make_worker_config(&binary, &resolved_model.model, "");
+            let grader_worker_config = make_worker_config(&binary, &resolved_grader, "");
             let prompt_set = prompt_set
                 .as_deref()
                 .map(|name| orboros::bench::prompts::BenchPromptSet::load(bench_root, name))
@@ -1024,6 +1025,7 @@ fn cmd_bench(
                 case_id: case.as_deref(),
                 tags: &tag,
                 worker_config: &worker_config,
+                grader_worker_config: &grader_worker_config,
                 no_budget,
                 jobs: jobs.or(cfg.bench.jobs).unwrap_or(1),
                 timeout_s: cfg.bench.timeout_s,

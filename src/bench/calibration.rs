@@ -214,6 +214,7 @@ mod tests {
             } else {
                 0.0
             },
+            quality_review: None,
             process_score: None,
             process_annotations: Vec::new(),
             resource_guidance: None,

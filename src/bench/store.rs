@@ -104,6 +104,11 @@ pub struct BenchResult {
     pub status: BenchStatus,
     /// Pass rate across N=3 (or however many) attempts, in `[0.0, 1.0]`.
     pub score: f32,
+    /// Independent AI review of a change after deterministic grading. This is
+    /// retained separately so reports can distinguish "tests passed" from
+    /// "the submitted change met the task's quality and scope rubric".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_review: Option<BenchQualityReview>,
     /// Independent score for an optional case process contract. `None` means
     /// the case does not assess process behavior and must not affect process
     /// averages.
@@ -182,6 +187,19 @@ pub struct BenchResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
     /// Free-form error message when `status == Error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Durable result from a task-specific benchmark quality rubric.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BenchQualityReview {
+    /// `Some(true)`/`Some(false)` is the grader's explicit OVERALL verdict.
+    /// `None` means the grader could not produce a parseable verdict.
+    pub passed: Option<bool>,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -850,6 +868,7 @@ mod tests {
             tier: BenchTier::T1,
             status: BenchStatus::Pass,
             score: 1.0,
+            quality_review: None,
             process_score: None,
             process_annotations: Vec::new(),
             resource_guidance: None,
