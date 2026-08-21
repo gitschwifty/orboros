@@ -448,17 +448,9 @@ async fn grade_t2_change(
             }
         }
     };
-    let diff = Command::new("diff")
-        .args([
-            "-ru",
-            &seed_dir.display().to_string(),
-            &workdir.display().to_string(),
-        ])
-        .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_else(|error| format!("(could not collect candidate diff: {error})"));
+    let diff = grader_candidate_diff(seed_dir, workdir);
     let evidence = format!(
-        "Task:\n{}\n\nDeterministic command: {}\nPassed: {}\nOutput:\n{}\n\nCandidate diff:\n{}",
+        "Task:\n{}\n\nDeterministic command: {}\nPassed: {}\nOutput:\n{}\n\nCandidate diff:\n{}\n\nScope note: The candidate diff deliberately excludes benchmark-harness and generated paths (`.orbs`, `target`, `.git`). Do not penalize files absent from this diff; judge scope only from the displayed candidate changes.",
         case.prompt,
         command,
         tests.passed,
@@ -534,6 +526,25 @@ async fn grade_t2_change(
         output: last_output,
         error: Some(errors.join("; ")),
     }
+}
+
+/// Returns the candidate-authored T2 diff used as AI-grader evidence. It must
+/// match the artifact diff's exclusions so runner state never counts as an
+/// unrelated worker change.
+fn grader_candidate_diff(seed_dir: &Path, workdir: &Path) -> String {
+    Command::new("diff")
+        .arg("-ruN")
+        .arg("-x")
+        .arg("target")
+        .arg("-x")
+        .arg(".orbs")
+        .arg("-x")
+        .arg(".git")
+        .arg(seed_dir)
+        .arg(workdir)
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_else(|error| format!("(could not collect candidate diff: {error})"))
 }
 
 fn truncate_grader_evidence(text: &str) -> String {
@@ -1714,6 +1725,33 @@ done
     fn rubric_parser_returns_none_when_absent_or_garbled() {
         assert_eq!(parse_rubric_verdict("no verdict line here"), None);
         assert_eq!(parse_rubric_verdict("OVERALL: maybe"), None);
+    }
+
+    #[test]
+    fn grader_diff_excludes_harness_and_generated_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = dir.path().join("seed");
+        let workdir = dir.path().join("workdir");
+        std::fs::create_dir_all(seed.join("config")).unwrap();
+        std::fs::create_dir_all(workdir.join("config")).unwrap();
+        std::fs::create_dir_all(workdir.join(".orbs")).unwrap();
+        std::fs::create_dir_all(workdir.join("target")).unwrap();
+        std::fs::write(seed.join("config/app.json"), r#"{"enabled":false}"#).unwrap();
+        std::fs::write(workdir.join("config/app.json"), r#"{"enabled":true}"#).unwrap();
+        std::fs::write(workdir.join(".orbs/orbs.jsonl"), "runner state").unwrap();
+        std::fs::write(workdir.join("target/build.log"), "generated").unwrap();
+
+        let diff = grader_candidate_diff(&seed, &workdir);
+
+        assert!(diff.contains("config/app.json"), "{diff}");
+        assert!(
+            !diff.contains(&workdir.join(".orbs").display().to_string()),
+            "{diff}"
+        );
+        assert!(
+            !diff.contains(&workdir.join("target").display().to_string()),
+            "{diff}"
+        );
     }
 
     // ── T2 runner ─────────────────────────────────────────────
