@@ -988,17 +988,11 @@ fn cmd_bench(
             )?;
             let worker_config = make_worker_config(&binary, &resolved_model.model, "");
             let grader_worker_config = make_worker_config(&binary, &resolved_grader, "");
-            // A benchmark model selection is a single-model baseline unless a
-            // future benchmark phase-assignment surface says otherwise. T2
-            // queue phases must not silently inherit the user's global phase
-            // model from the temporary fixture workspace.
-            let mut benchmark_model_config = cfg.clone();
-            for phase in ["speccing", "decomposing", "refining", "reevaluating"] {
-                benchmark_model_config
-                    .models
-                    .phases
-                    .insert(phase.into(), resolved_model.model.clone());
-            }
+            // A benchmark model selection is a single-model baseline. Pin
+            // every queue-dispatched role as well as the direct worker and
+            // grader, rather than allowing project role mappings to override
+            // `bench run --model` for execution children.
+            let benchmark_model_config = benchmark_model_config(&cfg, &resolved_model.model);
             let prompt_set = prompt_set
                 .as_deref()
                 .map(|name| orboros::bench::prompts::BenchPromptSet::load(bench_root, name))
@@ -1557,6 +1551,39 @@ fn cmd_init() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Produces the model configuration used inside an isolated benchmark run.
+///
+/// Benchmark selection is deliberately a single-model experiment: a CLI or
+/// benchmark-default selection must apply to direct workers, every queue
+/// phase, execution children, optional reviewers, and the grader. Normal
+/// project role mappings remain available outside the benchmark harness.
+fn benchmark_model_config(cfg: &config::OrbConfig, model: &str) -> config::OrbConfig {
+    let mut benchmark = cfg.clone();
+    let model = model.to_owned();
+
+    benchmark.default_model.clone_from(&model);
+    benchmark.models.default.worker = Some(model.clone());
+    benchmark.models.default.coordinator = Some(model.clone());
+    benchmark.models.default.phase = Some(model.clone());
+    benchmark.models.default.reviewer = Some(model.clone());
+    benchmark.models.default.bench = Some(model.clone());
+    benchmark.models.workers.clear();
+    benchmark.models.coordinators.clear();
+    benchmark.models.phases.clear();
+    benchmark.models.bench.default = Some(model.clone());
+    benchmark.models.bench.grader = Some(model.clone());
+    benchmark.second_opinion.reviewer_model = Some(model.clone());
+    // A benchmark measures the selected model, not a coordinator-selected
+    // per-child variation.
+    benchmark.models.coordinator_model_choice = false;
+
+    for phase in ["speccing", "decomposing", "refining", "reevaluating"] {
+        benchmark.models.phases.insert(phase.into(), model.clone());
+    }
+
+    benchmark
+}
+
 fn config_target(global: bool, project_dir: Option<&Path>) -> anyhow::Result<PathBuf> {
     if global {
         let home = dirs::home_dir()
@@ -1641,6 +1668,61 @@ fn cmd_config(action: ConfigAction, project_dir: Option<&Path>) -> anyhow::Resul
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn benchmark_model_config_pins_every_dispatch_role() {
+        let cfg: config::OrbConfig = toml::from_str(
+            r#"
+default_model = "fallback/model"
+
+[models]
+coordinator_model_choice = true
+
+[models.default]
+worker = "configured/worker"
+coordinator = "configured/coordinator"
+phase = "configured/phase"
+reviewer = "configured/reviewer"
+bench = "configured/bench"
+
+[models.workers]
+execute = "configured/execute"
+
+[models.coordinators]
+decompose = "configured/decompose"
+
+[models.phases]
+speccing = "configured/speccing"
+
+[models.bench]
+default = "configured/bench-default"
+grader = "configured/grader"
+
+[second_opinion]
+reviewer_model = "configured/second-opinion"
+"#,
+        )
+        .unwrap();
+
+        let benchmark = benchmark_model_config(&cfg, "stealth/ox-model");
+        let resolver = benchmark.model_resolver();
+
+        for role in [
+            config::ModelRole::Worker("execute"),
+            config::ModelRole::Coordinator("decompose"),
+            config::ModelRole::Phase("speccing"),
+            config::ModelRole::Reviewer,
+            config::ModelRole::BenchDefault,
+            config::ModelRole::BenchGrader,
+        ] {
+            assert_eq!(
+                resolver.resolve(role).unwrap().model,
+                "stealth/ox-model",
+                "{role:?} must be pinned for a benchmark run"
+            );
+        }
+        assert!(!benchmark.models.coordinator_model_choice);
+    }
 
     #[test]
     fn top_level_run_parses_as_orb_backed_command() {
