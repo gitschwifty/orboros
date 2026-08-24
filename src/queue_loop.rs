@@ -1145,7 +1145,7 @@ async fn dispatch_one_owned(
             prompt_context.clone(),
         ))?;
     }
-    execution_store.append(&crate::execution::ExecutionRecord::from_outcome(
+    let mut execution_record = crate::execution::ExecutionRecord::from_outcome(
         &orb,
         prompt_category,
         target.tool_policy_key(),
@@ -1157,7 +1157,14 @@ async fn dispatch_one_owned(
         wc.tools.clone(),
         &outcome,
         Some(prompt_context),
-    ))?;
+    );
+    if target == DispatchTarget::Decomposing {
+        execution_record.phase_retry = Some(crate::execution::PhaseRetryDiagnostic {
+            attempt: 1,
+            reason: "initial".into(),
+        });
+    }
+    execution_store.append(&execution_record)?;
 
     apply_dispatch_outcome_with_review(
         &mut orb,

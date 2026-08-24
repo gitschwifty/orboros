@@ -88,6 +88,10 @@ pub struct ExecutionRecord {
     /// original dispatch remains an unmodified account of what it returned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decomposition_repair: Option<DecompositionRepairDiagnostic>,
+    /// Phase-attempt provenance for a bounded clean retry. Kept separate from
+    /// worker-level terminal retries, which are attempts within one dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_retry: Option<PhaseRetryDiagnostic>,
     /// Evidence for a single fresh-worker retry after Heddle reported a
     /// structured terminal loop or iteration limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -121,6 +125,24 @@ pub struct DecompositionRepairDiagnostic {
     /// for a successfully repaired decomposition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repaired_confidence: Option<f32>,
+    /// Whether a clean decomposition retry followed this failed repair.
+    #[serde(default)]
+    pub fresh_retry_attempted: bool,
+    /// Whether that clean retry produced a valid plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_retry_succeeded: Option<bool>,
+    /// Why the clean retry could not be used, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_retry_parse_error: Option<String>,
+}
+
+/// Attribution for a complete phase retry rather than a repair sub-attempt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PhaseRetryDiagnostic {
+    /// The ordinal complete-phase attempt. The original dispatch is attempt 1.
+    pub attempt: u32,
+    /// Stable eligibility reason, for example `after_invalid_output`.
+    pub reason: String,
 }
 
 impl ExecutionRecord {
@@ -165,6 +187,7 @@ impl ExecutionRecord {
             retries: outcome.retries,
             prompt_context,
             decomposition_repair: None,
+            phase_retry: None,
             terminal_retry: outcome.terminal_retry.clone(),
             attempts: outcome.attempts.clone(),
         }

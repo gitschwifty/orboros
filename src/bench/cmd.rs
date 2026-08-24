@@ -1072,6 +1072,7 @@ pub fn cmd_bench_report(
         );
     }
     print_tool_policy_report(&records, &case_labels);
+    print_phase_retry_report(&records, &case_labels);
     print_prompt_context_report(store, run_id, case_id, &case_labels)?;
     Ok(())
 }
@@ -1580,6 +1581,34 @@ pub fn cmd_bench_compare(store: &BenchStore, run_a: &str, run_b: &str) -> anyhow
         );
     }
     Ok(())
+}
+
+fn print_phase_retry_report(
+    records: &[BenchDispatchRecord],
+    case_labels: &HashMap<String, (String, String)>,
+) {
+    let retries: Vec<_> = records
+        .iter()
+        .filter_map(|record| {
+            record
+                .execution
+                .phase_retry
+                .as_ref()
+                .filter(|retry| retry.attempt > 1)
+                .map(|retry| (record, retry))
+        })
+        .collect();
+    if retries.is_empty() {
+        return;
+    }
+    println!("\n-- complete phase retries --");
+    for (record, retry) in retries {
+        let (selector, name) = display_case_label(case_labels, &record.case_id);
+        println!(
+            "{selector} {name}: {} attempt={} reason={} status={}",
+            record.execution.dispatch_kind, retry.attempt, retry.reason, record.execution.status,
+        );
+    }
 }
 
 /// Lists every recorded run, newest first.

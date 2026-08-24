@@ -587,6 +587,7 @@ async fn run_t2_decompose_case(
     let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
     let dep_store = DepStore::new(state_dir.join("deps.jsonl"));
     let execution_store = crate::execution::ExecutionStore::new(state_dir.join("executions.jsonl"));
+    let prompt_store = crate::execution::PromptStore::new(state_dir.join("prompts.jsonl"));
 
     let root = Orb::new(case.name.clone(), case.prompt.clone()).with_type(OrbType::Feature);
     let root_id = root.id.clone();
@@ -635,6 +636,7 @@ async fn run_t2_decompose_case(
             &dep_store,
             &wc,
             &execution_store,
+            &prompt_store,
         )
         .await?;
         let cleared = clear_completed_phase_for_next_prompt(&root_id, &orb_store)?;
@@ -747,6 +749,7 @@ async fn materialize_decomposition_if_ready(
     dep_store: &DepStore,
     base_worker_config: &WorkerConfig,
     execution_store: &crate::execution::ExecutionStore,
+    prompt_store: &crate::execution::PromptStore,
 ) -> Result<bool, HarnessError> {
     let Some(mut root) = orb_store.load_by_id(root_id)? else {
         return Ok(false);
@@ -765,6 +768,7 @@ async fn materialize_decomposition_if_ready(
             dep_store,
             base_worker_config,
             execution_store,
+            prompt_store,
         )
         .await;
     };
@@ -799,6 +803,7 @@ async fn repair_decomposition(
     dep_store: &DepStore,
     base_worker_config: &WorkerConfig,
     execution_store: &crate::execution::ExecutionStore,
+    prompt_store: &crate::execution::PromptStore,
 ) -> Result<bool, HarnessError> {
     let initial_parse_error = "normal decomposition parser found no valid DecompositionPlan";
     let original_confidence = root.confidence;
@@ -840,6 +845,14 @@ async fn repair_decomposition(
         repair_parse_error: repair_parse_error.clone(),
         original_confidence,
         repaired_confidence: outcome.confidence,
+        // The initial decomposition is already known to be malformed. A
+        // repair that returns invalid JSON or cannot complete both leave the
+        // same safe option: one clean, read-only phase retry from attempt 1's
+        // original inputs. This is not a retry of a transport failure in the
+        // initial decomposition phase.
+        fresh_retry_attempted: repaired_plan.is_none(),
+        fresh_retry_succeeded: None,
+        fresh_retry_parse_error: None,
     };
     let mut record = crate::execution::ExecutionRecord::from_outcome(
         root,
@@ -850,10 +863,139 @@ async fn repair_decomposition(
         &outcome,
         None,
     );
-    record.decomposition_repair = Some(diagnostic);
+    record.decomposition_repair = Some(diagnostic.clone());
     execution_store.append(&record)?;
 
     if let Some(plan) = repaired_plan {
+        root.result = outcome.response;
+        root.confidence = outcome.confidence;
+        materialize_plan(root, &plan, orb_store, dep_store)?;
+    } else if diagnostic.fresh_retry_attempted {
+        return fresh_decomposition_retry(
+            root,
+            initial_parse_error,
+            repair_parse_error.unwrap_or_else(|| "unknown repair failure".into()),
+            diagnostic,
+            orb_store,
+            dep_store,
+            base_worker_config,
+            execution_store,
+            prompt_store,
+        )
+        .await;
+    } else {
+        root.set_phase(OrbPhase::Failed)
+            .map_err(|e| HarnessError::Io(std::io::Error::other(e)))?;
+        root.result = Some(format!(
+            "decompose phase initial parse failure: {initial_parse_error}; repair failed: {repair_parse_error}",
+            repair_parse_error = repair_parse_error.unwrap_or_else(|| "unknown repair failure".into())
+        ));
+        orb_store.update(root)?;
+    }
+    Ok(true)
+}
+
+async fn fresh_decomposition_retry(
+    root: &mut Orb,
+    initial_parse_error: &str,
+    repair_parse_error: String,
+    mut diagnostic: crate::execution::DecompositionRepairDiagnostic,
+    orb_store: &OrbStore,
+    dep_store: &DepStore,
+    base_worker_config: &WorkerConfig,
+    execution_store: &crate::execution::ExecutionStore,
+    prompt_store: &crate::execution::PromptStore,
+) -> Result<bool, HarnessError> {
+    const ATTEMPT: u32 = 2;
+    const REASON: &str = "after_invalid_output";
+    let original_prompt = prompt_store.read_all()?.into_iter().rev().find(|record| {
+        record.orb_id == root.id.to_string() && record.dispatch_kind == "phase.decomposing"
+    });
+    let Some(original_prompt) = original_prompt else {
+        root.set_phase(OrbPhase::Failed)
+            .map_err(|e| HarnessError::Io(std::io::Error::other(e)))?;
+        root.result = Some(format!(
+            "decompose phase initial parse failure: {initial_parse_error}; repair failed: {repair_parse_error}; fresh decomposition retry unavailable: original prompt was not retained"
+        ));
+        orb_store.update(root)?;
+        return Ok(true);
+    };
+
+    let mut retry_config = base_worker_config.clone();
+    retry_config.system_prompt = original_prompt.system_prompt.clone();
+    retry_config.tools = builtin_tools("read_only")
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    retry_config.task_id = Some(root.id.to_string());
+    retry_config.worker_id = Some(uuid::Uuid::new_v4().to_string());
+    tracing::info!(
+        orb = %root.id,
+        phase_attempt = ATTEMPT,
+        retry_reason = REASON,
+        "fresh decomposition retry started"
+    );
+    let outcome = crate::worker::dispatcher::dispatch_orb_once(
+        root,
+        &original_prompt.user_prompt,
+        &retry_config,
+        None,
+    )
+    .await
+    .map_err(|error| HarnessError::Io(std::io::Error::other(error)))?;
+    let outcome = crate::worker::dispatcher::with_prompt_metadata(
+        outcome,
+        "phase.decomposing",
+        &retry_config.system_prompt,
+        "retry_original_prompt",
+    );
+    let retry_plan = outcome
+        .response
+        .as_deref()
+        .and_then(decompose::parse_response);
+    let retry_parse_error = retry_plan.is_none().then(|| {
+        if outcome.status == crate::worker::dispatcher::DispatchStatus::Done {
+            "fresh decomposition response contained no valid DecompositionPlan".into()
+        } else {
+            outcome.error.clone().unwrap_or_else(|| {
+                "fresh decomposition worker did not complete successfully".into()
+            })
+        }
+    });
+    diagnostic.fresh_retry_succeeded = Some(retry_plan.is_some());
+    diagnostic.fresh_retry_parse_error = retry_parse_error.clone();
+    let mut record = crate::execution::ExecutionRecord::from_outcome(
+        root,
+        "phase.decomposing",
+        "decomposing",
+        Some("retry_after_invalid_output".into()),
+        retry_config.tools.clone(),
+        &outcome,
+        Some(original_prompt.prompt_context.clone()),
+    );
+    record.phase_retry = Some(crate::execution::PhaseRetryDiagnostic {
+        attempt: ATTEMPT,
+        reason: REASON.into(),
+    });
+    execution_store.append(&record)?;
+    prompt_store.append(&crate::execution::PromptRecord::new(
+        root,
+        "phase.decomposing",
+        outcome.dispatched_at,
+        retry_config.system_prompt.clone(),
+        original_prompt.user_prompt,
+        outcome.prompt_tokens,
+        original_prompt.prompt_context,
+    ))?;
+    tracing::info!(
+        orb = %root.id,
+        phase_attempt = ATTEMPT,
+        retry_reason = REASON,
+        succeeded = retry_plan.is_some(),
+        "fresh decomposition retry completed"
+    );
+
+    if let Some(plan) = retry_plan {
         root.result = outcome.response;
         root.confidence = outcome.confidence;
         materialize_plan(root, &plan, orb_store, dep_store)?;
@@ -861,8 +1003,8 @@ async fn repair_decomposition(
         root.set_phase(OrbPhase::Failed)
             .map_err(|e| HarnessError::Io(std::io::Error::other(e)))?;
         root.result = Some(format!(
-            "decompose phase initial parse failure: {initial_parse_error}; repair failed: {}",
-            repair_parse_error.unwrap_or_else(|| "unknown repair failure".into())
+            "decompose phase initial parse failure: {initial_parse_error}; repair failed: {repair_parse_error}; fresh decomposition retry failed: {}",
+            retry_parse_error.unwrap_or_else(|| "unknown fresh retry failure".into())
         ));
         orb_store.update(root)?;
     }
@@ -1618,7 +1760,7 @@ done
   id=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['id'])")
   case "$type" in
     init) test -z "$ORBOROS_REPAIR_INIT" || echo "$line" > "$ORBOROS_REPAIR_INIT"; echo "{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"repair-session\",\"protocol_version\":\"0.3.0\"}" ;;
-    send) test -z "$ORBOROS_REPAIR_SEND" || echo "$line" >> "$ORBOROS_REPAIR_SEND"; echo "{\"type\":\"result\",\"id\":\"$id\",\"status\":\"ok\",\"response\":$ORBOROS_REPAIR_RESPONSE,\"tool_calls_made\":[],\"iterations\":1,\"confidence\":0.73}" ;;
+    send) test -z "$ORBOROS_REPAIR_SEND" || echo "$line" >> "$ORBOROS_REPAIR_SEND"; if echo "$line" | python3 -c "import sys,json; print('repair' if 'Original response to repair' in json.loads(sys.stdin.read())['message'] else 'fresh')" | grep -q repair; then response="$ORBOROS_REPAIR_RESPONSE"; else response="${ORBOROS_FRESH_RESPONSE:-$ORBOROS_REPAIR_RESPONSE}"; fi; echo "{\"type\":\"result\",\"id\":\"$id\",\"status\":\"ok\",\"response\":$response,\"tool_calls_made\":[],\"iterations\":1,\"confidence\":0.73}" ;;
     shutdown) echo "{\"type\":\"shutdown_ok\",\"id\":\"$id\"}"; exit 0 ;;
   esac
 done
@@ -1931,12 +2073,14 @@ done
 
         let execution_store =
             crate::execution::ExecutionStore::new(dir.path().join("executions.jsonl"));
+        let prompt_store = crate::execution::PromptStore::new(dir.path().join("prompts.jsonl"));
         assert!(materialize_decomposition_if_ready(
             &root_id,
             &orb_store,
             &dep_store,
             &worker_config(Path::new("unused")),
             &execution_store,
+            &prompt_store,
         )
         .await
         .unwrap());
@@ -1976,6 +2120,7 @@ done
         let dep_store = DepStore::new(dir.path().join("deps.jsonl"));
         let execution_store =
             crate::execution::ExecutionStore::new(dir.path().join("executions.jsonl"));
+        let prompt_store = crate::execution::PromptStore::new(dir.path().join("prompts.jsonl"));
         let mut root = Orb::new("Feature", "Build it").with_type(OrbType::Feature);
         root.set_phase(OrbPhase::Speccing).unwrap();
         root.set_phase(OrbPhase::Decomposing).unwrap();
@@ -2009,6 +2154,7 @@ done
             &dep_store,
             &wc,
             &execution_store,
+            &prompt_store,
         )
         .await
         .unwrap());
@@ -2059,11 +2205,29 @@ done
         root.confidence = Some(0.31);
         let root_id = root.id.clone();
         orb_store.append(&root).unwrap();
+        let prompt_store = crate::execution::PromptStore::new(dir.path().join("prompts.jsonl"));
+        prompt_store
+            .append(&crate::execution::PromptRecord::new(
+                &root,
+                "phase.decomposing",
+                chrono::Utc::now(),
+                "normal decomposition system prompt".into(),
+                "original decomposition task".into(),
+                None,
+                crate::execution::PromptContextMetrics::default(),
+            ))
+            .unwrap();
         let mut wc = worker_config(&write_repair_worker(dir.path()));
-        wc.env = vec![(
-            "ORBOROS_REPAIR_RESPONSE".into(),
-            serde_json::to_string("still not JSON").unwrap(),
-        )];
+        wc.env = vec![
+            (
+                "ORBOROS_REPAIR_RESPONSE".into(),
+                serde_json::to_string("still not JSON").unwrap(),
+            ),
+            (
+                "ORBOROS_FRESH_RESPONSE".into(),
+                serde_json::to_string("still not JSON either").unwrap(),
+            ),
+        ];
 
         assert!(materialize_decomposition_if_ready(
             &root_id,
@@ -2071,6 +2235,7 @@ done
             &dep_store,
             &wc,
             &execution_store,
+            &prompt_store,
         )
         .await
         .unwrap());
@@ -2086,8 +2251,99 @@ done
         let diagnostic = records[0].decomposition_repair.as_ref().unwrap();
         assert!(!diagnostic.repair_succeeded);
         assert!(diagnostic.repair_parse_error.is_some());
+        assert!(diagnostic.fresh_retry_attempted);
         assert_eq!(diagnostic.original_confidence, Some(0.31));
         assert_eq!(diagnostic.repaired_confidence, Some(0.73));
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].dispatch_kind, "phase.decomposing");
+        let retry = records[1].phase_retry.as_ref().unwrap();
+        assert_eq!(retry.attempt, 2);
+        assert_eq!(retry.reason, "after_invalid_output");
+        assert!(records[1]
+            .attempts
+            .iter()
+            .all(|attempt| attempt.status == "done"));
+        assert!(!materialize_decomposition_if_ready(
+            &root_id,
+            &orb_store,
+            &dep_store,
+            &wc,
+            &execution_store,
+            &prompt_store,
+        )
+        .await
+        .unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_repair_retries_original_decomposition_prompt_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let orb_store = OrbStore::new(dir.path().join("orbs.jsonl"));
+        let dep_store = DepStore::new(dir.path().join("deps.jsonl"));
+        let execution_store =
+            crate::execution::ExecutionStore::new(dir.path().join("executions.jsonl"));
+        let prompt_store = crate::execution::PromptStore::new(dir.path().join("prompts.jsonl"));
+        let mut root = Orb::new("Feature", "Build it").with_type(OrbType::Feature);
+        root.set_phase(OrbPhase::Speccing).unwrap();
+        root.set_phase(OrbPhase::Decomposing).unwrap();
+        root.set_phase(OrbPhase::Refining).unwrap();
+        root.result = Some("broken response".into());
+        let root_id = root.id.clone();
+        orb_store.append(&root).unwrap();
+        prompt_store
+            .append(&crate::execution::PromptRecord::new(
+                &root,
+                "phase.decomposing",
+                chrono::Utc::now(),
+                "normal decomposition system prompt".into(),
+                "original decomposition task".into(),
+                None,
+                crate::execution::PromptContextMetrics::default(),
+            ))
+            .unwrap();
+        let send_log = dir.path().join("sends.jsonl");
+        let mut wc = worker_config(&write_repair_worker(dir.path()));
+        wc.env = vec![
+            (
+                "ORBOROS_REPAIR_RESPONSE".into(),
+                serde_json::to_string("still not JSON").unwrap(),
+            ),
+            (
+                "ORBOROS_FRESH_RESPONSE".into(),
+                serde_json::to_string(r#"{"subtasks":[{"title":"Fresh","description":"Use the original task","order":1}]}"#).unwrap(),
+            ),
+            ("ORBOROS_REPAIR_SEND".into(), send_log.to_string_lossy().into()),
+        ];
+
+        assert!(materialize_decomposition_if_ready(
+            &root_id,
+            &orb_store,
+            &dep_store,
+            &wc,
+            &execution_store,
+            &prompt_store,
+        )
+        .await
+        .unwrap());
+        let updated_root = orb_store.load_by_id(&root_id).unwrap().unwrap();
+        assert_eq!(updated_root.phase, Some(OrbPhase::Waiting));
+        assert_eq!(orb_store.load_children(&root_id).unwrap().len(), 1);
+        let sends = std::fs::read_to_string(send_log).unwrap();
+        assert_eq!(sends.lines().count(), 2);
+        let fresh_send: serde_json::Value =
+            serde_json::from_str(sends.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(fresh_send["message"], "original decomposition task");
+        let records = execution_store.read_all().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].phase_retry.as_ref().unwrap().attempt, 2);
+        assert_eq!(
+            records[1].phase_retry.as_ref().unwrap().reason,
+            "after_invalid_output"
+        );
+        assert_eq!(
+            records[1].allowed_tools.as_ref().unwrap(),
+            &vec!["read_file", "glob", "grep"]
+        );
     }
 
     #[tokio::test]
