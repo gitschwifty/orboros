@@ -449,7 +449,8 @@ fn map_worker_event(turn_id: &TurnId, event: &WorkerEvent) -> Vec<SessionEvent> 
             at: Utc::now(),
         }],
         // Operational / control-plane events — not part of the transcript.
-        WorkerEvent::Heartbeat { .. }
+        WorkerEvent::TurnState { .. }
+        | WorkerEvent::Heartbeat { .. }
         | WorkerEvent::PermissionRequest { .. }
         | WorkerEvent::PermissionDenied { .. }
         | WorkerEvent::PlanComplete { .. }

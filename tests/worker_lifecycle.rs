@@ -91,7 +91,10 @@ async fn test_live_heddle_usage_metadata() {
                 .is_some_and(|currency| !currency.trim().is_empty()),
             "cost currency should be non-empty"
         );
-        assert!(cost_micros > 0, "reported cost should be positive");
+        // Free routes and sub-micro-dollar requests legitimately report zero.
+        // Presence means the provider supplied a cost estimate; it does not
+        // imply that the estimate is non-zero.
+        let _ = cost_micros;
     } else if std::env::var_os("HEDDLE_EXPECT_COST").is_some() {
         panic!("expected usage.cost_micros because HEDDLE_EXPECT_COST is set");
     }

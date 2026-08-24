@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 // ── Protocol version ──
 
-pub const PROTOCOL_VERSION: &str = "0.4.0";
+pub const PROTOCOL_VERSION: &str = "0.5.0";
 
 // ── Requests (Orboros → Heddle) ──
 
@@ -66,6 +66,28 @@ pub enum RuntimeMode {
     Isolated,
 }
 
+/// Feature advertisement returned by Heddle during the 0.5 handshake.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IpcCapabilities {
+    pub enabled_tools: Vec<String>,
+    pub explicit_tool_allowlist: bool,
+    pub runtime_modes: Vec<RuntimeMode>,
+    pub transcript_placement: bool,
+    pub failure_details_version: String,
+    pub routing_request_metadata: bool,
+    pub effective_routing_metadata: bool,
+    pub cache_usage_metrics: bool,
+    pub cancellation: bool,
+    pub turn_state_events: bool,
+}
+
+/// Safe reproducibility identity returned for a worker session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProfileIdentity {
+    pub fingerprint: String,
+    pub model: String,
+}
+
 /// Optional runtime placement supplied during worker initialization.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimePlacementConfig {
@@ -103,6 +125,17 @@ pub struct RoutingMetadata {
     pub upstream_provider_history: Vec<String>,
 }
 
+/// Routing facts observed by Heddle, distinct from caller-requested routing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EffectiveRoutingMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routed_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstream_provider_history: Vec<String>,
+}
+
 /// Effective runtime placement reported by Heddle.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EffectiveRuntimeMetadata {
@@ -121,6 +154,51 @@ pub struct FailureDetails {
     pub tool_calls_made: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool: Option<ToolCallSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_threshold: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderFailureDetails>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<PermissionFailureDetails>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub malformed_tool_call: Option<ToolCallSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_source: Option<CancellationSource>,
+}
+
+/// Non-secret provider facts retained for transport-failure attribution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderFailureDetails {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PermissionFailureDetails {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationSource {
+    User,
 }
 
 /// Structured error envelope returned by heddle in protocol 0.2.0+.
@@ -149,6 +227,14 @@ pub enum IpcResponse {
         runtime: Option<EffectiveRuntimeMetadata>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         routing: Option<RoutingMetadata>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requested_routing: Option<RoutingMetadata>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effective_routing: Option<EffectiveRoutingMetadata>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        capabilities: Option<IpcCapabilities>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile: Option<ProfileIdentity>,
     },
     Event {
         event: WorkerEvent,
@@ -199,6 +285,10 @@ pub enum IpcResponse {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         routing: Option<RoutingMetadata>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        requested_routing: Option<RoutingMetadata>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effective_routing: Option<EffectiveRoutingMetadata>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         failure: Option<FailureDetails>,
     },
     StatusOk {
@@ -213,6 +303,10 @@ pub enum IpcResponse {
         runtime: Option<EffectiveRuntimeMetadata>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         routing: Option<RoutingMetadata>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requested_routing: Option<RoutingMetadata>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effective_routing: Option<EffectiveRoutingMetadata>,
     },
     ShutdownOk {
         id: String,
@@ -232,6 +326,9 @@ pub enum ResultStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum WorkerEvent {
+    TurnState {
+        state: TurnStateEvent,
+    },
     ContentDelta {
         text: String,
     },
@@ -301,10 +398,28 @@ pub enum WorkerEvent {
     ContextHandoff {},
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStateEvent {
+    Queued,
+    Running,
+    Cancelling,
+    Completed,
+}
+
 // ── Shared types ──
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolCallRecord {
+    pub name: String,
+    pub args: serde_json::Value,
+}
+
+/// Final-tool or malformed-call evidence carried by a 0.5 failure result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCallSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub name: String,
     pub args: serde_json::Value,
 }
@@ -418,6 +533,10 @@ mod tests {
             error: None,
             runtime: None,
             routing: None,
+            requested_routing: None,
+            effective_routing: None,
+            capabilities: None,
+            profile: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
@@ -456,6 +575,8 @@ mod tests {
             confidence: Some(0.85),
             runtime: None,
             routing: None,
+            requested_routing: None,
+            effective_routing: None,
             failure: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -487,11 +608,65 @@ mod tests {
             confidence: None,
             runtime: None,
             routing: None,
+            requested_routing: None,
+            effective_routing: None,
             failure: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let parsed: IpcResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(resp, parsed);
+    }
+
+    #[test]
+    fn parses_v050_provider_failure_details() {
+        let response: IpcResponse = serde_json::from_str(
+            r#"{"type":"result","id":"2","status":"error","tool_calls_made":[],"iterations":3,"failure":{"code":"provider_error","termination_reason":"stream decode failed","iterations":3,"tool_calls_made":2,"last_tool":{"id":"call-1","name":"read_file","args":{"path":"src/lib.rs"}},"provider":{"name":"openrouter","status":502,"status_category":"server_error","retry_after_ms":250,"error_type":"upstream","provider_code":"bad_gateway"}}}"#,
+        )
+        .unwrap();
+        let IpcResponse::Result {
+            failure: Some(failure),
+            ..
+        } = response
+        else {
+            panic!("expected result failure");
+        };
+        assert_eq!(failure.provider.as_ref().and_then(|p| p.status), Some(502));
+        assert_eq!(
+            failure.provider.as_ref().and_then(|p| p.retry_after_ms),
+            Some(250)
+        );
+        assert_eq!(
+            failure.last_tool.as_ref().map(|tool| tool.name.as_str()),
+            Some("read_file")
+        );
+    }
+
+    #[test]
+    fn parses_v050_init_capabilities_and_turn_state() {
+        let init: IpcResponse = serde_json::from_str(
+            r#"{"type":"init_ok","id":"1","session_id":"s","protocol_version":"0.5.0","capabilities":{"enabled_tools":["read_file"],"explicit_tool_allowlist":true,"runtime_modes":["default","isolated"],"transcript_placement":true,"failure_details_version":"v2","routing_request_metadata":true,"effective_routing_metadata":true,"cache_usage_metrics":true,"cancellation":true,"turn_state_events":true},"profile":{"fingerprint":"abc","model":"test/model"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            init,
+            IpcResponse::InitOk {
+                capabilities: Some(_),
+                ..
+            }
+        ));
+        let event: IpcResponse = serde_json::from_str(
+            r#"{"type":"event","event":{"event":"turn_state","state":"running"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            event,
+            IpcResponse::Event {
+                event: WorkerEvent::TurnState {
+                    state: TurnStateEvent::Running
+                },
+                ..
+            }
+        ));
     }
 
     #[test]
