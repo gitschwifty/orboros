@@ -625,7 +625,6 @@ async fn cmd_bench_run_parallel(
         "benchmark run completed"
     );
     print_completed_run(&run, &all_results, &case_labels, &resource_guidance);
-    print_parallel_timing(&run, &all_results, req.jobs);
     println!("\nRun id: {run_id}");
     Ok(())
 }
@@ -1810,34 +1809,6 @@ fn print_completed_run(
     print_run_completion(run, results, resource_guidance);
 }
 
-/// Shows the aggregate case work separately from elapsed wall-clock time.
-/// This only appears for opt-in parallel runs: serial output remains unchanged.
-fn print_parallel_timing(run: &BenchRun, results: &[BenchResult], jobs: usize) {
-    let case_work_ms = results.iter().fold(0_u64, |total, result| {
-        total.saturating_add(result.latency_ms)
-    });
-    let wall_ms = u64::try_from((run.finished_at - run.started_at).num_milliseconds()).unwrap_or(0);
-    let speedup = effective_speedup(case_work_ms, wall_ms);
-    println!("\n== parallel timing ==");
-    println!(
-        "aggregate case work: {} (sum of per-case elapsed time)",
-        format_elapsed_ms(case_work_ms)
-    );
-    println!("wall-clock elapsed:   {}", format_elapsed_ms(wall_ms));
-    match speedup {
-        Some(speedup) => println!("effective speedup:    {speedup:.2}x ({jobs} case jobs)"),
-        None => println!("effective speedup:    unavailable (zero wall-clock elapsed)"),
-    }
-}
-
-fn effective_speedup(case_work_ms: u64, wall_ms: u64) -> Option<f64> {
-    (wall_ms != 0).then(|| {
-        let case_work_ms = u32::try_from(case_work_ms).unwrap_or(u32::MAX);
-        let wall_ms = u32::try_from(wall_ms).unwrap_or(u32::MAX);
-        f64::from(case_work_ms) / f64::from(wall_ms)
-    })
-}
-
 fn print_result_table(
     results: &[crate::bench::store::BenchResult],
     case_labels: Option<&HashMap<String, (String, String)>>,
@@ -1856,13 +1827,12 @@ fn print_result_table(
         .unwrap_or(4)
         .max(20);
     println!(
-        "{selector:<selector_width$}  {name:<name_width$}  {status:<8}  {score:>5}  {process:>7}  {elapsed:>9}  {cost:>10}  {turns:>5}  {tools:>5}  {input:>8}  {output:>8}  {cache_r:>8}  {cache_w:>8}  {conf:>5}  {target:>11}",
+        "{selector:<selector_width$}  {name:<name_width$}  {status:<8}  {score:>5}  {process:>7}  {cost:>10}  {turns:>5}  {tools:>5}  {input:>8}  {output:>8}  {cache_r:>8}  {cache_w:>8}  {conf:>5}  {target:>11}",
         selector = "case",
         name = "name",
         status = "status",
         score = "score",
         process = "process",
-        elapsed = "elapsed",
         cost = "cost",
         turns = "turns",
         tools = "tools",
@@ -1880,7 +1850,6 @@ fn print_result_table(
             .and_then(|labels| labels.get(&r.case_id))
             .map_or_else(|| (r.tier.to_string(), "-".to_string()), Clone::clone);
         let status = format!("{:?}", r.status);
-        let latency = format_elapsed_ms(r.latency_ms);
         let cost = format_cost(r.cost_micros, r.cost_cents);
         let turns = r
             .assistant_turns
@@ -1910,13 +1879,12 @@ fn print_result_table(
             .and_then(|guidance| resource_target_status(r, guidance))
             .map_or("-", ResourceTargetStatus::label);
         println!(
-            "{selector:<selector_width$}  {name:<name_width$}  {status:<8}  {score:>5.2}  {process:>7}  {elapsed:>9}  {cost:>10}  {turns:>5}  {tools:>5}  {input:>8}  {output:>8}  {cache_read:>8}  {cache_write:>8}  {conf:>5}  {target:>11}",
+            "{selector:<selector_width$}  {name:<name_width$}  {status:<8}  {score:>5.2}  {process:>7}  {cost:>10}  {turns:>5}  {tools:>5}  {input:>8}  {output:>8}  {cache_read:>8}  {cache_write:>8}  {conf:>5}  {target:>11}",
             selector = selector,
             name = name,
             status = status,
             score = r.score,
             process = process,
-            elapsed = latency,
             cost = cost,
             turns = turns,
             tools = tools,
@@ -2044,9 +2012,6 @@ fn print_run_completion(
         display_count(run.assistant_turns),
         display_count(run.tool_calls)
     );
-    let elapsed_ms = u64::try_from((run.finished_at - run.started_at).num_milliseconds().max(0))
-        .unwrap_or(u64::MAX);
-    println!("wall time: {}", format_elapsed_ms(elapsed_ms));
 }
 
 fn display_count(value: Option<u64>) -> String {
@@ -2200,7 +2165,6 @@ fn resource_target_status(
             guidance.cache_read_tokens.as_ref(),
             result.cache_read_tokens,
         ),
-        (guidance.elapsed_ms.as_ref(), Some(result.latency_ms)),
         (
             guidance.assistant_turns.as_ref(),
             result.assistant_turns.map(u64::from),
@@ -2225,7 +2189,23 @@ fn resource_target_status(
             over = true;
         }
     }
-    measured.then_some(if over {
+    if !measured {
+        return None;
+    }
+
+    // Time includes provider queueing, streaming, and host contention. Keep it
+    // in the report, but only let it escalate a case that already exceeded a
+    // non-time resource target.
+    if over
+        && guidance
+            .elapsed_ms
+            .as_ref()
+            .is_some_and(|threshold| result.latency_ms > threshold.investigate)
+    {
+        return Some(ResourceTargetStatus::Investigate);
+    }
+
+    Some(if over {
         ResourceTargetStatus::Over
     } else {
         ResourceTargetStatus::Under
@@ -2918,9 +2898,34 @@ text = "x"
     }
 
     #[test]
-    fn effective_speedup_uses_case_work_over_wall_clock() {
-        assert_eq!(effective_speedup(500, 0), None);
-        assert_eq!(effective_speedup(600, 200), Some(3.0));
+    fn elapsed_time_only_escalates_an_already_over_resource_target() {
+        let guidance = BenchResourceGuidance {
+            cost_micros: None,
+            input_tokens: Some(BenchResourceThreshold {
+                target: 10,
+                investigate: 20,
+            }),
+            cache_read_tokens: None,
+            elapsed_ms: Some(BenchResourceThreshold {
+                target: 100,
+                investigate: 200,
+            }),
+            assistant_turns: None,
+            tool_calls: None,
+        };
+        let mut result = sample_result("case", "run", BenchStatus::Pass);
+        result.prompt_tokens = Some(10);
+        result.latency_ms = 201;
+        assert_eq!(
+            resource_target_status(&result, &guidance),
+            Some(ResourceTargetStatus::Under)
+        );
+
+        result.prompt_tokens = Some(11);
+        assert_eq!(
+            resource_target_status(&result, &guidance),
+            Some(ResourceTargetStatus::Investigate)
+        );
     }
 
     #[test]
