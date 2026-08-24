@@ -10,12 +10,27 @@ precedence:
 
 1. Built-in compatible defaults.
 2. `~/.orboros/config.toml` — user-wide defaults.
-3. `<project>/.orbs/config.toml` — project policy.
-4. `<bench-root>/config.toml`, or the file supplied through `--bench-config` — benchmark-only overlay.
-5. Explicit CLI options. `--worker-binary` wins over `HEDDLE_BINARY`; either wins over TOML.
+3. `<workspace>/.orboros/config.toml` through
+   `<project>/.orboros/config.toml` — ancestor-to-child workspace policy.
+4. The matching `config.local.toml` files — ignored local worktree overrides.
+5. `~/.orboros/projects/<project>/config.toml` — user-local project overrides.
+6. `<bench-root>/config.toml`, or the file supplied through `--bench-config` — benchmark-only overlay.
+7. `--config <path>` — one explicit final TOML overlay.
+8. Explicit CLI options. `--worker-binary` wins over `HEDDLE_BINARY`; either wins over TOML.
 
 Only supplied CLI options override config. In particular, `--model` and
 `bench run --jobs` have no implicit CLI default.
+
+`~/.orboros/projects.toml` registers projects. Each entry has a `root_dir`,
+the inclusive boundary for workspace-config discovery, and may have a `path`,
+the default runnable worktree. If `path` is omitted, `root_dir` is used for
+both. This supports a container directory with multiple worktrees without
+walking config discovery into unrelated ancestors. Project policy is committed
+only when the repository chooses to commit `.orboros/config.toml`;
+`.orboros/config.local.toml` is created as an ignored convention for a
+machine- or worktree-specific override. Existing `.orbs/config.toml` files are
+read as a legacy compatibility layer, but new configuration belongs in
+`.orboros/`; `.orbs/` is runtime state only.
 
 Create starter files with:
 
@@ -209,10 +224,18 @@ packaged template defines `read_only`, `research`, `test`, `edit`, and
 - `[second_opinion]`: `mode` (`off`, `always`, `confidence`, or `sampling`),
   `confidence_threshold`, `sampling_rate`, and optional `reviewer_model`.
 - `[notification]`: `enabled` and `desktop_enabled`.
+- `[logging]`: optional `level` tracing filter (for example
+  `orboros=debug,tokio=warn`) and `file` for foreground command logs. The
+  global `--log-level` and `--log-file` flags override these settings.
 - `[daemon]`: optional `pid_file`, `log_file`, `log_max_size`, and
   `tick_interval_ms` process settings. Project `max_concurrency` controls that
   project's dispatch cap; explicit daemon CLI flags override these settings.
+  Without a configured file, a multi-project supervisor appends to
+  `~/.orboros/supervisor.log`; a daemon targeted to one project appends
+  to `~/.orboros/projects/<project>/daemon.log`. Foreground project
+  commands default to the sibling `cli.log` path.
 
 Hooks intentionally use a separate schema and files: `~/.orboros/hooks.toml`
-followed by `<state-dir>/hooks.toml`. They are ordered global first, then
+followed by `<project>/.orboros/hooks.toml` (with `<state-dir>/hooks.toml` as
+legacy fallback). They are ordered global first, then
 project; they are not fields in `config.toml`.

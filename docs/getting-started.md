@@ -23,7 +23,7 @@ cargo run -- init
 ```
 
 This creates:
-- `.orbs/config.toml` — project config with defaults
+- `.orboros/config.toml` — project config with defaults
 - `.orbs/orbs.jsonl` — empty orb store
 - Registers the project in `~/.orboros/projects.toml`
 
@@ -49,7 +49,7 @@ orboros config init
 orboros config init --minimal
 ```
 
-Edit `.orbs/config.toml` in your project:
+Edit `.orboros/config.toml` in your project:
 
 ```toml
 default_model = "anthropic/claude-sonnet-4-20250514"
@@ -180,7 +180,7 @@ The daemon loop:
 
 ## Model Routing
 
-Configure model roles and tool profiles in `.orbs/config.toml`.
+Configure model roles and tool profiles in `.orboros/config.toml`.
 
 ```toml
 [models.workers]
@@ -204,8 +204,9 @@ allowed_tools = ["read_file", "write_file", "edit_file", "glob", "grep", "bash"]
 
 ```
 your-project/
+  .orboros/
+    config.toml     # Project/workspace policy
   .orbs/
-    config.toml     # Project config
     orbs.jsonl      # Orb store
     deps.jsonl      # Dependency edges
     events.jsonl    # Audit log

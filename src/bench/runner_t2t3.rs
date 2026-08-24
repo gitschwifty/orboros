@@ -1491,6 +1491,13 @@ pub async fn run_t3_case(
     .await?;
     result.tier = BenchTier::T3;
 
+    // A dispatch, harness, or stalled-pipeline error is not a quality verdict.
+    // Retain it as `Error` and its original diagnostic rather than asking the
+    // AI grader to turn missing artifacts into a misleading rubric failure.
+    if result.status == BenchStatus::Error {
+        return Ok(result);
+    }
+
     let artifact_workdir = artifact_dir.map(|dir| dir.join("workdir")).ok_or_else(|| {
         HarnessError::Io(std::io::Error::other("T3 requires an artifact directory"))
     })?;

@@ -50,6 +50,18 @@ struct Cli {
     #[arg(long, global = true)]
     skip_prereq_check: bool,
 
+    /// Append structured operational logs to this file.
+    #[arg(long, global = true)]
+    log_file: Option<String>,
+
+    /// Tracing filter directive, e.g. `orboros=debug,tokio=warn`.
+    #[arg(long, global = true)]
+    log_level: Option<String>,
+
+    /// Overlay one explicit TOML configuration file after all discovered layers.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -116,9 +128,6 @@ enum Commands {
         /// PID file path (default: ~/.orboros/orboros.pid).
         #[arg(long)]
         pid_file: Option<String>,
-        /// Log file path.
-        #[arg(long)]
-        log_file: Option<String>,
         /// Tick interval in milliseconds (default: 1000).
         #[arg(long)]
         tick_interval: Option<u64>,
@@ -176,7 +185,7 @@ enum Commands {
 enum ConfigAction {
     /// Write an annotated starter config (project by default).
     Init {
-        /// Target ~/.orboros/config.toml instead of .orbs/config.toml.
+        /// Target ~/.orboros/config.toml instead of .orboros/config.toml.
         #[arg(long)]
         global: bool,
         /// Replace an existing config file.
@@ -548,6 +557,54 @@ fn resolve_effective_state_dir(raw: &str) -> EffectiveStateDir {
     }
 }
 
+fn safe_log_component(value: &str) -> String {
+    let component = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    (!component.is_empty())
+        .then_some(component)
+        .unwrap_or_else(|| "project".into())
+}
+
+fn project_log_file(
+    project_dir: Option<&Path>,
+    file_name: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    let Some(project_dir) = project_dir else {
+        return Ok(None);
+    };
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+    let registered_name = config::list_projects(&home)?
+        .into_iter()
+        .find(|entry| entry.runnable_path() == Some(project_dir))
+        .map(|entry| entry.name);
+    let fallback_name = project_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("project");
+    let name = registered_name.as_deref().unwrap_or(fallback_name);
+    Ok(Some(
+        home.join(".orboros")
+            .join("projects")
+            .join(safe_log_component(name))
+            .join(file_name),
+    ))
+}
+
+fn supervisor_log_file() -> anyhow::Result<PathBuf> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+    Ok(home.join(".orboros").join("supervisor.log"))
+}
+
 fn require_binary(worker_binary: Option<&str>) -> anyhow::Result<&str> {
     worker_binary.ok_or_else(|| {
         anyhow::anyhow!("No worker binary configured. Set --worker-binary or HEDDLE_BINARY.")
@@ -634,11 +691,68 @@ fn main() -> anyhow::Result<()> {
     // Load .env from current dir or ancestors (silently ignore if missing)
     let _ = dotenvy::dotenv();
 
+    let cli = Cli::parse();
+    if let Some(config_path) = &cli.config {
+        std::env::set_var("ORBOROS_CONFIG_PATH", config_path);
+    }
+    let effective_state = resolve_effective_state_dir(&cli.state_dir);
+    let state_dir = effective_state.state_dir;
+
+    let (project_logging, global_logging) =
+        config::load_logging_config_sources(effective_state.project_dir.as_deref())?;
+    let configured_daemon_log_file = matches!(&cli.command, Commands::Daemon { .. })
+        .then(|| config::load_config(effective_state.project_dir.as_deref()))
+        .transpose()?
+        .and_then(|configured| {
+            configured
+                .daemon
+                .log_file
+                .map(|path| resolve_state_dir(&path))
+        });
+    let default_log_file = match &cli.command {
+        Commands::Daemon { project, .. } => {
+            if let Some(project_name) = project {
+                let home = dirs::home_dir()
+                    .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+                Some(
+                    home.join(".orboros")
+                        .join("projects")
+                        .join(safe_log_component(project_name))
+                        .join("daemon.log"),
+                )
+            } else if cli.state_dir == DEFAULT_STATE_DIR {
+                Some(supervisor_log_file()?)
+            } else {
+                project_log_file(effective_state.project_dir.as_deref(), "daemon.log")?
+            }
+        }
+        _ => project_log_file(effective_state.project_dir.as_deref(), "cli.log")?,
+    };
+    let general_log_file = cli.log_file.as_deref().map(resolve_state_dir).or_else(|| {
+        configured_daemon_log_file
+            .or_else(|| project_logging.file.as_deref().map(resolve_state_dir))
+            .or_else(|| global_logging.file.as_deref().map(resolve_state_dir))
+            .or(default_log_file)
+    });
+    if let Some(path) = general_log_file.as_deref() {
+        orboros::bench::log::start_general(path)?;
+    }
+
     use tracing_subscriber::prelude::*;
 
-    let terminal_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("orboros=info,heddle=warn"));
+    let configured_filter = cli
+        .log_level
+        .as_deref()
+        .or(project_logging.level.as_deref())
+        .or(global_logging.level.as_deref());
+    let terminal_filter = match configured_filter {
+        Some(filter) => tracing_subscriber::EnvFilter::try_new(filter)
+            .map_err(|error| anyhow::anyhow!("invalid logging level `{filter}`: {error}"))?,
+        None => tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("orboros=info,heddle=warn")),
+    };
     let bench_filter = tracing_subscriber::EnvFilter::new("orboros=info,heddle=warn");
+    let file_filter = terminal_filter.clone();
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
@@ -652,11 +766,14 @@ fn main() -> anyhow::Result<()> {
                 .with_target(false)
                 .with_filter(bench_filter),
         )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(orboros::bench::log::GeneralLogWriter)
+                .with_ansi(false)
+                .with_target(false)
+                .with_filter(file_filter),
+        )
         .init();
-
-    let cli = Cli::parse();
-    let effective_state = resolve_effective_state_dir(&cli.state_dir);
-    let state_dir = effective_state.state_dir;
     std::fs::create_dir_all(&state_dir)?;
 
     match cli.command {
@@ -705,7 +822,6 @@ fn main() -> anyhow::Result<()> {
             stop,
             status,
             pid_file,
-            log_file,
             tick_interval,
             project,
         } => {
@@ -715,8 +831,10 @@ fn main() -> anyhow::Result<()> {
             if let Some(pf) = pid_file {
                 daemon_config.pid_file = resolve_state_dir(&pf);
             }
-            if let Some(lf) = log_file {
-                daemon_config.log_file = Some(resolve_state_dir(&lf));
+            if let Some(lf) = &cli.log_file {
+                daemon_config.log_file = Some(resolve_state_dir(lf));
+            } else if daemon_config.log_file.is_none() {
+                daemon_config.log_file.clone_from(&general_log_file);
             }
             if let Some(ti) = tick_interval {
                 daemon_config.tick_interval_ms = ti;
@@ -964,11 +1082,11 @@ fn cmd_bench(
                 resolver.resolve(ModelRole::BenchDefault)?
             };
             let resolved_grader = if model.is_some() {
-                resolved_model.model.clone()
+                resolved_model.clone()
             } else {
                 resolver
                     .resolve(ModelRole::BenchGrader)
-                    .map_or_else(|_| resolved_model.model.clone(), |m| m.model)
+                    .unwrap_or_else(|_| resolved_model.clone())
             };
             let binary_owned;
             let binary = if let Some(binary) = worker_binary {
@@ -987,7 +1105,7 @@ fn cmd_bench(
                 skip_prereq_check,
             )?;
             let worker_config = make_worker_config(&binary, &resolved_model.model, "");
-            let grader_worker_config = make_worker_config(&binary, &resolved_grader, "");
+            let grader_worker_config = make_worker_config(&binary, &resolved_grader.model, "");
             // A benchmark model selection is a single-model baseline. Pin
             // every queue-dispatched role as well as the direct worker and
             // grader, rather than allowing project role mappings to override
@@ -1005,7 +1123,9 @@ fn cmd_bench(
                     .or_else(|| Some(resolved_model.model.clone())),
                 model_key: resolved_model.key.clone(),
                 worker_model: Some(resolved_model.model.clone()),
-                grader_model: Some(resolved_grader),
+                worker_model_source: Some(resolved_model.source.clone()),
+                grader_model: Some(resolved_grader.model.clone()),
+                grader_model_source: Some(resolved_grader.source.clone()),
                 prompt_variant: prompt_set.as_ref().map(|set| set.name.clone()),
                 prompt_manifest: prompt_set
                     .as_ref()
@@ -1428,11 +1548,14 @@ fn cmd_supervisor_start(
     use orboros::daemon::SupervisedProject;
     let (registered, skipped) = config::registered_project_state_dirs(home)?;
     for project in skipped {
-        tracing::warn!(project = %project.name, path = %project.path.display(), "skipping missing or uninitialized registered project");
+        let path = project
+            .runnable_path()
+            .map_or_else(|| Path::new("<unset>"), |path| path);
+        tracing::warn!(project = %project.name, path = %path.display(), "skipping missing or uninitialized registered project");
         println!(
             "  warning: skipping {} (missing {})",
             project.name,
-            project.path.join(".orbs").display()
+            path.join(".orbs").display()
         );
     }
     let registered: Vec<_> = registered
@@ -1455,8 +1578,11 @@ fn cmd_supervisor_start(
         let orb_store = OrbStore::new(project_state_dir.join("orbs.jsonl"));
         let dep_store = DepStore::new(project_state_dir.join("deps.jsonl"));
         let mut queue = QueueLoop::new(orb_store, dep_store, project_state_dir.clone());
+        let project_cwd = entry
+            .runnable_path()
+            .unwrap_or_else(|| project_state_dir.parent().unwrap_or(&project_state_dir));
         if let Some(sink) =
-            orboros::hooks::HookSink::from_state_dir(&project_state_dir, &entry.path)?
+            orboros::hooks::HookSink::from_state_dir(&project_state_dir, project_cwd)?
         {
             queue = queue.with_hooks(sink);
         }
@@ -1539,7 +1665,7 @@ fn cmd_init() -> anyhow::Result<()> {
     config::init_project(&home, &project_dir)?;
 
     println!("Initialized orboros project in {}", project_dir.display());
-    println!("  Created .orbs/config.toml");
+    println!("  Created .orboros/config.toml");
     println!("  Created .orbs/orbs.jsonl");
     println!(
         "  Registered project \"{}\" in ~/.orboros/projects.toml",
@@ -1594,7 +1720,7 @@ fn config_target(global: bool, project_dir: Option<&Path>) -> anyhow::Result<Pat
         .map(Path::to_path_buf)
         .or_else(|| std::env::current_dir().ok())
         .ok_or_else(|| anyhow::anyhow!("could not determine project directory"))?;
-    Ok(project.join(".orbs/config.toml"))
+    Ok(project.join(".orboros/config.toml"))
 }
 
 fn cmd_config(action: ConfigAction, project_dir: Option<&Path>) -> anyhow::Result<()> {
@@ -1648,9 +1774,18 @@ fn cmd_config(action: ConfigAction, project_dir: Option<&Path>) -> anyhow::Resul
         }
         ConfigAction::Show => {
             let cfg = config::load_config(project_dir)?;
+            let sources = config::config_source_paths(project_dir)?;
             let resolver = cfg.model_resolver();
             let worker = resolver.resolve(config::ModelRole::Worker("execute"))?;
             let chat = resolver.resolve(config::ModelRole::Chat)?;
+            println!("config sources:");
+            if sources.is_empty() {
+                println!("  <built-in defaults>");
+            } else {
+                for source in sources {
+                    println!("  {}", source.display());
+                }
+            }
             println!("config_version: {}", cfg.config_version);
             println!(
                 "worker_binary: {}",

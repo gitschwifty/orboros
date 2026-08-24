@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, instrument, warn};
 
 use crate::ipc::error::IpcError;
 use crate::ipc::transport::{read_response, write_request};
@@ -173,19 +173,9 @@ impl Worker {
     ///
     /// Returns `IpcError` if spawning fails, the init handshake fails,
     /// or there's a protocol version mismatch.
-    #[instrument(
-        name = "worker.spawn",
-        skip(config),
-        fields(
-            command = %config.command,
-            model = %config.model,
-            worker_id = tracing::field::Empty,
-            session_id = tracing::field::Empty,
-        )
-    )]
+    #[instrument(name = "worker.spawn", level = "debug", skip(config))]
     pub async fn spawn(config: &WorkerConfig) -> Result<Self, IpcError> {
         let worker_id = crate::tracing_ctx::WorkerId::new();
-        tracing::Span::current().record("worker_id", tracing::field::display(&worker_id));
         debug!("spawning worker subprocess");
 
         let mut cmd = Command::new(&config.command);
@@ -230,14 +220,7 @@ impl Worker {
         } else {
             worker.init(config).await?;
         }
-        tracing::Span::current().record("session_id", tracing::field::display(&worker.session_id));
-        info!(
-            session_id = %worker.session_id,
-            task_id = %optional_field(config.task_id.as_deref()),
-            worker_id = %optional_field(config.worker_id.as_deref()),
-            model = %config.model,
-            "worker ready",
-        );
+        debug!("worker ready");
         Ok(worker)
     }
 
@@ -338,6 +321,7 @@ impl Worker {
     /// or the worker closes stdout unexpectedly.
     #[instrument(
         name = "worker.send",
+        level = "debug",
         skip(self, message),
         fields(worker_id = %self.worker_id, session_id = %self.session_id, send_id = %id)
     )]
@@ -368,6 +352,7 @@ impl Worker {
     /// fails, the worker closes stdout unexpectedly, or `send_timeout` elapses.
     #[instrument(
         name = "worker.send_streaming",
+        level = "debug",
         skip(self, message, event_tx),
         fields(worker_id = %self.worker_id, session_id = %self.session_id, send_id = %id)
     )]
@@ -474,6 +459,7 @@ impl Worker {
     /// Returns `IpcError` if the shutdown handshake fails.
     #[instrument(
         name = "worker.shutdown",
+        level = "debug",
         skip(self),
         fields(worker_id = %self.worker_id, session_id = %self.session_id)
     )]
@@ -620,10 +606,6 @@ impl Worker {
             }
         }
     }
-}
-
-fn optional_field(value: Option<&str>) -> &str {
-    value.unwrap_or("none")
 }
 
 fn protocol_versions_compatible(expected: &str, actual: &str) -> bool {

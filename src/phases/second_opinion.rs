@@ -160,7 +160,7 @@ fn extract_first_object_with_verdict(text: &str) -> Option<String> {
 ///
 /// Returns a `ReviewerError` if the worker fails, the response is
 /// empty, or the verdict can't be parsed out of it.
-#[instrument(name = "second_opinion.run", skip_all, fields(orb = %orb.id))]
+#[instrument(name = "second_opinion.run", level = "debug", skip_all, fields(orb = %orb.id))]
 pub async fn run_reviewer(
     orb: &Orb,
     cfg: &SecondOpinionConfig,

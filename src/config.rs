@@ -27,6 +27,7 @@ pub struct OrbConfig {
     pub review: ReviewConfig,
     pub second_opinion: SecondOpinionConfig,
     pub notification: NotificationConfig,
+    pub logging: LoggingConfig,
     pub daemon: DaemonSettingsConfig,
 }
 
@@ -61,9 +62,21 @@ impl Default for OrbConfig {
             review: ReviewConfig::default(),
             second_opinion: SecondOpinionConfig::default(),
             notification: NotificationConfig::default(),
+            logging: LoggingConfig::default(),
             daemon: DaemonSettingsConfig::default(),
         }
     }
+}
+
+/// Optional process-wide logging settings. CLI flags take precedence over
+/// these settings, which take precedence over `RUST_LOG` for Orboros commands.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LoggingConfig {
+    /// A tracing filter directive such as `orboros=debug,tokio=warn`.
+    pub level: Option<String>,
+    /// Append foreground command logs to this path.
+    pub file: Option<String>,
 }
 
 /// Optional daemon process settings. Worker dispatch concurrency remains the
@@ -646,6 +659,20 @@ pub fn load_config(project_dir: Option<&Path>) -> anyhow::Result<OrbConfig> {
     load_config_with_home(dirs::home_dir().as_deref(), project_dir)
 }
 
+/// Returns the logging settings from the project and global layers separately.
+/// This preserves the distinction needed for CLI precedence: a project may
+/// override only one logging field and still inherit the other from global.
+pub fn load_logging_config_sources(
+    project_dir: Option<&Path>,
+) -> anyhow::Result<(LoggingConfig, LoggingConfig)> {
+    let global = load_config_with_home(dirs::home_dir().as_deref(), None)?.logging;
+    let project = project_dir
+        .map(|dir| load_config(Some(dir)).map(|config| config.logging))
+        .transpose()?
+        .unwrap_or_default();
+    Ok((project, global))
+}
+
 /// Load normal config, then overlay benchmark config after project config.
 ///
 /// If `bench_config_path` is provided it must exist. Otherwise
@@ -701,19 +728,118 @@ pub(crate) fn load_config_with_home_and_bench(
         }
     }
 
-    // 2. Project config
+    // 2. Legacy project config. Keep this read-only compatibility path while
+    // users migrate policy files out of `.orbs/`.
     if let Some(dir) = project_dir {
-        let project_path = dir.join(".orbs").join("config.toml");
+        let project_base = (dir.file_name().and_then(|name| name.to_str()) == Some(".orbs"))
+            .then(|| dir.parent())
+            .flatten()
+            .unwrap_or(dir);
+        let project_path = project_base.join(".orbs").join("config.toml");
         if project_path.exists() {
             let content = std::fs::read_to_string(&project_path)?;
             let table: toml::value::Table = toml::from_str(&content)?;
             merge_toml_tables(&mut base_table, &table);
+        }
+
+        // Workspace policy is discovered through the registered root (or the
+        // supplied directory for an unregistered project), never beyond it.
+        let root = home
+            .and_then(|home| {
+                list_projects(home).ok().and_then(|projects| {
+                    projects
+                        .into_iter()
+                        .filter(|project| {
+                            project
+                                .config_root()
+                                .is_some_and(|root| project_base.starts_with(root))
+                        })
+                        .max_by_key(|project| {
+                            project
+                                .config_root()
+                                .map_or(0, |root| root.components().count())
+                        })
+                })
+            })
+            .map_or_else(
+                || project_base.to_path_buf(),
+                |project| {
+                    project
+                        .config_root()
+                        .expect("matched project has root")
+                        .into()
+                },
+            );
+        let mut directories = Vec::new();
+        let mut current = Some(project_base);
+        while let Some(directory) = current {
+            directories.push(directory);
+            if directory == root {
+                break;
+            }
+            current = directory.parent();
+        }
+        directories.reverse();
+        for directory in &directories {
+            let config_path = directory.join(".orboros").join("config.toml");
+            if config_path.exists() {
+                let content = std::fs::read_to_string(config_path)?;
+                let table: toml::value::Table = toml::from_str(&content)?;
+                merge_toml_tables(&mut base_table, &table);
+            }
+        }
+        // A worktree-local override is deliberately local to the current
+        // project directory. An ancestor's local file must not override the
+        // child worktree's committed policy.
+        let local_path = project_base.join(".orboros").join("config.local.toml");
+        if local_path.exists() {
+            let content = std::fs::read_to_string(local_path)?;
+            let table: toml::value::Table = toml::from_str(&content)?;
+            merge_toml_tables(&mut base_table, &table);
+        }
+        if let Some(project) = home.and_then(|home| {
+            list_projects(home).ok().and_then(|projects| {
+                projects
+                    .into_iter()
+                    .filter(|project| {
+                        project
+                            .config_root()
+                            .is_some_and(|root| project_base.starts_with(root))
+                    })
+                    .max_by_key(|project| {
+                        project
+                            .config_root()
+                            .map_or(0, |root| root.components().count())
+                    })
+            })
+        }) {
+            let path = home
+                .expect("project lookup requires a home directory")
+                .join(".orboros")
+                .join("projects")
+                .join(&project.name)
+                .join("config.toml");
+            if path.exists() {
+                let content = std::fs::read_to_string(path)?;
+                let table: toml::value::Table = toml::from_str(&content)?;
+                merge_toml_tables(&mut base_table, &table);
+            }
         }
     }
 
     // 3. Benchmark corpus config
     if let Some(path) = bench_config_path {
         let content = std::fs::read_to_string(path)?;
+        let table: toml::value::Table = toml::from_str(&content)?;
+        merge_toml_tables(&mut base_table, &table);
+    }
+
+    // A CLI-selected file is the final TOML layer. `main` sets this process
+    // variable from `--config`; retaining the lookup here keeps all existing
+    // config consumers on the same resolved view.
+    if let Some(path) = std::env::var_os("ORBOROS_CONFIG_PATH") {
+        let path = PathBuf::from(path);
+        let content = std::fs::read_to_string(&path)?;
         let table: toml::value::Table = toml::from_str(&content)?;
         merge_toml_tables(&mut base_table, &table);
     }
@@ -728,6 +854,86 @@ pub(crate) fn load_config_with_home_and_bench(
     Ok(config)
 }
 
+/// Returns the existing TOML files that contribute to the current effective
+/// configuration, in merge order. This intentionally reports files rather
+/// than attempting per-field provenance after TOML table merging.
+pub fn config_source_paths(project_dir: Option<&Path>) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    let home = dirs::home_dir();
+    if let Some(home) = home.as_deref() {
+        let global = home.join(".orboros").join("config.toml");
+        if global.exists() {
+            paths.push(global);
+        }
+    }
+
+    let Some(dir) = project_dir else {
+        return Ok(paths);
+    };
+    let project_base = (dir.file_name().and_then(|name| name.to_str()) == Some(".orbs"))
+        .then(|| dir.parent())
+        .flatten()
+        .unwrap_or(dir);
+    let legacy = project_base.join(".orbs").join("config.toml");
+    if legacy.exists() {
+        paths.push(legacy);
+    }
+    let registered = home.as_deref().and_then(|home| {
+        list_projects(home).ok().and_then(|projects| {
+            projects
+                .into_iter()
+                .filter(|project| {
+                    project
+                        .config_root()
+                        .is_some_and(|root| project_base.starts_with(root))
+                })
+                .max_by_key(|project| {
+                    project
+                        .config_root()
+                        .map_or(0, |root| root.components().count())
+                })
+        })
+    });
+    let root = registered
+        .as_ref()
+        .and_then(|project| project.config_root())
+        .unwrap_or(project_base);
+    let mut directories = Vec::new();
+    let mut current = Some(project_base);
+    while let Some(directory) = current {
+        directories.push(directory);
+        if directory == root {
+            break;
+        }
+        current = directory.parent();
+    }
+    directories.reverse();
+    for directory in directories {
+        let policy = directory.join(".orboros").join("config.toml");
+        if policy.exists() {
+            paths.push(policy);
+        }
+    }
+    let local = project_base.join(".orboros").join("config.local.toml");
+    if local.exists() {
+        paths.push(local);
+    }
+    if let (Some(home), Some(project)) = (home.as_deref(), registered) {
+        let user_project = home
+            .join(".orboros")
+            .join("projects")
+            .join(project.name)
+            .join("config.toml");
+        if user_project.exists() {
+            paths.push(user_project);
+        }
+    }
+    if let Some(path) = std::env::var_os("ORBOROS_CONFIG_PATH") {
+        paths.push(PathBuf::from(path));
+    }
+    Ok(paths)
+}
+
 // ---------------------------------------------------------------------------
 // Projects registry — ~/.orboros/projects.toml
 // ---------------------------------------------------------------------------
@@ -735,8 +941,26 @@ pub(crate) fn load_config_with_home_and_bench(
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProjectEntry {
     pub name: String,
-    pub path: PathBuf,
+    /// Optional default runnable worktree. When omitted, `root_dir` is used.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    /// Boundary for workspace config discovery. Missing legacy values fall
+    /// back to `path`.
+    #[serde(default)]
+    pub root_dir: Option<PathBuf>,
     pub created_at: DateTime<Utc>,
+}
+
+impl ProjectEntry {
+    #[must_use]
+    pub fn config_root(&self) -> Option<&Path> {
+        self.root_dir.as_deref().or(self.path.as_deref())
+    }
+
+    #[must_use]
+    pub fn runnable_path(&self) -> Option<&Path> {
+        self.path.as_deref().or(self.root_dir.as_deref())
+    }
 }
 
 /// A registered project with a usable `.orbs` state directory.
@@ -785,7 +1009,8 @@ pub fn register_project(home: &Path, name: &str, path: &Path) -> anyhow::Result<
 
     // Update existing or insert new
     if let Some(existing) = pf.projects.iter_mut().find(|p| p.name == name) {
-        existing.path = path.to_path_buf();
+        existing.path = Some(path.to_path_buf());
+        existing.root_dir = Some(path.to_path_buf());
         let entry = existing.clone();
         save_projects_file(home, &pf)?;
         return Ok(entry);
@@ -793,7 +1018,8 @@ pub fn register_project(home: &Path, name: &str, path: &Path) -> anyhow::Result<
 
     let entry = ProjectEntry {
         name: name.to_string(),
-        path: path.to_path_buf(),
+        path: Some(path.to_path_buf()),
+        root_dir: Some(path.to_path_buf()),
         created_at: Utc::now(),
     };
     pf.projects.push(entry.clone());
@@ -820,7 +1046,11 @@ pub fn registered_project_state_dirs(
     let mut active = Vec::new();
     let mut skipped = Vec::new();
     for project in list_projects(home)? {
-        let state_dir = project.path.join(".orbs");
+        let Some(worktree) = project.runnable_path() else {
+            skipped.push(project);
+            continue;
+        };
+        let state_dir = worktree.join(".orbs");
         if state_dir.is_dir() {
             active.push(RegisteredProjectState {
                 entry: project,
@@ -846,7 +1076,7 @@ pub fn find_project(home: &Path, name: &str) -> anyhow::Result<Option<ProjectEnt
 // Init command logic
 // ---------------------------------------------------------------------------
 
-/// Initialize a project directory: create `.orbs/`, write default config,
+/// Initialize a project directory: create `.orbs/`, write policy config,
 /// create empty store, and register in global projects list.
 ///
 /// # Errors
@@ -855,12 +1085,29 @@ pub fn init_project(home: &Path, project_dir: &Path) -> anyhow::Result<()> {
     let orbs_dir = project_dir.join(".orbs");
     std::fs::create_dir_all(&orbs_dir)?;
 
-    // Write default config
+    // Keep configuration separate from runtime orb state.
     let default_config = OrbConfig::default();
     let config_content = toml::to_string_pretty(&default_config)?;
-    let config_path = orbs_dir.join("config.toml");
+    let config_dir = project_dir.join(".orboros");
+    std::fs::create_dir_all(&config_dir)?;
+    let config_path = config_dir.join("config.toml");
     if !config_path.exists() {
         std::fs::write(&config_path, &config_content)?;
+    }
+    let gitignore_path = project_dir.join(".gitignore");
+    let ignore_rule = ".orboros/config.local.toml";
+    let existing_ignore = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+    if !existing_ignore
+        .lines()
+        .any(|line| line.trim() == ignore_rule)
+    {
+        let separator = (!existing_ignore.is_empty() && !existing_ignore.ends_with('\n'))
+            .then_some("\n")
+            .unwrap_or("");
+        std::fs::write(
+            &gitignore_path,
+            format!("{existing_ignore}{separator}{ignore_rule}\n"),
+        )?;
     }
 
     // Create empty store file
@@ -1714,6 +1961,10 @@ system = "project speccing"
                 enabled: false,
                 desktop_enabled: true,
             },
+            logging: LoggingConfig {
+                level: Some("orboros=debug".into()),
+                file: Some("/tmp/orboros-general.log".into()),
+            },
             daemon: DaemonSettingsConfig {
                 pid_file: Some("/tmp/orboros.pid".into()),
                 log_file: Some("/tmp/orboros.log".into()),
@@ -1750,7 +2001,7 @@ system = "project speccing"
 
         let projects = list_projects(home.path()).unwrap();
         assert_eq!(projects.len(), 1);
-        assert_eq!(projects[0].path, Path::new("/new/path"));
+        assert_eq!(projects[0].path.as_deref(), Some(Path::new("/new/path")));
     }
 
     #[test]
@@ -1787,12 +2038,13 @@ system = "project speccing"
         init_project(home.path(), project.path()).unwrap();
 
         let orbs_dir = project.path().join(".orbs");
+        let config_path = project.path().join(".orboros").join("config.toml");
         assert!(orbs_dir.is_dir());
-        assert!(orbs_dir.join("config.toml").is_file());
+        assert!(config_path.is_file());
         assert!(orbs_dir.join("orbs.jsonl").is_file());
 
         // Config should parse as valid OrbConfig
-        let content = std::fs::read_to_string(orbs_dir.join("config.toml")).unwrap();
+        let content = std::fs::read_to_string(config_path).unwrap();
         let cfg: OrbConfig = toml::from_str(&content).unwrap();
         assert_eq!(cfg, OrbConfig::default());
     }
@@ -1806,7 +2058,7 @@ system = "project speccing"
 
         let projects = list_projects(home.path()).unwrap();
         assert_eq!(projects.len(), 1);
-        assert_eq!(projects[0].path, project.path());
+        assert_eq!(projects[0].path.as_deref(), Some(project.path()));
     }
 
     #[test]

@@ -211,7 +211,7 @@ impl QueueLoop {
     /// # Errors
     ///
     /// Returns an IO error if store operations fail.
-    #[instrument(name = "queue.tick", skip(self), fields(orb_count = tracing::field::Empty))]
+    #[instrument(name = "queue.tick", level = "debug", skip(self), fields(orb_count = tracing::field::Empty))]
     pub fn tick(&self) -> std::io::Result<TickResult> {
         if self.paused.load(Ordering::SeqCst) {
             debug!("queue paused; skipping tick");
@@ -694,7 +694,7 @@ impl QueueLoop {
     ///
     /// Returns an IO error if the store can't be read at the top.
     /// Individual worker / per-orb errors are captured per-orb.
-    #[instrument(name = "queue.dispatch_ready", skip(self, base_worker_config), fields(model = %base_worker_config.model))]
+    #[instrument(name = "queue.dispatch_ready", level = "debug", skip(self, base_worker_config), fields(model = %base_worker_config.model))]
     pub async fn dispatch_ready_orbs(
         &self,
         base_worker_config: &crate::worker::process::WorkerConfig,

@@ -169,6 +169,8 @@ pub fn rotate_log(config: &DaemonConfig) -> Result<()> {
     // Create new empty log file
     std::fs::write(log_file, "")
         .with_context(|| format!("creating new log file: {}", log_file.display()))?;
+    crate::bench::log::reopen_general(log_file)
+        .with_context(|| format!("reopening rotated log file: {}", log_file.display()))?;
 
     tracing::info!(
         "rotated log file {} -> {}",

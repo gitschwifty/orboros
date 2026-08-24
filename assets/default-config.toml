@@ -36,6 +36,10 @@ review_on_completion = true
 enabled = true
 desktop_enabled = false
 
+[logging]
+# level = "orboros=info,heddle=warn"
+# file = "/absolute/path/to/orboros.log"
+
 [daemon]
 # pid_file = "/absolute/path/to/orboros.pid"
 # log_file = "/absolute/path/to/orboros.log"

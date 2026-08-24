@@ -217,6 +217,7 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
 
     // Split by tier and dispatch. Today only T1 actually runs the
     // pipeline; T2/T3 fall through to scaffolded error rows.
+    let selected_cases = cases.len();
     let (t1, other): (Vec<BenchCase>, Vec<BenchCase>) =
         cases.into_iter().partition(|c| c.tier == BenchTier::T1);
 
@@ -229,7 +230,18 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
     let run_id = crate::bench::store::new_run_id();
     let run_started_at = Utc::now();
     crate::bench::log::start(&req.store.run_dir(&run_id).join("cli.log"))?;
-    tracing::info!(run_id = %run_id, "benchmark run logging started");
+    tracing::info!(
+        run_id = %run_id,
+        cases = selected_cases,
+        jobs = 1,
+        model_selector = ?run_config.model_selector,
+        worker_model = %req.worker_config.model,
+        worker_model_source = ?run_config.worker_model_source,
+        grader_model = %req.grader_worker_config.model,
+        grader_model_source = ?run_config.grader_model_source,
+        artifacts = %req.store.run_dir(&run_id).display(),
+        "benchmark run started"
+    );
     let mut summary_run_id = Some(run_id.clone());
 
     if !t1.is_empty() {
@@ -263,6 +275,15 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
             .expect("benchmark run ID initialized");
         let timeout_s = effective_timeout_s(case, &opts);
         let artifact_dir = req.store.case_artifact_dir(&run_id, &case.id);
+        tracing::info!(
+            run_id = %run_id,
+            case = %case.id,
+            tier = ?case.tier,
+            worker_model = %req.worker_config.model,
+            grader_model = %req.grader_worker_config.model,
+            timeout_s,
+            "benchmark case started"
+        );
         let result = match case.tier {
             BenchTier::T2 => match tokio::time::timeout(
                 Duration::from_secs(u64::from(timeout_s)),
@@ -411,7 +432,21 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
             &case.id,
             &artifact_dir.join("workdir").join(".orbs"),
         )?;
+        tracing::info!(
+            run_id = %run_id,
+            case = %case.id,
+            artifacts = %artifact_dir.display(),
+            "benchmark case artifacts captured"
+        );
         req.store.append_result(&result)?;
+        tracing::info!(
+            run_id = %run_id,
+            case = %result.case_id,
+            status = ?result.status,
+            score = result.score,
+            elapsed_ms = result.latency_ms,
+            "benchmark case completed"
+        );
         let fatal = is_fatal_worker_error(&result);
         all_results.push(result);
         if fatal {
@@ -438,6 +473,15 @@ pub async fn cmd_bench_run(req: BenchRunRequest<'_>) -> anyhow::Result<()> {
     }
 
     if let Some(run) = completed_run.as_ref() {
+        tracing::info!(
+            run_id = %run.run_id,
+            total = run.total,
+            passed = run.passed,
+            failed = run.failed,
+            errored = run.errored,
+            elapsed_ms = (run.finished_at - run.started_at).num_milliseconds(),
+            "benchmark run completed"
+        );
         print_completed_run(run, &all_results, &case_labels, &resource_guidance);
     } else {
         print_result_table(&all_results, Some(&case_labels), Some(&resource_guidance));
@@ -476,7 +520,18 @@ async fn cmd_bench_run_parallel(
         cases.len(),
         req.jobs
     );
-    tracing::info!(run_id = %run_id, jobs = req.jobs, "parallel benchmark run logging started");
+    tracing::info!(
+        run_id = %run_id,
+        cases = cases.len(),
+        jobs = req.jobs,
+        model_selector = ?run_config.model_selector,
+        worker_model = %req.worker_config.model,
+        worker_model_source = ?run_config.worker_model_source,
+        grader_model = %req.grader_worker_config.model,
+        grader_model_source = ?run_config.grader_model_source,
+        artifacts = %req.store.run_dir(&run_id).display(),
+        "benchmark run started"
+    );
 
     let mut pending = cases.into_iter().enumerate().collect::<VecDeque<_>>();
     let mut in_flight = JoinSet::new();
@@ -521,6 +576,12 @@ async fn cmd_bench_run_parallel(
     let mut all_results = Vec::with_capacity(completions.len());
     for completion in completions {
         persist_case_evidence(req.store, &run_id, &completion)?;
+        tracing::info!(
+            run_id = %run_id,
+            case = %completion.result.case_id,
+            artifacts = %completion.artifact_dir.display(),
+            "benchmark case artifacts captured"
+        );
         if completion.result.status == BenchStatus::Error {
             tracing::warn!(
                 run_id = %completion.result.run_id,
@@ -531,6 +592,14 @@ async fn cmd_bench_run_parallel(
             );
         }
         req.store.append_result(&completion.result)?;
+        tracing::info!(
+            run_id = %run_id,
+            case = %completion.result.case_id,
+            status = ?completion.result.status,
+            score = completion.result.score,
+            elapsed_ms = completion.result.latency_ms,
+            "benchmark case completed"
+        );
         all_results.push(completion.result);
     }
 
@@ -546,6 +615,15 @@ async fn cmd_bench_run_parallel(
         req.worker_config,
     );
     req.store.append_run(&run)?;
+    tracing::info!(
+        run_id = %run.run_id,
+        total = run.total,
+        passed = run.passed,
+        failed = run.failed,
+        errored = run.errored,
+        elapsed_ms = (run.finished_at - run.started_at).num_milliseconds(),
+        "benchmark run completed"
+    );
     print_completed_run(&run, &all_results, &case_labels, &resource_guidance);
     print_parallel_timing(&run, &all_results, req.jobs);
     println!("\nRun id: {run_id}");
@@ -597,6 +675,15 @@ async fn run_case(
     prompt_set: Option<BenchPromptSet>,
 ) -> CaseCompletion {
     let timeout_s = effective_timeout_s(&case, &opts);
+    tracing::info!(
+        run_id = %run_id,
+        case = %case.id,
+        tier = ?case.tier,
+        worker_model = %worker_config.model,
+        grader_model = %grader_worker_config.model,
+        timeout_s,
+        "benchmark case started"
+    );
     let result = match case.tier {
         BenchTier::T1 => match tokio::time::timeout(
             Duration::from_secs(u64::from(timeout_s)),

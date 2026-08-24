@@ -224,12 +224,10 @@ impl DispatchOutcome {
 /// complete dispatch rather than attempting to continue mid-response.
 #[instrument(
     name = "dispatcher.dispatch_orb",
+    level = "debug",
     skip(orb, prompt, worker_config, hooks),
     fields(
         orb = %orb.id,
-        title = %orb.title,
-        orb_type = ?orb.orb_type,
-        phase = %optional_debug(orb.phase.as_ref()),
         model = %worker_config.model
     )
 )]
@@ -295,9 +293,9 @@ async fn dispatch_orb_with_retry_limit(
         orb = %orb.id,
         title = %orb.title,
         orb_type = ?orb.orb_type,
-        phase = %optional_debug(orb.phase.as_ref()),
+        phase = ?orb.phase,
         model = %worker_config.model,
-        "dispatch_orb start",
+        "dispatch started"
     );
 
     let mut attempt = 0;
@@ -420,9 +418,6 @@ async fn dispatch_orb_with_retry_limit(
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     info!(
         orb = %orb.id,
-        title = %orb.title,
-        orb_type = ?orb.orb_type,
-        phase = %optional_debug(orb.phase.as_ref()),
         status = ?outcome.status,
         elapsed_ms,
         tokens_in = %optional_display(outcome.prompt_tokens),
@@ -434,7 +429,7 @@ async fn dispatch_orb_with_retry_limit(
         tool_calls = %optional_display(outcome.tool_calls),
         cost_micros = %optional_display(outcome.cost_micros),
         cost_currency = %outcome.cost_currency.as_deref().unwrap_or("none"),
-        "dispatch_orb complete",
+        "dispatch completed",
     );
 
     // 3. post-worker-* — async / fire-and-forget. The event picked
@@ -797,10 +792,6 @@ pub fn worker_config_for_with_model_config(
         crate::worker::process::CONFIDENCE_PROMPT_ADDENDUM
     );
     Ok(wc)
-}
-
-fn optional_debug<T: std::fmt::Debug>(value: Option<&T>) -> String {
-    value.map_or_else(|| "none".to_string(), |value| format!("{value:?}"))
 }
 
 fn optional_display<T: std::fmt::Display>(value: Option<T>) -> String {

@@ -209,9 +209,13 @@ impl PromptResolver {
         }
 
         if let Some(project_dir) = &self.project_dir {
-            let candidate = project_dir.join(".orbs").join(path);
+            let candidate = project_dir.join(".orboros").join(path);
             if candidate.exists() {
                 return candidate;
+            }
+            let legacy = project_dir.join(".orbs").join(path);
+            if legacy.exists() {
+                return legacy;
             }
         }
 
@@ -224,7 +228,7 @@ impl PromptResolver {
 
         self.project_dir.as_ref().map_or_else(
             || path.to_path_buf(),
-            |project_dir| project_dir.join(".orbs").join(path),
+            |project_dir| project_dir.join(".orboros").join(path),
         )
     }
 }
@@ -544,7 +548,7 @@ mod tests {
     #[test]
     fn phase_prompt_can_load_relative_project_file() {
         let project = tempdir().unwrap();
-        let prompt_dir = project.path().join(".orbs").join("prompts");
+        let prompt_dir = project.path().join(".orboros").join("prompts");
         std::fs::create_dir_all(&prompt_dir).unwrap();
         std::fs::write(prompt_dir.join("speccing.md"), "project speccing").unwrap();
         let config = PromptConfig {

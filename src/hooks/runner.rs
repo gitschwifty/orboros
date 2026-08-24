@@ -135,6 +135,7 @@ impl<'a> FireCtx<'a> {
 /// the per-invocation records. The function only returns `Ok` so
 /// callers don't conflate "infra error" with "hook said no."
 #[instrument(
+    level = "debug",
     name = "hooks.fire",
     skip(config, ctx),
     fields(
@@ -300,6 +301,7 @@ fn split_command(cmd: &str) -> Result<(String, Vec<String>), shell_words::ParseE
 }
 
 #[instrument(
+    level = "debug",
     name = "hooks.invocation",
     skip(payload, project_cwd, ctx),
     fields(
@@ -407,6 +409,7 @@ async fn run_sync(
 }
 
 #[instrument(
+    level = "debug",
     name = "hooks.invocation",
     skip(payload, project_cwd, ctx),
     fields(hook = %hook.name, sync = false)

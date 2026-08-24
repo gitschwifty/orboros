@@ -45,7 +45,7 @@ pub enum AttemptOutcome {
 /// invalid regex).
 pub fn grade_attempt(response: &str, expected: &BenchExpected) -> anyhow::Result<AttemptOutcome> {
     match expected {
-        BenchExpected::Exact { text } => Ok(if response.trim() == text.trim() {
+        BenchExpected::Exact { text } => Ok(if normalize_exact_response(response) == text.trim() {
             AttemptOutcome::Pass
         } else {
             AttemptOutcome::Fail
@@ -62,6 +62,26 @@ pub fn grade_attempt(response: &str, expected: &BenchExpected) -> anyhow::Result
         BenchExpected::TestsPass { .. } | BenchExpected::Rubric { .. } => {
             Ok(AttemptOutcome::Unsupported)
         }
+    }
+}
+
+/// Removes presentation-only wrappers commonly added to a one-value model
+/// answer. This intentionally does not alter the expected value, so a case
+/// that genuinely expects quote characters remains exact.
+fn normalize_exact_response(response: &str) -> String {
+    let value = response.trim();
+    if value.starts_with("```") && value.ends_with("```") && value.len() >= 6 {
+        return value[3..value.len() - 3].trim().to_string();
+    }
+    let wrapped = value.len() >= 2
+        && matches!(
+            (value.as_bytes()[0], value.as_bytes()[value.len() - 1]),
+            (b'`', b'`') | (b'\'', b'\'') | (b'"', b'"')
+        );
+    if wrapped {
+        value[1..value.len() - 1].trim().to_string()
+    } else {
+        value.to_string()
     }
 }
 
@@ -162,7 +182,11 @@ pub struct BenchRunConfig {
     pub model_selector: Option<String>,
     pub model_key: Option<String>,
     pub worker_model: Option<String>,
+    /// Resolver path which selected the worker model.
+    pub worker_model_source: Option<String>,
     pub grader_model: Option<String>,
+    /// Resolver path which selected the grader model.
+    pub grader_model_source: Option<String>,
     pub prompt_variant: Option<String>,
     pub prompt_manifest: Option<PromptManifest>,
     pub suite_manifest: Option<BenchSuiteManifest>,
@@ -182,12 +206,14 @@ impl BenchRunConfig {
     #[must_use]
     pub fn config_hash_input(&self, base_worker_config: &WorkerConfig) -> String {
         format!(
-            "variant={:?}\nmodel_selector={:?}\nmodel_key={:?}\nworker_model={:?}\ngrader_model={:?}\nprompt_variant={:?}\nprompt_manifest={:?}\nbench_config_path={:?}\ntimeout_s={:?}\nmax_iterations={:?}\nworker_command={}\nsystem_prompt={}",
+            "variant={:?}\nmodel_selector={:?}\nmodel_key={:?}\nworker_model={:?}\nworker_model_source={:?}\ngrader_model={:?}\ngrader_model_source={:?}\nprompt_variant={:?}\nprompt_manifest={:?}\nbench_config_path={:?}\ntimeout_s={:?}\nmax_iterations={:?}\nworker_command={}\nsystem_prompt={}",
             self.variant,
             self.model_selector,
             self.model_key,
             self.worker_model,
+            self.worker_model_source,
             self.grader_model,
+            self.grader_model_source,
             self.prompt_variant,
             self.prompt_manifest,
             self.bench_config_path,
@@ -286,6 +312,13 @@ pub async fn run_t1_case_with_artifacts(
             .map(ToString::to_string)
             .collect();
         wc.runtime = artifact_dir.map(|dir| benchmark_runtime_placement(dir, attempt));
+        info!(
+            run_id,
+            case = %case.id,
+            attempt = attempt + 1,
+            worker_model = %wc.model,
+            "benchmark worker attempt started"
+        );
 
         let mut worker = match Worker::spawn(&wc).await {
             Ok(w) => w,
@@ -443,6 +476,7 @@ pub async fn run_t1_case_with_artifacts(
     }
 
     info!(
+        run_id,
         case = %case.id,
         status = ?status,
         passes,
@@ -453,7 +487,7 @@ pub async fn run_t1_case_with_artifacts(
         cache_read_tokens,
         cache_write_tokens,
         elapsed_ms,
-        "T1 case complete",
+        "benchmark T1 case completed",
     );
 
     Ok(BenchResult {
@@ -626,6 +660,14 @@ pub async fn run_t1_with_run_id(
 
     for case in cases {
         let timeout_s = effective_timeout_s(case, opts);
+        info!(
+            run_id = %run_id,
+            case = %case.id,
+            tier = ?case.tier,
+            worker_model = %base_worker_config.model,
+            timeout_s,
+            "benchmark case started"
+        );
         let r = match tokio::time::timeout(
             Duration::from_secs(u64::from(timeout_s)),
             run_t1_case_with_artifacts(
@@ -842,6 +884,14 @@ mod tests {
             AttemptOutcome::Pass,
             "leading/trailing whitespace ignored"
         );
+    }
+
+    #[test]
+    fn grade_exact_tolerates_single_value_presentation_wrappers() {
+        let exp = BenchExpected::Exact { text: "ok".into() };
+        for response in ["`ok`", "'ok'", "\"ok\"", "```\nok\n```"] {
+            assert_eq!(grade_attempt(response, &exp).unwrap(), AttemptOutcome::Pass);
+        }
     }
 
     #[test]

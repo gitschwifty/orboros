@@ -350,7 +350,16 @@ fn warn_on_duplicate_names(hooks: &[HookEntry]) {
 #[must_use]
 pub fn default_paths(state_dir: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
     let global = dirs::home_dir().map(|h| h.join(".orboros").join("hooks.toml"));
-    let project = Some(state_dir.join("hooks.toml"));
+    let project_root = (state_dir.file_name().and_then(|name| name.to_str()) == Some(".orbs"))
+        .then(|| state_dir.parent())
+        .flatten()
+        .unwrap_or(state_dir);
+    let configured = project_root.join(".orboros").join("hooks.toml");
+    let project = if configured.exists() {
+        Some(configured)
+    } else {
+        Some(state_dir.join("hooks.toml"))
+    };
     (global, project)
 }
 

@@ -22,7 +22,7 @@ Initialize a new project in the current directory.
 orboros init
 ```
 
-Creates `.orbs/` with `config.toml` and `orbs.jsonl`. Registers the project in `~/.orboros/projects.toml`.
+Creates `.orbs/orbs.jsonl` and `.orboros/config.toml`. Registers the project in `~/.orboros/projects.toml`.
 
 When `--state-dir` is omitted, Orboros searches upward from the current
 directory for a `.orbs` directory, stopping at home. If none is found, it falls

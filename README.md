@@ -144,15 +144,18 @@ Layered config with TOML:
 
 ```
 ~/.orboros/config.toml          # Global defaults
-.orbs/config.toml               # Project overrides
+.orboros/config.toml            # Project/workspace policy
+.orboros/config.local.toml      # Ignored local worktree overrides
 CLI flags                       # Per-invocation overrides
 ```
 
 See the [configuration reference](docs/configuration.md) for the full schema,
 including benchmark overlays and concurrency settings.
+`--config <path>` overlays one explicit configuration file after all discovered
+layers.
 
 ```toml
-# Example .orbs/config.toml
+# Example .orboros/config.toml
 default_model = "anthropic/claude-sonnet-4-20250514"
 max_concurrency = 4
 
@@ -242,7 +245,7 @@ desktop_enabled = true
 system = "You are an implementation worker. Make focused, tested code changes."
 
 [prompts.workers.review]
-system_file = "prompts/review.md" # resolves from .orbs/prompts/review.md
+system_file = "prompts/review.md" # resolves from .orboros/prompts/review.md
 
 [prompts.coordinators.decompose]
 system_file = "prompts/decompose.md"
@@ -258,6 +261,20 @@ system = "You are refining an Orboros plan. Return only the requested JSON shape
 ```
 
 Projects are registered in `~/.orboros/projects.toml` automatically on `orboros init`.
+The registry records a workspace `root_dir` (the upper boundary for config
+discovery) and an optional default runnable `path`; when omitted, `path`
+defaults to `root_dir`. This allows one container directory to own policy for
+several worktrees without relying on a Git root.
+
+### User-local project data
+
+The registry is deliberately global: `~/.orboros/projects.toml` maps a stable
+project name to its checkout. User-local, per-project operational data belongs
+beside that registry under `~/.orboros/projects/<project>/`, rather than in the
+repository. For example, foreground and single-project daemon logs are written
+to `cli.log` and `daemon.log` there. This is also the intended home for future
+per-project user configuration; repository-scoped policy lives in
+`.orboros/config.toml`.
 
 Model catalog entries are optional; configs with only `default_model` still work.
 Set `[models] coordinator_model_choice = true` to let decomposition
@@ -314,7 +331,7 @@ execution ledger so benchmark evidence can distinguish the permitted policy
 from a worker's attempted tool calls.
 
 ```toml
-# preferred: .orbs/config.toml
+# preferred: .orboros/config.toml
 [tool_profiles.edit]
 allowed_tools = ["read_file", "write_file", "edit_file", "glob", "grep", "bash"]
 ```
