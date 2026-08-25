@@ -62,11 +62,11 @@ pub struct WorkerConfig {
 /// clear that they cannot be used to escape the Orboros capability boundary.
 ///
 /// Benchmark prompt sets can select `<!-- orboros: workdir-relative-paths=on -->`
-/// or `<!-- orboros: workdir-relative-paths=off -->` as a composed fragment.
-/// These control markers are stripped before the worker receives the prompt so
-/// an A/B run can measure the path guidance without changing its task role.
+/// as a composed fragment. This control marker is stripped before the worker
+/// receives the prompt so an A/B run can measure the path guidance without
+/// changing its task role. Guidance is deliberately off unless an experiment
+/// selects it; promotion to the default runtime contract requires evidence.
 const WORKDIR_PATH_GUIDANCE_ON_MARKER: &str = "<!-- orboros: workdir-relative-paths=on -->";
-const WORKDIR_PATH_GUIDANCE_OFF_MARKER: &str = "<!-- orboros: workdir-relative-paths=off -->";
 
 #[must_use]
 pub fn effective_system_prompt(system_prompt: &str, tools: &[String]) -> String {
@@ -87,10 +87,8 @@ pub fn effective_system_prompt_for_workdir(
     tools: &[String],
     workdir: Option<&Path>,
 ) -> String {
-    let workdir_path_guidance = !system_prompt.contains(WORKDIR_PATH_GUIDANCE_OFF_MARKER);
-    let system_prompt = system_prompt
-        .replace(WORKDIR_PATH_GUIDANCE_ON_MARKER, "")
-        .replace(WORKDIR_PATH_GUIDANCE_OFF_MARKER, "");
+    let workdir_path_guidance = system_prompt.contains(WORKDIR_PATH_GUIDANCE_ON_MARKER);
+    let system_prompt = system_prompt.replace(WORKDIR_PATH_GUIDANCE_ON_MARKER, "");
     let tools = if tools.is_empty() {
         "none".to_string()
     } else {
@@ -856,7 +854,7 @@ mod tests {
     #[test]
     fn effective_system_prompt_names_workdir_and_requires_relative_paths() {
         let prompt = effective_system_prompt_for_workdir(
-            "Base role instructions.",
+            "Base role instructions.\n<!-- orboros: workdir-relative-paths=on -->",
             &["read_file".into()],
             Some(Path::new("/private/tmp/assigned-repo")),
         );
@@ -870,7 +868,7 @@ mod tests {
     #[test]
     fn effective_system_prompt_strips_benchmark_path_guidance_marker() {
         let prompt = effective_system_prompt_for_workdir(
-            "Base role instructions.\n<!-- orboros: workdir-relative-paths=off -->",
+            "Base role instructions.",
             &[],
             Some(Path::new("/private/tmp/assigned-repo")),
         );

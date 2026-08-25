@@ -231,6 +231,10 @@ enum BenchAction {
         /// Named Markdown prompt set under <bench-root>/prompts/.
         #[arg(long)]
         prompt_set: Option<String>,
+        /// Opt-in prompt-only experiment applied to the selected prompt set.
+        /// Supported: workdir-relative-paths.
+        #[arg(long)]
+        prompt_experiment: Option<String>,
         /// Skip the per-case cost ceiling (`max_cost_cents`).
         #[arg(long)]
         no_budget: bool,
@@ -1051,6 +1055,7 @@ fn cmd_bench(
             model,
             variant,
             prompt_set,
+            prompt_experiment,
             no_budget,
             jobs,
         } => {
@@ -1115,6 +1120,19 @@ fn cmd_bench(
                 .as_deref()
                 .map(|name| orboros::bench::prompts::BenchPromptSet::load(bench_root, name))
                 .transpose()?;
+            let prompt_set = match (prompt_set, prompt_experiment.as_deref()) {
+                (Some(set), Some(experiment)) => Some(
+                    set.with_experiment(
+                        experiment
+                            .parse::<orboros::bench::prompts::PromptExperiment>()
+                            .map_err(anyhow::Error::msg)?,
+                    ),
+                ),
+                (None, Some(_)) => anyhow::bail!(
+                    "--prompt-experiment requires --prompt-set so it has a stable base prompt set"
+                ),
+                (set, None) => set,
+            };
             let run_config = BenchRunConfig {
                 variant,
                 model_selector: model

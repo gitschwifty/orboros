@@ -22,6 +22,28 @@ const ROLES: &[&str] = &[
     "execute",
 ];
 const COMPOSITION_FILE: &str = "composition.toml";
+const WORKDIR_PATH_EXPERIMENT: &str = "<!-- orboros: workdir-relative-paths=on -->\n";
+const WORKDIR_PATH_EXPERIMENT_FILE: &str = "experiments/workdir-relative-paths.md";
+
+/// An opt-in, prompt-only benchmark variation. When absent, the base prompt
+/// set and suite fingerprint are unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptExperiment {
+    WorkdirRelativePaths,
+}
+
+impl std::str::FromStr for PromptExperiment {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "workdir-relative-paths" => Ok(Self::WorkdirRelativePaths),
+            _ => Err(format!(
+                "unknown prompt experiment `{value}`; supported: workdir-relative-paths"
+            )),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 struct CompositionFile {
@@ -216,6 +238,29 @@ impl BenchPromptSet {
             }
         }
         config
+    }
+
+    /// Returns a derived prompt set for one isolated experiment. The base set
+    /// is not modified, so running without this method preserves its exact
+    /// manifest and suite fingerprint.
+    #[must_use]
+    pub fn with_experiment(mut self, experiment: PromptExperiment) -> Self {
+        match experiment {
+            PromptExperiment::WorkdirRelativePaths => {
+                let experiment_path = PathBuf::from(WORKDIR_PATH_EXPERIMENT_FILE);
+                let input = input_file(&experiment_path, WORKDIR_PATH_EXPERIMENT);
+                self.source_files
+                    .insert(experiment_path, WORKDIR_PATH_EXPERIMENT.into());
+                for role in self.roles.values_mut() {
+                    role.content.push_str("\n\n");
+                    role.content.push_str(WORKDIR_PATH_EXPERIMENT);
+                    role.manifest.fragments.push(input.clone());
+                    role.manifest.assembled_sha256 = prompt_hash(&role.content);
+                }
+                self.name = format!("{}.1-workdir-paths", self.name);
+            }
+        }
+        self
     }
 
     #[must_use]
@@ -425,6 +470,33 @@ mod tests {
         );
         assert!(run.join("prompts/x/composition.toml").exists());
         assert!(run.join("prompts/x/manifest.json").exists());
+    }
+
+    #[test]
+    fn workdir_path_experiment_derives_a_new_prompt_set_without_mutating_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let set = dir.path().join("prompts/composable-v1");
+        fs::create_dir_all(set.join("roles")).unwrap();
+        fs::write(
+            set.join(COMPOSITION_FILE),
+            "[roles.execute]\nfragments = [\"roles/execute.md\"]\n",
+        )
+        .unwrap();
+        fs::write(set.join("roles/execute.md"), "base execute").unwrap();
+        let base = BenchPromptSet::load(dir.path(), "composable-v1").unwrap();
+        let base_manifest = base.manifest();
+        let experiment = base.with_experiment(PromptExperiment::WorkdirRelativePaths);
+
+        assert_eq!(base_manifest.prompt_set, "composable-v1");
+        assert_eq!(experiment.name, "composable-v1.1-workdir-paths");
+        assert!(experiment.prompt_config().workers["execute"]
+            .system
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains(WORKDIR_PATH_EXPERIMENT)));
+        assert!(experiment.manifest().roles[0]
+            .fragments
+            .iter()
+            .any(|input| input.path == WORKDIR_PATH_EXPERIMENT_FILE));
     }
 
     #[test]

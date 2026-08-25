@@ -1,10 +1,10 @@
 # Worker workdir path contract
 
 Orboros starts each Heddle worker with `WorkerConfig.cwd` as its process
-working directory. For normal repository reads, edits, searches, and commands,
-workers must use paths relative to that directory. The effective system prompt
-names the assigned workdir when one is configured and instructs the worker to
-recover from a failed path by checking that directory and retrying relatively.
+working directory. The workdir-relative-path instruction is currently an
+opt-in benchmark experiment, not an assumed production default: it names the
+assigned workdir and instructs the worker to recover from a failed path by
+checking that directory and retrying relatively.
 
 Absolute paths remain valid only when a task explicitly requires an approved
 location outside the repository. Orboros neither rewrites a worker tool path
@@ -28,19 +28,17 @@ prompt guidance and the existing Heddle sandbox boundary.
 
 ## Benchmark experiment
 
-The guidance is enabled by default, but composable benchmark prompt sets may
-include one of these exact Markdown fragments for an A/B run:
+Run the experiment with a stable base set:
 
-```markdown
-<!-- orboros: workdir-relative-paths=on -->
+```sh
+orboros bench run --tier 3 --prompt-set composable-v1 \
+  --prompt-experiment workdir-relative-paths
 ```
 
-```markdown
-<!-- orboros: workdir-relative-paths=off -->
-```
-
-The marker is removed before dispatch. Create otherwise identical prompt-set
-directories (for example `composable-v1-path-on` and
-`composable-v1-path-off`), select the fragment in each execute-role
-composition, then compare the same T3 suite with `bench compare`. The copied
-prompt manifest preserves the selected variant and its content hash.
+Without `--prompt-experiment`, `composable-v1` is loaded unchanged and its
+suite fingerprint remains exactly the base fingerprint. With the switch,
+Orboros derives `composable-v1.1-workdir-paths`, injects the versioned
+experiment fragment into every selected role prompt, and records the derived
+manifest/hash. The marker is stripped before dispatch. Compare matching runs
+with `bench compare` before promoting the guidance to the default runtime
+contract.
