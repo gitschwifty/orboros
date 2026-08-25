@@ -118,6 +118,21 @@ pub enum OperationJournalError {
     },
 }
 
+/// Failures exposed by the project state authority.
+#[derive(Debug, Error)]
+pub enum ProjectAuthorityError {
+    #[error(transparent)]
+    Lease(#[from] ProjectLeaseError),
+    #[error(transparent)]
+    Journal(#[from] OperationJournalError),
+    #[error("operation {operation_id} is based on revision {base_revision}, but current revision is {current_revision}")]
+    RevisionConflict {
+        operation_id: uuid::Uuid,
+        base_revision: u64,
+        current_revision: u64,
+    },
+}
+
 /// Append-only journal which deduplicates retried operations by UUID.
 #[derive(Debug)]
 pub struct OperationJournal {
@@ -168,6 +183,11 @@ impl OperationJournal {
     #[must_use]
     pub fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Returns a receipt for a previously accepted operation.
+    pub fn receipt(&self, operation_id: &uuid::Uuid) -> Option<&StateReceipt> {
+        self.receipts.get(operation_id)
     }
 
     /// Records one operation once, returning the original receipt on retry.
@@ -230,6 +250,7 @@ pub struct ProjectStateAuthority {
     project: ProjectEntry,
     state_dir: PathBuf,
     lease: ProjectStateLease,
+    journal: OperationJournal,
 }
 
 /// The project registry owned by one user-level supervisor process.
@@ -259,7 +280,10 @@ impl LocalSupervisor {
     }
 
     /// Idempotently attaches a project and acquires its writer lease.
-    pub fn attach(&mut self, project: ProjectEntry) -> Result<AttachOutcome, ProjectLeaseError> {
+    pub fn attach(
+        &mut self,
+        project: ProjectEntry,
+    ) -> Result<AttachOutcome, ProjectAuthorityError> {
         if self.projects.contains_key(&project.name) {
             return Ok(AttachOutcome::AlreadyAttached);
         }
@@ -296,7 +320,7 @@ impl ProjectStateAuthority {
         home: &Path,
         project: ProjectEntry,
         epoch: u64,
-    ) -> Result<Self, ProjectLeaseError> {
+    ) -> Result<Self, ProjectAuthorityError> {
         let state_dir = project.shared_state_dir(home);
         let lease = ProjectStateLease::try_acquire(
             &state_dir,
@@ -306,10 +330,12 @@ impl ProjectStateAuthority {
                 epoch,
             },
         )?;
+        let journal = OperationJournal::open(&state_dir)?;
         Ok(Self {
             project,
             state_dir,
             lease,
+            journal,
         })
     }
 
@@ -326,6 +352,31 @@ impl ProjectStateAuthority {
     /// Returns the exclusive writer lease held for this project.
     pub fn lease(&self) -> &ProjectStateLease {
         &self.lease
+    }
+
+    /// Returns the currently durable state revision.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.journal.revision()
+    }
+
+    /// Accepts a new operation once, rejecting stale state-dependent writes.
+    pub fn accept(
+        &mut self,
+        operation: StateOperation,
+    ) -> Result<StateReceipt, ProjectAuthorityError> {
+        if let Some(receipt) = self.journal.receipt(&operation.operation_id) {
+            return Ok(receipt.clone());
+        }
+        let current_revision = self.journal.revision();
+        if operation.base_revision != current_revision {
+            return Err(ProjectAuthorityError::RevisionConflict {
+                operation_id: operation.operation_id,
+                base_revision: operation.base_revision,
+                current_revision,
+            });
+        }
+        Ok(self.journal.accept(operation)?)
     }
 }
 
@@ -498,7 +549,10 @@ mod tests {
         let error = ProjectStateAuthority::attach(home.path(), project("alpha"), 2)
             .expect_err("the project already has an authoritative writer");
 
-        assert!(matches!(error, ProjectLeaseError::Busy { .. }));
+        assert!(matches!(
+            error,
+            ProjectAuthorityError::Lease(ProjectLeaseError::Busy { .. })
+        ));
         drop(first);
     }
 
@@ -547,5 +601,32 @@ mod tests {
 
         let reopened = OperationJournal::open(state_dir.path()).unwrap();
         assert_eq!(reopened.revision(), 2);
+    }
+
+    #[test]
+    fn project_authority_rejects_stale_operations_but_replays_a_retry() {
+        let home = tempfile::tempdir().unwrap();
+        let mut authority =
+            ProjectStateAuthority::attach(home.path(), project("alpha"), 1).unwrap();
+        let accepted = authority
+            .accept(operation(uuid::Uuid::new_v4(), "create_orb"))
+            .unwrap();
+
+        let stale = authority
+            .accept(StateOperation {
+                operation_id: uuid::Uuid::new_v4(),
+                base_revision: 0,
+                kind: "update_orb".into(),
+                payload: serde_json::json!({}),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            stale,
+            ProjectAuthorityError::RevisionConflict {
+                current_revision: 1,
+                ..
+            }
+        ));
+        assert_eq!(authority.accept(accepted.operation).unwrap().revision, 1);
     }
 }
