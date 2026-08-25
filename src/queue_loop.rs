@@ -1097,8 +1097,11 @@ async fn dispatch_one_owned(
     );
     let wc = worker_config_for_with_model_config(&orb, &target_base_wc, &system, model_config)
         .map_err(std::io::Error::other)?;
-    let effective_system_prompt =
-        crate::worker::process::effective_system_prompt(&wc.system_prompt, &wc.tools);
+    let effective_system_prompt = crate::worker::process::effective_system_prompt_for_workdir(
+        &wc.system_prompt,
+        &wc.tools,
+        wc.cwd.as_deref(),
+    );
     prompt_context.effective_system_prompt_chars =
         u32::try_from(effective_system_prompt.chars().count()).unwrap_or(u32::MAX);
     tracing::info!(
