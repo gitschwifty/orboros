@@ -18,6 +18,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
 use crate::config::ProjectEntry;
+use orbs::dep::DepEdge;
+use orbs::orb::Orb;
 
 /// Metadata written by the process that currently owns a project state lease.
 ///
@@ -87,6 +89,54 @@ pub struct StateReceipt {
     pub revision: u64,
 }
 
+/// A state change understood by the shared-state projection.
+///
+/// The operation journal is the durable source of truth.  The JSONL stores
+/// are materialized projections, kept in the existing format so workers and
+/// read-only tooling can consume them without a second storage API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SharedStateMutation {
+    /// Create or replace the latest record for one orb.
+    UpsertOrb { orb: Orb },
+    /// Create or replace the latest record for one dependency edge.
+    UpsertDependency { edge: DepEdge },
+}
+
+impl StateOperation {
+    /// Builds an operation carrying one typed shared-state mutation.
+    #[must_use]
+    pub fn mutation(
+        operation_id: uuid::Uuid,
+        base_revision: u64,
+        mutation: SharedStateMutation,
+    ) -> Self {
+        let payload =
+            serde_json::to_value(mutation).expect("shared state mutation is serializable");
+        let kind = payload
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .expect("tagged shared state mutation has a kind")
+            .to_owned();
+        Self {
+            operation_id,
+            base_revision,
+            kind,
+            payload,
+        }
+    }
+
+    fn shared_mutation(&self) -> Result<SharedStateMutation, StateProjectionError> {
+        serde_json::from_value(self.payload.clone()).map_err(|source| {
+            StateProjectionError::InvalidMutation {
+                operation_id: self.operation_id,
+                kind: self.kind.clone(),
+                source,
+            }
+        })
+    }
+}
+
 /// Failures while opening or appending the replayable operation journal.
 #[derive(Debug, Error)]
 pub enum OperationJournalError {
@@ -122,6 +172,42 @@ pub enum OperationJournalError {
     },
 }
 
+/// Failures while rebuilding the materialized JSONL state from the journal.
+#[derive(Debug, Error)]
+pub enum StateProjectionError {
+    #[error("operation {operation_id} has invalid {kind} mutation payload: {source}")]
+    InvalidMutation {
+        operation_id: uuid::Uuid,
+        kind: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("failed to serialize materialized state record in {path}: {source}")]
+    Serialize {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("failed to write materialized state record in {path}: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to read projection watermark {path}: {source}")]
+    ReadWatermark {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("invalid projection watermark {path}: {source}")]
+    ParseWatermark {
+        path: PathBuf,
+        #[source]
+        source: std::num::ParseIntError,
+    },
+}
+
 /// Failures exposed by the project state authority.
 #[derive(Debug, Error)]
 pub enum ProjectAuthorityError {
@@ -129,6 +215,8 @@ pub enum ProjectAuthorityError {
     Lease(#[from] ProjectLeaseError),
     #[error(transparent)]
     Journal(#[from] OperationJournalError),
+    #[error(transparent)]
+    Projection(#[from] StateProjectionError),
     #[error("operation {operation_id} is based on revision {base_revision}, but current revision is {current_revision}")]
     RevisionConflict {
         operation_id: uuid::Uuid,
@@ -194,6 +282,18 @@ impl OperationJournal {
         self.receipts.get(operation_id)
     }
 
+    /// Returns receipts in the exact order in which they were accepted.
+    pub fn receipts_after(&self, revision: u64) -> Vec<StateReceipt> {
+        let mut receipts = self
+            .receipts
+            .values()
+            .filter(|receipt| receipt.revision > revision)
+            .cloned()
+            .collect::<Vec<_>>();
+        receipts.sort_by_key(|receipt| receipt.revision);
+        receipts
+    }
+
     /// Records one operation once, returning the original receipt on retry.
     pub fn accept(
         &mut self,
@@ -255,6 +355,7 @@ pub struct ProjectStateAuthority {
     state_dir: PathBuf,
     lease: ProjectStateLease,
     journal: OperationJournal,
+    projection: StateProjection,
 }
 
 /// The project registry owned by one user-level supervisor process.
@@ -441,7 +542,9 @@ fn rejected(error: &ProjectAuthorityError) -> SupervisorResponse {
     let code = match error {
         ProjectAuthorityError::RevisionConflict { .. } => "revision_conflict",
         ProjectAuthorityError::Lease(ProjectLeaseError::Busy { .. }) => "project_busy",
-        ProjectAuthorityError::Lease(_) | ProjectAuthorityError::Journal(_) => "supervisor_error",
+        ProjectAuthorityError::Lease(_)
+        | ProjectAuthorityError::Journal(_)
+        | ProjectAuthorityError::Projection(_) => "supervisor_error",
     };
     SupervisorResponse::Rejected {
         code: code.into(),
@@ -469,12 +572,15 @@ impl ProjectStateAuthority {
             },
         )?;
         let journal = OperationJournal::open(&state_dir)?;
-        Ok(Self {
+        let mut authority = Self {
             project,
             state_dir,
             lease,
             journal,
-        })
+            projection: StateProjection::new(),
+        };
+        authority.project_pending_operations()?;
+        Ok(authority)
     }
 
     /// Returns the registered project attached to this authority.
@@ -503,9 +609,13 @@ impl ProjectStateAuthority {
         &mut self,
         operation: StateOperation,
     ) -> Result<StateReceipt, ProjectAuthorityError> {
-        if let Some(receipt) = self.journal.receipt(&operation.operation_id) {
-            return Ok(receipt.clone());
+        if let Some(receipt) = self.journal.receipt(&operation.operation_id).cloned() {
+            self.project_pending_operations()?;
+            return Ok(receipt);
         }
+        // Reject malformed mutations before they enter the authoritative WAL:
+        // an invalid durable row could otherwise prevent every later replay.
+        let _ = operation.shared_mutation()?;
         let current_revision = self.journal.revision();
         if operation.base_revision != current_revision {
             return Err(ProjectAuthorityError::RevisionConflict {
@@ -514,8 +624,97 @@ impl ProjectStateAuthority {
                 current_revision,
             });
         }
-        Ok(self.journal.accept(operation)?)
+        let receipt = self.journal.accept(operation)?;
+        self.project_pending_operations()?;
+        Ok(receipt)
     }
+
+    fn project_pending_operations(&mut self) -> Result<(), StateProjectionError> {
+        let applied_revision = self.projection.applied_revision(&self.state_dir)?;
+        for receipt in self.journal.receipts_after(applied_revision) {
+            self.projection.apply(&self.state_dir, &receipt)?;
+        }
+        Ok(())
+    }
+}
+
+/// Materializes journal entries into the legacy JSONL files.
+///
+/// The projection watermark advances only after an individual record is
+/// flushed. A crash between the record and watermark writes repeats a complete
+/// latest-value record, which is semantically idempotent under the JSONL
+/// stores' normal replay rules. A crash cannot advance the watermark ahead of
+/// durable state.
+#[derive(Debug, Default)]
+struct StateProjection;
+
+impl StateProjection {
+    fn new() -> Self {
+        Self
+    }
+
+    fn watermark_path(state_dir: &Path) -> PathBuf {
+        state_dir.join("projection-revision")
+    }
+
+    fn applied_revision(&self, state_dir: &Path) -> Result<u64, StateProjectionError> {
+        let path = Self::watermark_path(state_dir);
+        match std::fs::read_to_string(&path) {
+            Ok(value) => value
+                .trim()
+                .parse()
+                .map_err(|source| StateProjectionError::ParseWatermark { path, source }),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(0),
+            Err(source) => Err(StateProjectionError::ReadWatermark { path, source }),
+        }
+    }
+
+    fn apply(&self, state_dir: &Path, receipt: &StateReceipt) -> Result<(), StateProjectionError> {
+        match receipt.operation.shared_mutation()? {
+            SharedStateMutation::UpsertOrb { orb } => {
+                append_materialized(&state_dir.join("orbs.jsonl"), &orb)?;
+            }
+            SharedStateMutation::UpsertDependency { edge } => {
+                append_materialized(&state_dir.join("deps.jsonl"), &edge)?;
+            }
+        }
+        let path = Self::watermark_path(state_dir);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .map_err(|source| StateProjectionError::Write {
+                path: path.clone(),
+                source,
+            })?;
+        file.write_all(receipt.revision.to_string().as_bytes())
+            .and_then(|()| file.write_all(b"\n"))
+            .and_then(|()| file.sync_data())
+            .map_err(|source| StateProjectionError::Write { path, source })
+    }
+}
+
+fn append_materialized<T: Serialize>(path: &Path, value: &T) -> Result<(), StateProjectionError> {
+    let row = serde_json::to_vec(value).map_err(|source| StateProjectionError::Serialize {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|source| StateProjectionError::Write {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.write_all(&row)
+        .and_then(|()| file.write_all(b"\n"))
+        .and_then(|()| file.sync_data())
+        .map_err(|source| StateProjectionError::Write {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 impl ProjectStateLease {
@@ -629,13 +828,14 @@ mod tests {
         }
     }
 
-    fn operation(id: uuid::Uuid, kind: &str) -> StateOperation {
-        StateOperation {
-            operation_id: id,
-            base_revision: 0,
-            kind: kind.into(),
-            payload: serde_json::json!({"title": "example"}),
-        }
+    fn operation(id: uuid::Uuid) -> StateOperation {
+        StateOperation::mutation(
+            id,
+            0,
+            SharedStateMutation::UpsertOrb {
+                orb: Orb::new("example", "example description"),
+            },
+        )
     }
 
     #[test]
@@ -729,9 +929,9 @@ mod tests {
         let second_id = uuid::Uuid::new_v4();
         let mut journal = OperationJournal::open(state_dir.path()).unwrap();
 
-        let first = journal.accept(operation(first_id, "create_orb")).unwrap();
-        let retry = journal.accept(operation(first_id, "create_orb")).unwrap();
-        let second = journal.accept(operation(second_id, "review_orb")).unwrap();
+        let first = journal.accept(operation(first_id)).unwrap();
+        let retry = journal.accept(operation(first_id)).unwrap();
+        let second = journal.accept(operation(second_id)).unwrap();
 
         assert_eq!(first.revision, 1);
         assert_eq!(retry, first);
@@ -746,17 +946,16 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let mut authority =
             ProjectStateAuthority::attach(home.path(), project("alpha"), 1).unwrap();
-        let accepted = authority
-            .accept(operation(uuid::Uuid::new_v4(), "create_orb"))
-            .unwrap();
+        let accepted = authority.accept(operation(uuid::Uuid::new_v4())).unwrap();
 
         let stale = authority
-            .accept(StateOperation {
-                operation_id: uuid::Uuid::new_v4(),
-                base_revision: 0,
-                kind: "update_orb".into(),
-                payload: serde_json::json!({}),
-            })
+            .accept(StateOperation::mutation(
+                uuid::Uuid::new_v4(),
+                0,
+                SharedStateMutation::UpsertOrb {
+                    orb: Orb::new("stale", "must be rejected"),
+                },
+            ))
             .unwrap_err();
         assert!(matches!(
             stale,
@@ -766,6 +965,60 @@ mod tests {
             }
         ));
         assert_eq!(authority.accept(accepted.operation).unwrap().revision, 1);
+    }
+
+    #[test]
+    fn authority_materializes_and_recovers_a_durable_orb_operation() {
+        let home = tempfile::tempdir().unwrap();
+        let orb = Orb::new("shared orb", "written through the supervisor");
+        let operation = StateOperation::mutation(
+            uuid::Uuid::new_v4(),
+            0,
+            SharedStateMutation::UpsertOrb { orb: orb.clone() },
+        );
+
+        let state_dir = {
+            let mut authority =
+                ProjectStateAuthority::attach(home.path(), project("alpha"), 1).unwrap();
+            let receipt = authority.accept(operation.clone()).unwrap();
+            assert_eq!(receipt.revision, 1);
+            assert_eq!(
+                std::fs::read_to_string(authority.state_dir().join("projection-revision"))
+                    .unwrap()
+                    .trim(),
+                "1"
+            );
+            authority.state_dir().to_path_buf()
+        };
+
+        let reopened = ProjectStateAuthority::attach(home.path(), project("alpha"), 2).unwrap();
+        assert_eq!(reopened.revision(), 1);
+        let materialized: Orb = serde_json::from_str(
+            std::fs::read_to_string(state_dir.join("orbs.jsonl"))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(materialized.id, orb.id);
+        assert_eq!(materialized.title, "shared orb");
+    }
+
+    #[test]
+    fn authority_rejects_invalid_operations_before_journaling_them() {
+        let home = tempfile::tempdir().unwrap();
+        let mut authority =
+            ProjectStateAuthority::attach(home.path(), project("alpha"), 1).unwrap();
+        let error = authority
+            .accept(StateOperation {
+                operation_id: uuid::Uuid::new_v4(),
+                base_revision: 0,
+                kind: "unknown".into(),
+                payload: serde_json::json!({"kind": "unknown"}),
+            })
+            .unwrap_err();
+        assert!(matches!(error, ProjectAuthorityError::Projection(_)));
+        assert_eq!(authority.revision(), 0);
+        assert!(!authority.state_dir().join("projection-revision").exists());
     }
 
     #[test]
@@ -783,7 +1036,7 @@ mod tests {
         );
         let accepted = supervisor.handle(SupervisorRequest::Mutate {
             project_name: "alpha".into(),
-            operation: operation(uuid::Uuid::new_v4(), "create_orb"),
+            operation: operation(uuid::Uuid::new_v4()),
         });
         assert!(matches!(
             accepted,
