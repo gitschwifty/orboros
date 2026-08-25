@@ -25,3 +25,22 @@ scope, return a structured path error containing:
 Orboros can then persist the structured diagnostic once that IPC field exists.
 Until then, the stable Orboros-side protection is explicit workdir-relative
 prompt guidance and the existing Heddle sandbox boundary.
+
+## Benchmark experiment
+
+The guidance is enabled by default, but composable benchmark prompt sets may
+include one of these exact Markdown fragments for an A/B run:
+
+```markdown
+<!-- orboros: workdir-relative-paths=on -->
+```
+
+```markdown
+<!-- orboros: workdir-relative-paths=off -->
+```
+
+The marker is removed before dispatch. Create otherwise identical prompt-set
+directories (for example `composable-v1-path-on` and
+`composable-v1-path-off`), select the fragment in each execute-role
+composition, then compare the same T3 suite with `bench compare`. The copied
+prompt manifest preserves the selected variant and its content hash.

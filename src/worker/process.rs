@@ -60,6 +60,14 @@ pub struct WorkerConfig {
 /// but spelling it out prevents a worker from wasting turns probing unavailable
 /// tools. Heddle control tools may still be visible; this instruction makes
 /// clear that they cannot be used to escape the Orboros capability boundary.
+///
+/// Benchmark prompt sets can select `<!-- orboros: workdir-relative-paths=on -->`
+/// or `<!-- orboros: workdir-relative-paths=off -->` as a composed fragment.
+/// These control markers are stripped before the worker receives the prompt so
+/// an A/B run can measure the path guidance without changing its task role.
+const WORKDIR_PATH_GUIDANCE_ON_MARKER: &str = "<!-- orboros: workdir-relative-paths=on -->";
+const WORKDIR_PATH_GUIDANCE_OFF_MARKER: &str = "<!-- orboros: workdir-relative-paths=off -->";
+
 #[must_use]
 pub fn effective_system_prompt(system_prompt: &str, tools: &[String]) -> String {
     effective_system_prompt_for_workdir(system_prompt, tools, None)
@@ -79,6 +87,10 @@ pub fn effective_system_prompt_for_workdir(
     tools: &[String],
     workdir: Option<&Path>,
 ) -> String {
+    let workdir_path_guidance = !system_prompt.contains(WORKDIR_PATH_GUIDANCE_OFF_MARKER);
+    let system_prompt = system_prompt
+        .replace(WORKDIR_PATH_GUIDANCE_ON_MARKER, "")
+        .replace(WORKDIR_PATH_GUIDANCE_OFF_MARKER, "");
     let tools = if tools.is_empty() {
         "none".to_string()
     } else {
@@ -97,14 +109,16 @@ pub fn effective_system_prompt_for_workdir(
             path.display()
         ),
     );
+    let path_section =
+        workdir_path_guidance.then(|| format!("\n\n## Repository paths\n{path_guidance}"));
     format!(
         "{system_prompt}\n\n## Runtime capabilities\n\
 This is a non-interactive worker session: do not call `ask_user` or wait for \
 user input. Your Orboros-permitted repository tools are: {tools}. Do not \
 attempt tools outside that inventory. Do not use subagents or other control \
 tools to obtain capabilities that are not listed; complete the assigned role \
-with the available tools and return the required result.\n\n## Repository paths\n\
-{path_guidance}"
+with the available tools and return the required result.{path_section}",
+        path_section = path_section.unwrap_or_default(),
     )
 }
 
@@ -851,6 +865,18 @@ mod tests {
         assert!(prompt.contains("use paths relative to this directory"));
         assert!(prompt.contains("Do not invent or reuse absolute temporary paths"));
         assert!(prompt.contains("retry with the repository-relative path"));
+    }
+
+    #[test]
+    fn effective_system_prompt_strips_benchmark_path_guidance_marker() {
+        let prompt = effective_system_prompt_for_workdir(
+            "Base role instructions.\n<!-- orboros: workdir-relative-paths=off -->",
+            &[],
+            Some(Path::new("/private/tmp/assigned-repo")),
+        );
+
+        assert!(!prompt.contains("workdir-relative-paths"));
+        assert!(!prompt.contains("## Repository paths"));
     }
 
     fn mock_worker_config() -> WorkerConfig {
