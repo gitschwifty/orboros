@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Seek, Write};
+use std::io::{self, BufRead, BufReader, Seek, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
@@ -65,6 +65,147 @@ pub enum ProjectLeaseError {
         #[source]
         source: serde_json::Error,
     },
+}
+
+/// A client mutation accepted by the project state authority.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateOperation {
+    pub operation_id: uuid::Uuid,
+    pub base_revision: u64,
+    pub kind: String,
+    pub payload: serde_json::Value,
+}
+
+/// Durable outcome of an accepted mutation request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateReceipt {
+    pub operation: StateOperation,
+    pub revision: u64,
+}
+
+/// Failures while opening or appending the replayable operation journal.
+#[derive(Debug, Error)]
+pub enum OperationJournalError {
+    #[error("failed to open operation journal {path}: {source}")]
+    Open {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to read operation journal {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("invalid operation journal row in {path}: {source}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("failed to serialize operation journal row for {path}: {source}")]
+    Serialize {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("failed to append operation journal {path}: {source}")]
+    Append {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// Append-only journal which deduplicates retried operations by UUID.
+#[derive(Debug)]
+pub struct OperationJournal {
+    path: PathBuf,
+    receipts: HashMap<uuid::Uuid, StateReceipt>,
+    revision: u64,
+}
+
+impl OperationJournal {
+    /// Opens the journal and rebuilds its idempotency index from durable rows.
+    pub fn open(state_dir: &Path) -> Result<Self, OperationJournalError> {
+        let path = state_dir.join("operations.jsonl");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .map_err(|source| OperationJournalError::Open {
+                path: path.clone(),
+                source,
+            })?;
+        let mut receipts = HashMap::new();
+        let mut revision = 0;
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|source| OperationJournalError::Read {
+                path: path.clone(),
+                source,
+            })?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let receipt: StateReceipt =
+                serde_json::from_str(&line).map_err(|source| OperationJournalError::Parse {
+                    path: path.clone(),
+                    source,
+                })?;
+            revision = revision.max(receipt.revision);
+            receipts.insert(receipt.operation.operation_id, receipt);
+        }
+        Ok(Self {
+            path,
+            receipts,
+            revision,
+        })
+    }
+
+    /// Returns the last assigned authoritative revision.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Records one operation once, returning the original receipt on retry.
+    pub fn accept(
+        &mut self,
+        operation: StateOperation,
+    ) -> Result<StateReceipt, OperationJournalError> {
+        if let Some(receipt) = self.receipts.get(&operation.operation_id) {
+            return Ok(receipt.clone());
+        }
+        self.revision += 1;
+        let receipt = StateReceipt {
+            operation,
+            revision: self.revision,
+        };
+        let row =
+            serde_json::to_vec(&receipt).map_err(|source| OperationJournalError::Serialize {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .map_err(|source| OperationJournalError::Open {
+                path: self.path.clone(),
+                source,
+            })?;
+        file.write_all(&row)
+            .and_then(|()| file.write_all(b"\n"))
+            .and_then(|()| file.sync_data())
+            .map_err(|source| OperationJournalError::Append {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.receipts
+            .insert(receipt.operation.operation_id, receipt.clone());
+        Ok(receipt)
+    }
 }
 
 /// An exclusive, OS-held writer lease for one user-local project state home.
@@ -299,6 +440,15 @@ mod tests {
         }
     }
 
+    fn operation(id: uuid::Uuid, kind: &str) -> StateOperation {
+        StateOperation {
+            operation_id: id,
+            base_revision: 0,
+            kind: kind.into(),
+            payload: serde_json::json!({"title": "example"}),
+        }
+    }
+
     #[test]
     fn project_state_lease_rejects_a_second_writer() {
         let directory = tempfile::tempdir().unwrap();
@@ -378,5 +528,24 @@ mod tests {
         drop(supervisor.detach("alpha"));
         assert_eq!(supervisor.project_count(), 1);
         assert!(supervisor.project("alpha").is_none());
+    }
+
+    #[test]
+    fn operation_journal_deduplicates_retries_and_replays_revisions() {
+        let state_dir = tempfile::tempdir().unwrap();
+        let first_id = uuid::Uuid::new_v4();
+        let second_id = uuid::Uuid::new_v4();
+        let mut journal = OperationJournal::open(state_dir.path()).unwrap();
+
+        let first = journal.accept(operation(first_id, "create_orb")).unwrap();
+        let retry = journal.accept(operation(first_id, "create_orb")).unwrap();
+        let second = journal.accept(operation(second_id, "review_orb")).unwrap();
+
+        assert_eq!(first.revision, 1);
+        assert_eq!(retry, first);
+        assert_eq!(second.revision, 2);
+
+        let reopened = OperationJournal::open(state_dir.path()).unwrap();
+        assert_eq!(reopened.revision(), 2);
     }
 }
