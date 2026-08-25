@@ -436,6 +436,35 @@ pub async fn serve_local_socket(
     }
 }
 
+/// Location of the one user-level supervisor control socket.
+#[must_use]
+pub fn control_socket_path(home: &Path) -> PathBuf {
+    home.join(".orboros").join("supervisor.sock")
+}
+
+/// Sends one request to the running local supervisor and returns its response.
+///
+/// A missing or unreachable socket is deliberately surfaced to callers rather
+/// than falling back to direct JSONL writes: that is what keeps shared-mode
+/// clients from accidentally bypassing the authoritative writer.
+pub async fn request_local_socket(
+    socket_path: &Path,
+    request: &SupervisorRequest,
+) -> io::Result<SupervisorResponse> {
+    let stream = UnixStream::connect(socket_path).await?;
+    let (reader, mut writer) = stream.into_split();
+    let encoded = serde_json::to_vec(request).map_err(io::Error::other)?;
+    writer.write_all(&encoded).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+
+    let mut lines = AsyncBufReader::new(reader).lines();
+    let line = lines.next_line().await?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::UnexpectedEof, "supervisor closed response")
+    })?;
+    serde_json::from_str(&line).map_err(io::Error::other)
+}
+
 async fn serve_connection(
     stream: UnixStream,
     supervisor: Arc<Mutex<LocalSupervisor>>,
@@ -1071,6 +1100,32 @@ mod tests {
         let mut lines = AsyncBufReader::new(reader).lines();
         let response: SupervisorResponse =
             serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            response,
+            SupervisorResponse::Attached {
+                outcome: AttachOutcomeWire::Attached
+            }
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn local_socket_client_surfaces_typed_responses() {
+        let home = tempfile::tempdir().unwrap();
+        let socket = control_socket_path(home.path());
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let supervisor = Arc::new(Mutex::new(LocalSupervisor::new(home.path().to_path_buf())));
+        let task = tokio::spawn(serve_local_socket(listener, supervisor));
+
+        let response = request_local_socket(
+            &socket,
+            &SupervisorRequest::Attach {
+                project: project("alpha"),
+            },
+        )
+        .await
+        .unwrap();
         assert_eq!(
             response,
             SupervisorResponse::Attached {
