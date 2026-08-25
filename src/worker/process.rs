@@ -190,7 +190,7 @@ impl Worker {
             cmd.current_dir(cwd);
         }
 
-        for (key, value) in &config.env {
+        for (key, value) in worker_process_environment(&config.env) {
             cmd.env(key, value);
         }
 
@@ -609,6 +609,22 @@ impl Worker {
     }
 }
 
+/// Returns the environment forwarded to a Heddle worker process.
+///
+/// Go otherwise writes telemetry beneath the sandboxed home directory, which
+/// is often the benchmark workdir. Callers may explicitly choose another
+/// `GOTELEMETRY` value through [`WorkerConfig::env`].
+fn worker_process_environment(configured: &[(String, String)]) -> Vec<(String, String)> {
+    let mut environment = configured.to_vec();
+    if !environment
+        .iter()
+        .any(|(key, _)| key.eq_ignore_ascii_case("GOTELEMETRY"))
+    {
+        environment.push(("GOTELEMETRY".into(), "off".into()));
+    }
+    environment
+}
+
 fn protocol_versions_compatible(expected: &str, actual: &str) -> bool {
     fn major(version: &str) -> Option<u64> {
         version.split('.').next()?.parse().ok()
@@ -831,6 +847,20 @@ mod tests {
             runtime: None,
             routing: None,
         }
+    }
+
+    #[test]
+    fn worker_environment_disables_go_telemetry_by_default() {
+        assert_eq!(
+            worker_process_environment(&[]),
+            vec![("GOTELEMETRY".into(), "off".into())]
+        );
+    }
+
+    #[test]
+    fn worker_environment_respects_explicit_go_telemetry_setting() {
+        let configured = vec![("GOTELEMETRY".into(), "local".into())];
+        assert_eq!(worker_process_environment(&configured), configured);
     }
 
     fn confidence_mock_worker_config() -> WorkerConfig {
