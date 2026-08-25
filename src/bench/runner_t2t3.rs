@@ -449,7 +449,7 @@ async fn grade_t2_change(
     };
     let diff = grader_candidate_diff(seed_dir, workdir);
     let evidence = format!(
-        "Task:\n{}\n\nDeterministic command: {}\nPassed: {}\nOutput:\n{}\n\nCandidate diff:\n{}\n\nScope note: The candidate diff deliberately excludes benchmark-harness and generated paths (`.orbs`, `target`, `.git`). Do not penalize files absent from this diff; judge scope only from the displayed candidate changes.",
+        "Task:\n{}\n\nDeterministic command: {}\nPassed: {}\nOutput:\n{}\n\nCandidate diff:\n{}\n\nScope note: The candidate diff deliberately excludes benchmark-harness, dependency, cache, and generated build paths. Do not penalize files absent from this diff; judge scope only from the displayed candidate changes.",
         case.prompt,
         command,
         tests.passed,
@@ -531,19 +531,61 @@ async fn grade_t2_change(
 /// match the artifact diff's exclusions so runner state never counts as an
 /// unrelated worker change.
 fn grader_candidate_diff(seed_dir: &Path, workdir: &Path) -> String {
-    Command::new("diff")
-        .arg("-ruN")
-        .arg("-x")
-        .arg("target")
-        .arg("-x")
-        .arg(".orbs")
-        .arg("-x")
-        .arg(".git")
-        .arg(seed_dir)
-        .arg(workdir)
+    let mut command = Command::new("diff");
+    command.arg("-ruN");
+    add_generated_path_exclusions(&mut command);
+    command.arg(seed_dir).arg(workdir);
+    command
         .output()
         .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
         .unwrap_or_else(|error| format!("(could not collect candidate diff: {error})"))
+}
+
+/// Paths excluded from candidate diffs and grader evidence. The benchmark
+/// should assess authored source changes, not dependency installs, compiler
+/// byproducts, or runtime state left in the isolated workdir.
+const GENERATED_PATH_NAMES: &[&str] = &[
+    ".git",
+    ".next",
+    ".orbs",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+    ".venv",
+    ".bench-build",
+    "__pycache__",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    "target",
+    "venv",
+];
+
+const GENERATED_PATH_PATTERNS: &[&str] = &["*.pyc", "*.pyo", "*.tsbuildinfo"];
+
+fn add_generated_path_exclusions(command: &mut Command) {
+    for path in GENERATED_PATH_NAMES
+        .iter()
+        .chain(GENERATED_PATH_PATTERNS.iter())
+    {
+        command.arg("-x").arg(path);
+    }
+}
+
+fn is_generated_path(path: &std::ffi::OsStr) -> bool {
+    let name = path.to_string_lossy();
+    GENERATED_PATH_NAMES.contains(&name.as_ref())
+        || name.ends_with(".pyc")
+        || name.ends_with(".pyo")
+        || name.ends_with(".tsbuildinfo")
+}
+
+/// `.orbs` is excluded from diffs but deliberately retained in captured T2
+/// artifacts: its prompt and execution ledgers are needed when inspecting a
+/// benchmark run after completion.
+fn is_artifact_generated_path(path: &std::ffi::OsStr) -> bool {
+    path != ".orbs" && is_generated_path(path)
 }
 
 fn truncate_grader_evidence(text: &str) -> String {
@@ -1457,15 +1499,10 @@ fn write_diff_patch(
     workdir: &Path,
     patch_path: &Path,
 ) -> Result<(), HarnessError> {
-    let output = Command::new("diff")
-        .arg("-ruN")
-        .arg("-x")
-        .arg("target")
-        .arg("-x")
-        .arg(".orbs")
-        .arg(seed_dir)
-        .arg(workdir)
-        .output()?;
+    let mut command = Command::new("diff");
+    command.arg("-ruN");
+    add_generated_path_exclusions(&mut command);
+    let output = command.arg(seed_dir).arg(workdir).output()?;
     match output.status.code() {
         Some(0 | 1) => {
             std::fs::write(patch_path, output.stdout)?;
@@ -1483,7 +1520,7 @@ fn copy_dir_filtered(src: &Path, dest: &Path) -> Result<(), HarnessError> {
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let file_name = entry.file_name();
-        if file_name == "target" {
+        if is_artifact_generated_path(&file_name) {
             continue;
         }
         let src_path = entry.path();
@@ -1919,10 +1956,14 @@ done
         std::fs::create_dir_all(seed.join("config")).unwrap();
         std::fs::create_dir_all(workdir.join("config")).unwrap();
         std::fs::create_dir_all(workdir.join(".orbs")).unwrap();
+        std::fs::create_dir_all(workdir.join("node_modules/package")).unwrap();
+        std::fs::create_dir_all(workdir.join("__pycache__")).unwrap();
         std::fs::create_dir_all(workdir.join("target")).unwrap();
         std::fs::write(seed.join("config/app.json"), r#"{"enabled":false}"#).unwrap();
         std::fs::write(workdir.join("config/app.json"), r#"{"enabled":true}"#).unwrap();
         std::fs::write(workdir.join(".orbs/orbs.jsonl"), "runner state").unwrap();
+        std::fs::write(workdir.join("node_modules/package/index.js"), "dependency").unwrap();
+        std::fs::write(workdir.join("__pycache__/headers.pyc"), "cache").unwrap();
         std::fs::write(workdir.join("target/build.log"), "generated").unwrap();
 
         let diff = grader_candidate_diff(&seed, &workdir);
@@ -1936,6 +1977,33 @@ done
             !diff.contains(&workdir.join("target").display().to_string()),
             "{diff}"
         );
+        assert!(
+            !diff.contains(&workdir.join("node_modules").display().to_string()),
+            "{diff}"
+        );
+        assert!(
+            !diff.contains(&workdir.join("__pycache__").display().to_string()),
+            "{diff}"
+        );
+    }
+
+    #[test]
+    fn artifact_copy_excludes_generated_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let artifact = dir.path().join("artifact");
+        std::fs::create_dir_all(source.join("src")).unwrap();
+        std::fs::create_dir_all(source.join("node_modules/package")).unwrap();
+        std::fs::create_dir_all(source.join("__pycache__")).unwrap();
+        std::fs::write(source.join("src/lib.ts"), "export const value = 1;").unwrap();
+        std::fs::write(source.join("node_modules/package/index.js"), "dependency").unwrap();
+        std::fs::write(source.join("__pycache__/lib.cpython-313.pyc"), "cache").unwrap();
+
+        copy_dir_filtered(&source, &artifact).unwrap();
+
+        assert!(artifact.join("src/lib.ts").is_file());
+        assert!(!artifact.join("node_modules").exists());
+        assert!(!artifact.join("__pycache__").exists());
     }
 
     // ── T2 runner ─────────────────────────────────────────────
