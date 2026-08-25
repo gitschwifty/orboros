@@ -9,9 +9,13 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Seek, Write};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Mutex;
 
 use crate::config::ProjectEntry;
 
@@ -313,6 +317,44 @@ impl From<AttachOutcome> for AttachOutcomeWire {
             AttachOutcome::AlreadyAttached => Self::AlreadyAttached,
         }
     }
+}
+
+/// Serves newline-delimited JSON supervisor requests on a local Unix socket.
+pub async fn serve_local_socket(
+    listener: UnixListener,
+    supervisor: Arc<Mutex<LocalSupervisor>>,
+) -> io::Result<()> {
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let supervisor = Arc::clone(&supervisor);
+        tokio::spawn(async move {
+            if let Err(error) = serve_connection(stream, supervisor).await {
+                tracing::warn!(%error, "supervisor client connection failed");
+            }
+        });
+    }
+}
+
+async fn serve_connection(
+    stream: UnixStream,
+    supervisor: Arc<Mutex<LocalSupervisor>>,
+) -> io::Result<()> {
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = AsyncBufReader::new(reader).lines();
+    while let Some(line) = lines.next_line().await? {
+        let response = match serde_json::from_str::<SupervisorRequest>(&line) {
+            Ok(request) => supervisor.lock().await.handle(request),
+            Err(error) => SupervisorResponse::Rejected {
+                code: "invalid_request".into(),
+                detail: error.to_string(),
+            },
+        };
+        let encoded = serde_json::to_vec(&response).map_err(io::Error::other)?;
+        writer.write_all(&encoded).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+    }
+    Ok(())
 }
 
 impl LocalSupervisor {
@@ -755,5 +797,33 @@ mod tests {
             }),
             SupervisorResponse::Status { revision: 1 }
         );
+    }
+
+    #[tokio::test]
+    async fn local_socket_serves_typed_supervisor_requests() {
+        let home = tempfile::tempdir().unwrap();
+        let socket = home.path().join("supervisor.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let supervisor = Arc::new(Mutex::new(LocalSupervisor::new(home.path().to_path_buf())));
+        let task = tokio::spawn(serve_local_socket(listener, Arc::clone(&supervisor)));
+
+        let stream = UnixStream::connect(&socket).await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let request = serde_json::to_vec(&SupervisorRequest::Attach {
+            project: project("alpha"),
+        })
+        .unwrap();
+        writer.write_all(&request).await.unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        let mut lines = AsyncBufReader::new(reader).lines();
+        let response: SupervisorResponse =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(
+            response,
+            SupervisorResponse::Attached {
+                outcome: AttachOutcomeWire::Attached
+            }
+        );
+        task.abort();
     }
 }
