@@ -167,6 +167,70 @@ async fn dispatch_ready_orbs_injects_orb_context_into_user_prompt() {
 }
 
 #[tokio::test]
+async fn dispatch_recovers_one_terminal_retry_that_left_a_changed_child_workdir() {
+    let dir = tempfile::tempdir().unwrap();
+    let workdir = dir.path().join("workdir");
+    fs::create_dir_all(&workdir).unwrap();
+    let counter = dir.path().join("attempts");
+    let changed = workdir.join("partial.txt");
+    let script = dir.path().join("recover-once.sh");
+    fs::write(
+        &script,
+        format!(
+            r##"#!/bin/bash
+COUNTER='{counter}'
+CHANGED='{changed}'
+while IFS= read -r line; do
+  type=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['type'])")
+  id=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['id'])")
+  case "$type" in
+    init) echo "{{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"s\",\"protocol_version\":\"0.4.0\"}}" ;;
+    send)
+      attempt=$(cat "$COUNTER" 2>/dev/null || echo 0)
+      if [ "$attempt" = 0 ]; then
+        echo partial > "$CHANGED"; echo 1 > "$COUNTER"
+        echo "{{\"type\":\"result\",\"id\":\"$id\",\"status\":\"error\",\"error\":{{\"code\":\"loop_detected\",\"message\":\"loop\",\"retryable\":false}},\"tool_calls_made\":[],\"iterations\":1,\"failure\":{{\"code\":\"loop_detected\",\"termination_reason\":\"loop\",\"iterations\":1,\"tool_calls_made\":1}}}}"
+      elif [ "$attempt" = 1 ]; then
+        echo 2 > "$COUNTER"
+        echo "{{\"type\":\"result\",\"id\":\"$id\",\"status\":\"error\",\"error\":{{\"code\":\"model_error\",\"message\":\"stream failed\",\"retryable\":false}},\"tool_calls_made\":[],\"iterations\":1}}"
+      else
+        echo "{{\"type\":\"result\",\"id\":\"$id\",\"status\":\"ok\",\"response\":\"recovered and verified\",\"tool_calls_made\":[],\"iterations\":1}}"
+      fi
+      ;;
+    shutdown) echo "{{\"type\":\"shutdown_ok\",\"id\":\"$id\"}}"; exit 0 ;;
+  esac
+done
+"##,
+            counter = counter.display(),
+            changed = changed.display(),
+        ),
+    )
+    .unwrap();
+    make_executable(&script);
+    let mut wc = worker_config(&script);
+    wc.cwd = Some(workdir);
+
+    let base = dir.path().to_path_buf();
+    let orb_store = OrbStore::new(base.join("orbs.jsonl"));
+    let dep_store = DepStore::new(base.join("deps.jsonl"));
+    let parent =
+        Orb::new("Parent", "must pass the focused verification").with_type(OrbType::Feature);
+    let mut child = active_task_orb("Child");
+    child.parent_id = Some(parent.id.clone());
+    child.root_id = Some(parent.id.clone());
+    orb_store.append(&parent).unwrap();
+    orb_store.append(&child).unwrap();
+
+    let ql = QueueLoop::new(orb_store.clone(), dep_store, base);
+    assert_eq!(ql.dispatch_ready_orbs(&wc, 1).await.unwrap(), 1);
+    let recovered = orb_store.load_by_id(&child.id).unwrap().unwrap();
+    assert_eq!(recovered.status, Some(OrbStatus::Done));
+    assert_eq!(recovered.result.as_deref(), Some("recovered and verified"));
+    assert_eq!(fs::read_to_string(changed).unwrap(), "partial\n");
+    assert_eq!(fs::read_to_string(counter).unwrap().trim(), "2");
+}
+
+#[tokio::test]
 async fn dispatch_ready_orbs_is_idempotent_once_execution_set() {
     let dir = tempfile::tempdir().unwrap();
     let script = write_worker_script(dir.path(), "ok.sh", "x");

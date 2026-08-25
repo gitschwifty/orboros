@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -11,6 +11,10 @@ use orbs::orb_store::OrbStore;
 use orbs::pipeline::create_pipeline;
 use orbs::task::TaskStatus;
 use tracing::{debug, instrument};
+
+const MAX_PARTIAL_ARTIFACT_RECOVERY_ITERATIONS: u32 = 8;
+const PARTIAL_ARTIFACT_RECOVERY_SYSTEM_PROMPT: &str =
+    include_str!("../assets/prompts/recover-partial-artifact.md");
 
 /// Result of a single tick of the queue loop.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1018,6 +1022,104 @@ fn optional_debug<T: std::fmt::Debug>(value: Option<T>) -> String {
     value.map_or_else(|| "none".to_string(), |value| format!("{value:?}"))
 }
 
+/// A deliberately small, content-based snapshot of an assigned workdir.
+/// Runtime and VCS metadata are excluded: they are not task artifacts and can
+/// change while a worker is running without proving implementation progress.
+async fn workspace_fingerprint(workdir: &Path) -> std::io::Result<String> {
+    let workdir = workdir.to_path_buf();
+    tokio::task::spawn_blocking(move || workspace_fingerprint_blocking(&workdir))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+fn workspace_fingerprint_blocking(workdir: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    fn visit(root: &Path, dir: &Path, entries: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name();
+            if matches!(
+                name.to_str(),
+                Some(".git" | ".orbs" | ".orboros" | "target")
+            ) {
+                continue;
+            }
+            let ty = entry.file_type()?;
+            if ty.is_dir() {
+                visit(root, &path, entries)?;
+            } else if ty.is_file() {
+                entries.push(path.strip_prefix(root).unwrap_or(&path).to_path_buf());
+            }
+        }
+        Ok(())
+    }
+
+    let mut entries = Vec::new();
+    visit(workdir, workdir, &mut entries)?;
+    entries.sort();
+    let mut hasher = Sha256::new();
+    for relative in entries {
+        hasher.update(relative.to_string_lossy().as_bytes());
+        let mut file = std::fs::File::open(workdir.join(&relative))?;
+        let mut buf = [0_u8; 8192];
+        loop {
+            let bytes = file.read(&mut buf)?;
+            if bytes == 0 {
+                break;
+            }
+            hasher.update(&buf[..bytes]);
+        }
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn partial_artifact_recovery_is_eligible(
+    orb: &Orb,
+    target: DispatchTarget,
+    outcome: &crate::worker::dispatcher::DispatchOutcome,
+    parent_has_acceptance_criteria: bool,
+    workspace_before: Option<&str>,
+    workspace_after: Option<&str>,
+) -> bool {
+    target == DispatchTarget::Execute
+        && orb.parent_id.is_some()
+        && parent_has_acceptance_criteria
+        && outcome.status == crate::worker::dispatcher::DispatchStatus::Error
+        && outcome.terminal_retry.is_some()
+        && workspace_before.is_some_and(|before| Some(before) != workspace_after)
+}
+
+async fn recover_partial_artifact(
+    orb: &Orb,
+    parent_description: &str,
+    failed_outcome: &crate::worker::dispatcher::DispatchOutcome,
+    user_prompt: &str,
+    worker_config: &crate::worker::process::WorkerConfig,
+    system_prompt: &str,
+    hooks: Option<&crate::hooks::HookSink>,
+) -> anyhow::Result<crate::worker::dispatcher::DispatchOutcome> {
+    let mut recovery_config = worker_config.clone();
+    recovery_config.worker_id = Some(uuid::Uuid::new_v4().to_string());
+    recovery_config.max_iterations = Some(
+        recovery_config
+            .max_iterations
+            .unwrap_or(MAX_PARTIAL_ARTIFACT_RECOVERY_ITERATIONS)
+            .clamp(1, MAX_PARTIAL_ARTIFACT_RECOVERY_ITERATIONS),
+    );
+    let failure = failed_outcome
+        .error
+        .as_deref()
+        .unwrap_or("terminal worker retry did not complete");
+    recovery_config.system_prompt = system_prompt.into();
+    let prompt = format!(
+        "Parent acceptance context:\n{parent_description}\n\nAssigned child task:\n{user_prompt}\n\nPrior terminal outcome:\n{failure}"
+    );
+    crate::worker::dispatcher::dispatch_orb_once(orb, &prompt, &recovery_config, hooks).await
+}
+
 /// Owned-argument version of `dispatch_one`, suitable for `tokio::spawn`.
 /// Returns `Ok(true)` when the orb ended at Done, `Ok(false)` otherwise.
 struct DispatchContext<'a> {
@@ -1097,11 +1199,8 @@ async fn dispatch_one_owned(
     );
     let wc = worker_config_for_with_model_config(&orb, &target_base_wc, &system, model_config)
         .map_err(std::io::Error::other)?;
-    let effective_system_prompt = crate::worker::process::effective_system_prompt_for_workdir(
-        &wc.system_prompt,
-        &wc.tools,
-        wc.cwd.as_deref(),
-    );
+    let effective_system_prompt =
+        crate::worker::process::effective_system_prompt(&wc.system_prompt, &wc.tools);
     prompt_context.effective_system_prompt_chars =
         u32::try_from(effective_system_prompt.chars().count()).unwrap_or(u32::MAX);
     tracing::info!(
@@ -1113,6 +1212,10 @@ async fn dispatch_one_owned(
         "dispatching ready orb",
     );
 
+    let workspace_before = match wc.cwd.as_deref() {
+        Some(workdir) => workspace_fingerprint(workdir).await.ok(),
+        None => None,
+    };
     let mut outcome = dispatch_orb(&orb, &user, &wc, hooks.as_deref())
         .await
         .map_err(std::io::Error::other)?;
@@ -1131,7 +1234,7 @@ async fn dispatch_one_owned(
             }
         }
     }
-    let outcome = crate::worker::dispatcher::with_prompt_metadata(
+    let mut outcome = crate::worker::dispatcher::with_prompt_metadata(
         outcome,
         prompt_category.clone(),
         &effective_system_prompt,
@@ -1142,15 +1245,35 @@ async fn dispatch_one_owned(
             &orb,
             prompt_category.clone(),
             outcome.dispatched_at,
-            effective_system_prompt,
-            user,
+            effective_system_prompt.clone(),
+            user.clone(),
             outcome.prompt_tokens,
             prompt_context.clone(),
         ))?;
     }
+    let workspace_after = match wc.cwd.as_deref() {
+        Some(workdir) => workspace_fingerprint(workdir).await.ok(),
+        None => None,
+    };
+    let parent_description = orb.parent_id.as_ref().and_then(|parent_id| {
+        context
+            .orbs
+            .iter()
+            .find(|candidate| &candidate.id == parent_id)
+            .map(|parent| parent.description.as_str())
+    });
+    let recovery_eligible = partial_artifact_recovery_is_eligible(
+        &orb,
+        target,
+        &outcome,
+        parent_description.is_some_and(|description| !description.trim().is_empty()),
+        workspace_before.as_deref(),
+        workspace_after.as_deref(),
+    );
+
     let mut execution_record = crate::execution::ExecutionRecord::from_outcome(
         &orb,
-        prompt_category,
+        prompt_category.clone(),
         target.tool_policy_key(),
         Some(if tool_policy.is_some() {
             "case_override".into()
@@ -1167,7 +1290,79 @@ async fn dispatch_one_owned(
             reason: "initial".into(),
         });
     }
+    if recovery_eligible {
+        execution_record.partial_artifact_recovery =
+            Some(crate::execution::PartialArtifactRecoveryDiagnostic {
+                recovery_attempted: true,
+                workspace_changed: true,
+                workdir: wc
+                    .cwd
+                    .as_ref()
+                    .map_or_else(String::new, |path| path.display().to_string()),
+                initial_error: outcome.error.clone(),
+                recovery_succeeded: false,
+                recovery_artifact_path: None,
+            });
+    }
     execution_store.append(&execution_record)?;
+
+    if recovery_eligible {
+        let recovery_prompt = prompt_resolver
+            .resolve_system_prompt(
+                crate::prompt::PromptKind::Phase("partial_artifact_recovery"),
+                PARTIAL_ARTIFACT_RECOVERY_SYSTEM_PROMPT,
+            )
+            .map_err(std::io::Error::other)?;
+        let recovery_outcome = recover_partial_artifact(
+            &orb,
+            parent_description.unwrap_or_default(),
+            &outcome,
+            &user,
+            &wc,
+            &recovery_prompt.system_prompt,
+            hooks.as_deref(),
+        )
+        .await
+        .map_err(std::io::Error::other)?;
+        let recovery_outcome = crate::worker::dispatcher::with_prompt_metadata(
+            recovery_outcome,
+            format!("{prompt_category}.partial_artifact_recovery"),
+            &crate::worker::process::effective_system_prompt(
+                &recovery_prompt.system_prompt,
+                &wc.tools,
+            ),
+            recovery_prompt.source.label(),
+        );
+        let mut recovery_record = crate::execution::ExecutionRecord::from_outcome(
+            &orb,
+            format!("{}.partial_artifact_recovery", target.tool_policy_key()),
+            target.tool_policy_key(),
+            Some("bounded_partial_artifact_recovery".into()),
+            wc.tools.clone(),
+            &recovery_outcome,
+            None,
+        );
+        recovery_record.partial_artifact_recovery =
+            Some(crate::execution::PartialArtifactRecoveryDiagnostic {
+                recovery_attempted: true,
+                workspace_changed: true,
+                workdir: wc
+                    .cwd
+                    .as_ref()
+                    .map_or_else(String::new, |path| path.display().to_string()),
+                initial_error: outcome.error.clone(),
+                recovery_succeeded: recovery_outcome.status
+                    == crate::worker::dispatcher::DispatchStatus::Done,
+                recovery_artifact_path: recovery_outcome
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| runtime.transcript_path.clone()),
+            });
+        execution_store.append(&recovery_record)?;
+        if recovery_outcome.status == crate::worker::dispatcher::DispatchStatus::Done {
+            outcome = recovery_outcome;
+        }
+    }
 
     apply_dispatch_outcome_with_review(
         &mut orb,
@@ -1231,6 +1426,20 @@ mod tests {
         let orb_store = OrbStore::new(base.join("orbs.jsonl"));
         let dep_store = DepStore::new(base.join("deps.jsonl"));
         (tmp, orb_store, dep_store, base)
+    }
+
+    #[tokio::test]
+    async fn workspace_fingerprint_tracks_artifacts_but_ignores_runtime_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("src.txt"), "before").unwrap();
+        let before = workspace_fingerprint(temp.path()).await.unwrap();
+
+        std::fs::create_dir_all(temp.path().join("target")).unwrap();
+        std::fs::write(temp.path().join("target/runtime.txt"), "ignored").unwrap();
+        assert_eq!(workspace_fingerprint(temp.path()).await.unwrap(), before);
+
+        std::fs::write(temp.path().join("src.txt"), "after").unwrap();
+        assert_ne!(workspace_fingerprint(temp.path()).await.unwrap(), before);
     }
 
     // ── tick with empty store ────────────────────────────────────────

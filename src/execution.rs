@@ -96,6 +96,10 @@ pub struct ExecutionRecord {
     /// structured terminal loop or iteration limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_retry: Option<TerminalRetryDiagnostic>,
+    /// Evidence for a single recovery dispatch after an exhausted terminal
+    /// worker retry left a materially changed workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_artifact_recovery: Option<PartialArtifactRecoveryDiagnostic>,
     /// Every worker attempt, including fresh retries that did not produce a
     /// final successful result. Missing on historical records.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -145,6 +149,25 @@ pub struct PhaseRetryDiagnostic {
     pub reason: String,
 }
 
+/// Attribution for the one bounded recovery pass permitted after a failed
+/// child dispatch has exhausted its terminal worker retry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialArtifactRecoveryDiagnostic {
+    /// The recovery protocol never retries itself.
+    pub recovery_attempted: bool,
+    /// Whether a before/after fingerprint showed a real repository change.
+    pub workspace_changed: bool,
+    /// The assigned repository root inspected by the recovery worker.
+    pub workdir: String,
+    /// The failed dispatch's final error, retained even if recovery succeeds.
+    pub initial_error: Option<String>,
+    /// Whether the recovery worker completed its bounded verification pass.
+    pub recovery_succeeded: bool,
+    /// Transcript/artifact path reported by Heddle for the recovery attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_artifact_path: Option<String>,
+}
+
 impl ExecutionRecord {
     pub fn from_outcome(
         orb: &orbs::orb::Orb,
@@ -189,6 +212,7 @@ impl ExecutionRecord {
             decomposition_repair: None,
             phase_retry: None,
             terminal_retry: outcome.terminal_retry.clone(),
+            partial_artifact_recovery: None,
             attempts: outcome.attempts.clone(),
         }
     }
