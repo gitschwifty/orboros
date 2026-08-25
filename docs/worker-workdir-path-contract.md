@@ -28,17 +28,17 @@ prompt guidance and the existing Heddle sandbox boundary.
 
 ## Benchmark experiment
 
-Run the experiment with a stable base set:
+Create a new private prompt set, for example
+`<bench-root>/prompts/composable-v1.1-workdir-paths/`, by copying the selected
+base composition and adding a versioned workdir-path fragment to the relevant
+roles. Run it explicitly:
 
 ```sh
-orboros bench run --tier 3 --prompt-set composable-v1 \
-  --prompt-experiment workdir-relative-paths
+orboros bench run --tier 3 --prompt-set composable-v1.1-workdir-paths
 ```
 
-Without `--prompt-experiment`, `composable-v1` is loaded unchanged and its
-suite fingerprint remains exactly the base fingerprint. With the switch,
-Orboros derives `composable-v1.1-workdir-paths`, injects the versioned
-experiment fragment into every selected role prompt, and records the derived
-manifest/hash. The marker is stripped before dispatch. Compare matching runs
-with `bench compare` before promoting the guidance to the default runtime
-contract.
+Without a new prompt-set selection, `composable-v1` is loaded unchanged and
+its suite fingerprint remains exactly the base fingerprint. The selected
+private set is copied into run artifacts and receives its own manifest/hash.
+Compare matching runs with `bench compare` before promoting the guidance to
+the default runtime contract.

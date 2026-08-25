@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,34 +61,8 @@ pub struct WorkerConfig {
 /// tools. Heddle control tools may still be visible; this instruction makes
 /// clear that they cannot be used to escape the Orboros capability boundary.
 ///
-/// Benchmark prompt sets can select `<!-- orboros: workdir-relative-paths=on -->`
-/// as a composed fragment. This control marker is stripped before the worker
-/// receives the prompt so an A/B run can measure the path guidance without
-/// changing its task role. Guidance is deliberately off unless an experiment
-/// selects it; promotion to the default runtime contract requires evidence.
-const WORKDIR_PATH_GUIDANCE_ON_MARKER: &str = "<!-- orboros: workdir-relative-paths=on -->";
-
 #[must_use]
 pub fn effective_system_prompt(system_prompt: &str, tools: &[String]) -> String {
-    effective_system_prompt_for_workdir(system_prompt, tools, None)
-}
-
-/// Builds the effective system prompt with explicit repository path guidance.
-///
-/// The worker process is already constrained to `workdir` by its process
-/// current directory and Heddle's tool policy. Naming that directory in the
-/// prompt makes the safe, portable path contract unambiguous: ordinary
-/// repository operations use relative paths, not copied temporary absolute
-/// paths. `None` is retained for callers that deliberately use their inherited
-/// current directory.
-#[must_use]
-pub fn effective_system_prompt_for_workdir(
-    system_prompt: &str,
-    tools: &[String],
-    workdir: Option<&Path>,
-) -> String {
-    let workdir_path_guidance = system_prompt.contains(WORKDIR_PATH_GUIDANCE_ON_MARKER);
-    let system_prompt = system_prompt.replace(WORKDIR_PATH_GUIDANCE_ON_MARKER, "");
     let tools = if tools.is_empty() {
         "none".to_string()
     } else {
@@ -98,25 +72,13 @@ pub fn effective_system_prompt_for_workdir(
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let path_guidance = workdir.map_or_else(
-        || {
-            "Your repository working directory is the process current directory. For normal repository reads, edits, searches, and commands, use relative paths. Do not invent or reuse absolute temporary paths. If a file path fails, re-check the working directory and retry with the repository-relative path when appropriate.".to_string()
-        },
-        |path| format!(
-            "Your repository working directory is `{}`. For normal repository reads, edits, searches, and commands, use paths relative to this directory. Do not invent or reuse absolute temporary paths. Use an absolute path only when the task explicitly requires an approved location outside the repository. If a file path fails, re-check this working directory and retry with the repository-relative path when appropriate.",
-            path.display()
-        ),
-    );
-    let path_section =
-        workdir_path_guidance.then(|| format!("\n\n## Repository paths\n{path_guidance}"));
     format!(
         "{system_prompt}\n\n## Runtime capabilities\n\
 This is a non-interactive worker session: do not call `ask_user` or wait for \
 user input. Your Orboros-permitted repository tools are: {tools}. Do not \
 attempt tools outside that inventory. Do not use subagents or other control \
 tools to obtain capabilities that are not listed; complete the assigned role \
-with the available tools and return the required result.{path_section}",
-        path_section = path_section.unwrap_or_default(),
+with the available tools and return the required result."
     )
 }
 
@@ -276,11 +238,7 @@ impl Worker {
             protocol_version: Some(PROTOCOL_VERSION.into()),
             config: InitConfig {
                 model: config.model.clone(),
-                system_prompt: effective_system_prompt_for_workdir(
-                    &config.system_prompt,
-                    &config.tools,
-                    config.cwd.as_deref(),
-                ),
+                system_prompt: effective_system_prompt(&config.system_prompt, &config.tools),
                 tools: config.tools.clone(),
                 max_iterations: config.max_iterations,
                 task_id: config.task_id.clone(),
@@ -849,32 +807,6 @@ mod tests {
         assert!(prompt.contains("non-interactive"));
         assert!(prompt.contains("`ask_user`"));
         assert!(prompt.contains("subagents"));
-    }
-
-    #[test]
-    fn effective_system_prompt_names_workdir_and_requires_relative_paths() {
-        let prompt = effective_system_prompt_for_workdir(
-            "Base role instructions.\n<!-- orboros: workdir-relative-paths=on -->",
-            &["read_file".into()],
-            Some(Path::new("/private/tmp/assigned-repo")),
-        );
-
-        assert!(prompt.contains("`/private/tmp/assigned-repo`"));
-        assert!(prompt.contains("use paths relative to this directory"));
-        assert!(prompt.contains("Do not invent or reuse absolute temporary paths"));
-        assert!(prompt.contains("retry with the repository-relative path"));
-    }
-
-    #[test]
-    fn effective_system_prompt_strips_benchmark_path_guidance_marker() {
-        let prompt = effective_system_prompt_for_workdir(
-            "Base role instructions.",
-            &[],
-            Some(Path::new("/private/tmp/assigned-repo")),
-        );
-
-        assert!(!prompt.contains("workdir-relative-paths"));
-        assert!(!prompt.contains("## Repository paths"));
     }
 
     fn mock_worker_config() -> WorkerConfig {
