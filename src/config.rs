@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::routing::profile::{validate_profiles, ToolProfile};
 
@@ -85,6 +86,9 @@ pub struct LoggingConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonSettingsConfig {
+    /// Opt into supervisor-owned user-local state instead of direct worktree
+    /// `.orbs` writes. Disabled until the supervisor authority is running.
+    pub shared_state: bool,
     pub pid_file: Option<String>,
     pub log_file: Option<String>,
     pub log_max_size: Option<u64>,
@@ -961,6 +965,36 @@ impl ProjectEntry {
     pub fn runnable_path(&self) -> Option<&Path> {
         self.path.as_deref().or(self.root_dir.as_deref())
     }
+
+    /// Stable user-local directory name for shared runtime state.
+    ///
+    /// A readable prefix aids operators while the project-name hash prevents
+    /// path traversal and collisions between punctuation variants.
+    #[must_use]
+    pub fn state_key(&self) -> String {
+        let readable: String = self
+            .name
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let hash = Sha256::digest(self.name.as_bytes());
+        format!("{readable}-{:x}", hash)[..readable.len() + 13].to_string()
+    }
+
+    /// Returns the user-local authoritative state home for this project.
+    #[must_use]
+    pub fn shared_state_dir(&self, home: &Path) -> PathBuf {
+        home.join(".orboros")
+            .join("projects")
+            .join(self.state_key())
+            .join("state")
+    }
 }
 
 /// A registered project with a usable `.orbs` state directory.
@@ -1169,6 +1203,7 @@ mod tests {
         assert!(cfg.review.review_on_completion);
         assert!(cfg.notification.enabled);
         assert!(!cfg.notification.desktop_enabled);
+        assert!(!cfg.daemon.shared_state);
         assert_eq!(cfg.second_opinion.mode, SecondOpinionMode::Off);
         assert!((cfg.second_opinion.confidence_threshold - 0.7).abs() < f32::EPSILON);
         assert!((cfg.second_opinion.sampling_rate - 0.1).abs() < f32::EPSILON);
@@ -1966,6 +2001,7 @@ system = "project speccing"
                 file: Some("/tmp/orboros-general.log".into()),
             },
             daemon: DaemonSettingsConfig {
+                shared_state: true,
                 pid_file: Some("/tmp/orboros.pid".into()),
                 log_file: Some("/tmp/orboros.log".into()),
                 log_max_size: Some(42),
@@ -1990,6 +2026,22 @@ system = "project speccing"
         assert_eq!(projects.len(), 2);
         assert_eq!(projects[0].name, "alpha");
         assert_eq!(projects[1].name, "beta");
+    }
+
+    #[test]
+    fn project_entry_shared_state_dir_is_stable_and_safe() {
+        let project = ProjectEntry {
+            name: "feature/a b".into(),
+            path: None,
+            root_dir: None,
+            created_at: Utc::now(),
+        };
+
+        assert_eq!(project.state_key(), "feature_a_b-13250f2ab119");
+        assert_eq!(
+            project.shared_state_dir(Path::new("/tmp/home")),
+            Path::new("/tmp/home/.orboros/projects/feature_a_b-13250f2ab119/state")
+        );
     }
 
     #[test]
