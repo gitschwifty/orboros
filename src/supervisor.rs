@@ -268,6 +268,53 @@ pub enum AttachOutcome {
     AlreadyAttached,
 }
 
+/// A request accepted by the user-level supervisor control plane.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SupervisorRequest {
+    Attach {
+        project: ProjectEntry,
+    },
+    Detach {
+        project_name: String,
+    },
+    Status {
+        project_name: String,
+    },
+    Mutate {
+        project_name: String,
+        operation: StateOperation,
+    },
+}
+
+/// A typed response returned by the supervisor control plane.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SupervisorResponse {
+    Attached { outcome: AttachOutcomeWire },
+    Detached { detached: bool },
+    Status { revision: u64 },
+    Accepted { receipt: StateReceipt },
+    Rejected { code: String, detail: String },
+}
+
+/// Wire-safe representation of the attachment outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachOutcomeWire {
+    Attached,
+    AlreadyAttached,
+}
+
+impl From<AttachOutcome> for AttachOutcomeWire {
+    fn from(value: AttachOutcome) -> Self {
+        match value {
+            AttachOutcome::Attached => Self::Attached,
+            AttachOutcome::AlreadyAttached => Self::AlreadyAttached,
+        }
+    }
+}
+
 impl LocalSupervisor {
     /// Creates an empty local supervisor registry rooted at this user's home.
     #[must_use]
@@ -304,10 +351,59 @@ impl LocalSupervisor {
         self.projects.get(project_name)
     }
 
+    /// Handles one typed supervisor request synchronously.
+    pub fn handle(&mut self, request: SupervisorRequest) -> SupervisorResponse {
+        match request {
+            SupervisorRequest::Attach { project } => match self.attach(project) {
+                Ok(outcome) => SupervisorResponse::Attached {
+                    outcome: outcome.into(),
+                },
+                Err(error) => rejected(&error),
+            },
+            SupervisorRequest::Detach { project_name } => SupervisorResponse::Detached {
+                detached: self.detach(&project_name).is_some(),
+            },
+            SupervisorRequest::Status { project_name } => self.project(&project_name).map_or_else(
+                || SupervisorResponse::Rejected {
+                    code: "project_not_attached".into(),
+                    detail: project_name,
+                },
+                |authority| SupervisorResponse::Status {
+                    revision: authority.revision(),
+                },
+            ),
+            SupervisorRequest::Mutate {
+                project_name,
+                operation,
+            } => match self.projects.get_mut(&project_name) {
+                Some(authority) => match authority.accept(operation) {
+                    Ok(receipt) => SupervisorResponse::Accepted { receipt },
+                    Err(error) => rejected(&error),
+                },
+                None => SupervisorResponse::Rejected {
+                    code: "project_not_attached".into(),
+                    detail: project_name,
+                },
+            },
+        }
+    }
+
     /// Returns the number of currently attached projects.
     #[must_use]
     pub fn project_count(&self) -> usize {
         self.projects.len()
+    }
+}
+
+fn rejected(error: &ProjectAuthorityError) -> SupervisorResponse {
+    let code = match error {
+        ProjectAuthorityError::RevisionConflict { .. } => "revision_conflict",
+        ProjectAuthorityError::Lease(ProjectLeaseError::Busy { .. }) => "project_busy",
+        ProjectAuthorityError::Lease(_) | ProjectAuthorityError::Journal(_) => "supervisor_error",
+    };
+    SupervisorResponse::Rejected {
+        code: code.into(),
+        detail: error.to_string(),
     }
 }
 
@@ -628,5 +724,36 @@ mod tests {
             }
         ));
         assert_eq!(authority.accept(accepted.operation).unwrap().revision, 1);
+    }
+
+    #[test]
+    fn supervisor_control_plane_attaches_and_serializes_mutations() {
+        let home = tempfile::tempdir().unwrap();
+        let mut supervisor = LocalSupervisor::new(home.path().to_path_buf());
+
+        assert_eq!(
+            supervisor.handle(SupervisorRequest::Attach {
+                project: project("alpha"),
+            }),
+            SupervisorResponse::Attached {
+                outcome: AttachOutcomeWire::Attached
+            }
+        );
+        let accepted = supervisor.handle(SupervisorRequest::Mutate {
+            project_name: "alpha".into(),
+            operation: operation(uuid::Uuid::new_v4(), "create_orb"),
+        });
+        assert!(matches!(
+            accepted,
+            SupervisorResponse::Accepted {
+                receipt: StateReceipt { revision: 1, .. }
+            }
+        ));
+        assert_eq!(
+            supervisor.handle(SupervisorRequest::Status {
+                project_name: "alpha".into(),
+            }),
+            SupervisorResponse::Status { revision: 1 }
+        );
     }
 }
