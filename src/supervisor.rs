@@ -488,23 +488,12 @@ impl SupervisorStoreWriter {
         }
     }
 
-    fn submit(&self, mutation: SharedStateMutation) -> io::Result<()> {
+    fn submit(&self, mutation: SharedStateMutation, base_revision: Option<u64>) -> io::Result<u64> {
         const MAX_CONFLICT_RETRIES: u8 = 4;
         for _ in 0..MAX_CONFLICT_RETRIES {
-            let revision = match self.request(SupervisorRequest::Status {
-                project_name: self.project_name.clone(),
-            })? {
-                SupervisorResponse::Status { revision } => revision,
-                SupervisorResponse::Rejected { code, detail } => {
-                    return Err(io::Error::other(format!(
-                        "supervisor rejected status ({code}): {detail}"
-                    )));
-                }
-                other => {
-                    return Err(io::Error::other(format!(
-                        "unexpected supervisor status response: {other:?}"
-                    )))
-                }
+            let revision = match base_revision {
+                Some(revision) => revision,
+                None => self.snapshot_revision()?,
             };
             let operation =
                 StateOperation::mutation(uuid::Uuid::new_v4(), revision, mutation.clone());
@@ -512,9 +501,17 @@ impl SupervisorStoreWriter {
                 project_name: self.project_name.clone(),
                 operation,
             })? {
-                SupervisorResponse::Accepted { .. } => return Ok(()),
-                SupervisorResponse::Rejected { code, .. } if code == "revision_conflict" => {
+                SupervisorResponse::Accepted { receipt } => return Ok(receipt.revision),
+                SupervisorResponse::Rejected { code, .. }
+                    if code == "revision_conflict" && base_revision.is_none() =>
+                {
                     continue
+                }
+                SupervisorResponse::Rejected { code, detail } if code == "revision_conflict" => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!("shared state changed since it was read: {detail}"),
+                    ));
                 }
                 SupervisorResponse::Rejected { code, detail } => {
                     return Err(io::Error::other(format!(
@@ -550,17 +547,45 @@ impl SupervisorStoreWriter {
         }
         serde_json::from_str(&response).map_err(io::Error::other)
     }
+
+    fn snapshot_revision(&self) -> io::Result<u64> {
+        match self.request(SupervisorRequest::Status {
+            project_name: self.project_name.clone(),
+        })? {
+            SupervisorResponse::Status { revision } => Ok(revision),
+            SupervisorResponse::Rejected { code, detail } => Err(io::Error::other(format!(
+                "supervisor rejected status ({code}): {detail}"
+            ))),
+            other => Err(io::Error::other(format!(
+                "unexpected supervisor status response: {other:?}"
+            ))),
+        }
+    }
 }
 
 impl OrbWriteSink for SupervisorStoreWriter {
-    fn write_orb(&self, orb: &Orb) -> io::Result<()> {
-        self.submit(SharedStateMutation::UpsertOrb { orb: orb.clone() })
+    fn snapshot_revision(&self) -> io::Result<u64> {
+        SupervisorStoreWriter::snapshot_revision(self)
+    }
+
+    fn write_orb(&self, orb: &Orb, base_revision: Option<u64>) -> io::Result<u64> {
+        self.submit(
+            SharedStateMutation::UpsertOrb { orb: orb.clone() },
+            base_revision,
+        )
     }
 }
 
 impl DepWriteSink for SupervisorStoreWriter {
-    fn write_edge(&self, edge: &DepEdge) -> io::Result<()> {
-        self.submit(SharedStateMutation::UpsertDependency { edge: edge.clone() })
+    fn snapshot_revision(&self) -> io::Result<u64> {
+        SupervisorStoreWriter::snapshot_revision(self)
+    }
+
+    fn write_edge(&self, edge: &DepEdge, base_revision: Option<u64>) -> io::Result<u64> {
+        self.submit(
+            SharedStateMutation::UpsertDependency { edge: edge.clone() },
+            base_revision,
+        )
     }
 }
 
@@ -1253,7 +1278,7 @@ mod tests {
 
         let writer = SupervisorStoreWriter::new(socket, "alpha".into());
         let orb = Orb::new("shared writer", "must use the authority");
-        tokio::task::spawn_blocking(move || writer.write_orb(&orb))
+        tokio::task::spawn_blocking(move || writer.write_orb(&orb, None))
             .await
             .unwrap()
             .unwrap();
