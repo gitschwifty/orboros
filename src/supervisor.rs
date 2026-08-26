@@ -178,6 +178,10 @@ pub enum OperationJournalError {
 /// Failures while rebuilding the materialized JSONL state from the journal.
 #[derive(Debug, Error)]
 pub enum StateProjectionError {
+    #[error("failed to read legacy orb projection: {0}")]
+    ReadLegacyOrb(#[source] io::Error),
+    #[error("failed to read legacy dependency projection: {0}")]
+    ReadLegacy(String),
     #[error("operation {operation_id} has invalid {kind} mutation payload: {source}")]
     InvalidMutation {
         operation_id: uuid::Uuid,
@@ -647,6 +651,12 @@ impl LocalSupervisor {
         self.projects.get(project_name)
     }
 
+    /// Returns mutable access to an attached project authority for supervisor
+    /// startup recovery and migration work.
+    pub fn project_mut(&mut self, project_name: &str) -> Option<&mut ProjectStateAuthority> {
+        self.projects.get_mut(project_name)
+    }
+
     /// Handles one typed supervisor request synchronously.
     pub fn handle(&mut self, request: SupervisorRequest) -> SupervisorResponse {
         match request {
@@ -788,6 +798,44 @@ impl ProjectStateAuthority {
             self.projection.apply(&self.state_dir, &receipt)?;
         }
         Ok(())
+    }
+
+    /// Imports an existing isolated `.orbs` projection exactly once.
+    ///
+    /// Migration is deliberately allowed only before this authority has
+    /// accepted any operation. Each imported latest-value record enters the
+    /// journal normally, giving the shared state an auditable recovery trail.
+    pub fn import_legacy_projection(
+        &mut self,
+        legacy_dir: &Path,
+    ) -> Result<usize, ProjectAuthorityError> {
+        if self.revision() != 0 {
+            return Ok(0);
+        }
+        let orbs = orbs::orb_store::OrbStore::new(legacy_dir.join("orbs.jsonl"))
+            .load_all_including_tombstoned()
+            .map_err(StateProjectionError::ReadLegacyOrb)?;
+        let edges = orbs::dep_store::DepStore::new(legacy_dir.join("deps.jsonl"))
+            .all_edges()
+            .map_err(|error| StateProjectionError::ReadLegacy(error.to_string()))?;
+        let mut imported = 0;
+        for orb in orbs {
+            self.accept(StateOperation::mutation(
+                uuid::Uuid::new_v4(),
+                self.revision(),
+                SharedStateMutation::UpsertOrb { orb },
+            ))?;
+            imported += 1;
+        }
+        for edge in edges {
+            self.accept(StateOperation::mutation(
+                uuid::Uuid::new_v4(),
+                self.revision(),
+                SharedStateMutation::UpsertDependency { edge },
+            ))?;
+            imported += 1;
+        }
+        Ok(imported)
     }
 }
 
@@ -1172,6 +1220,30 @@ mod tests {
         assert!(matches!(error, ProjectAuthorityError::Projection(_)));
         assert_eq!(authority.revision(), 0);
         assert!(!authority.state_dir().join("projection-revision").exists());
+    }
+
+    #[test]
+    fn authority_imports_an_isolated_projection_once() {
+        let home = tempfile::tempdir().unwrap();
+        let legacy = tempfile::tempdir().unwrap();
+        let orb = Orb::new("legacy orb", "preserve this state");
+        orbs::orb_store::OrbStore::new(legacy.path().join("orbs.jsonl"))
+            .append(&orb)
+            .unwrap();
+
+        let mut authority =
+            ProjectStateAuthority::attach(home.path(), project("alpha"), 1).unwrap();
+        assert_eq!(
+            authority.import_legacy_projection(legacy.path()).unwrap(),
+            1
+        );
+        assert_eq!(authority.revision(), 1);
+        assert_eq!(
+            authority.import_legacy_projection(legacy.path()).unwrap(),
+            0
+        );
+        let shared = orbs::orb_store::OrbStore::new(authority.state_dir().join("orbs.jsonl"));
+        assert_eq!(shared.load_all().unwrap()[0].id, orb.id);
     }
 
     #[test]

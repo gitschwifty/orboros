@@ -1638,6 +1638,7 @@ fn cmd_supervisor_start(
     let mut projects = Vec::with_capacity(registered.len());
     for project in registered {
         let entry = project.entry;
+        let legacy_state_dir = project.state_dir;
         let project_config = config::load_config(entry.config_root())?;
         let shared_state = project_config.daemon.shared_state;
         let project_state_dir = if shared_state {
@@ -1645,13 +1646,24 @@ fn cmd_supervisor_start(
             supervisor
                 .attach(entry.clone())
                 .map_err(anyhow::Error::from)?;
+            let imported = supervisor
+                .project_mut(&entry.name)
+                .expect("newly attached project is present")
+                .import_legacy_projection(&legacy_state_dir)
+                .map_err(anyhow::Error::from)?;
+            if imported > 0 {
+                println!(
+                    "  migrated {imported} existing state record(s) for {}",
+                    entry.name
+                );
+            }
             supervisor
                 .project(&entry.name)
                 .expect("newly attached project is present")
                 .state_dir()
                 .to_path_buf()
         } else {
-            project.state_dir
+            legacy_state_dir
         };
         let writer = shared_state.then(|| {
             Arc::new(SupervisorStoreWriter::new(
