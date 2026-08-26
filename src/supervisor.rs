@@ -370,11 +370,11 @@ pub struct ProjectStateAuthority {
 }
 
 /// The project registry owned by one user-level supervisor process.
-#[derive(Debug)]
 pub struct LocalSupervisor {
     home: PathBuf,
     next_epoch: u64,
     projects: HashMap<String, ProjectStateAuthority>,
+    queues: HashMap<String, crate::queue_loop::QueueLoop>,
 }
 
 /// Result of an idempotent project attachment request.
@@ -632,6 +632,7 @@ impl LocalSupervisor {
             home,
             next_epoch: 1,
             projects: HashMap::new(),
+            queues: HashMap::new(),
         }
     }
 
@@ -652,6 +653,9 @@ impl LocalSupervisor {
 
     /// Detaches a project and releases its writer lease.
     pub fn detach(&mut self, project_name: &str) -> Option<ProjectStateAuthority> {
+        if let Some(queue) = self.queues.remove(project_name) {
+            queue.stop();
+        }
         self.projects.remove(project_name)
     }
 
@@ -669,10 +673,13 @@ impl LocalSupervisor {
     /// Handles one typed supervisor request synchronously.
     pub fn handle(&mut self, request: SupervisorRequest) -> SupervisorResponse {
         match request {
-            SupervisorRequest::Attach { project } => match self.attach(project) {
-                Ok(outcome) => SupervisorResponse::Attached {
-                    outcome: outcome.into(),
-                },
+            SupervisorRequest::Attach { project } => match self.attach(project.clone()) {
+                Ok(outcome) => {
+                    self.ensure_queue(&project.name);
+                    SupervisorResponse::Attached {
+                        outcome: outcome.into(),
+                    }
+                }
                 Err(error) => rejected(&error),
             },
             SupervisorRequest::Detach { project_name } => SupervisorResponse::Detached {
@@ -707,6 +714,37 @@ impl LocalSupervisor {
     #[must_use]
     pub fn project_count(&self) -> usize {
         self.projects.len()
+    }
+
+    fn ensure_queue(&mut self, project_name: &str) {
+        if self.queues.contains_key(project_name) {
+            return;
+        }
+        let Some(authority) = self.projects.get(project_name) else {
+            return;
+        };
+        let state_dir = authority.state_dir().to_path_buf();
+        let writer = Arc::new(SupervisorStoreWriter::new(
+            control_socket_path(&self.home),
+            project_name.into(),
+        ));
+        let queue = crate::queue_loop::QueueLoop::new(
+            orbs::orb_store::OrbStore::new(state_dir.join("orbs.jsonl"))
+                .with_write_sink(writer.clone()),
+            orbs::dep_store::DepStore::new(state_dir.join("deps.jsonl")).with_write_sink(writer),
+            state_dir,
+        );
+        self.queues.insert(project_name.into(), queue);
+    }
+
+    /// Advances queues added by live control-plane attachment.
+    pub async fn tick_attached_queues(&mut self) {
+        for (name, queue) in &mut self.queues {
+            if let Err(error) = queue.tick_async().await {
+                tracing::error!(project = %name, %error, "dynamically attached project tick failed");
+            }
+            queue.fire_on_queue_tick().await;
+        }
     }
 }
 

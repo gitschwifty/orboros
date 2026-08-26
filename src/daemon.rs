@@ -275,6 +275,9 @@ pub async fn run_supervisor_with_control_socket(
     );
     let mut shutdown_rx = setup_signal_handlers();
     let tick_interval = std::time::Duration::from_millis(config.tick_interval_ms);
+    let control_supervisor = control_socket
+        .as_ref()
+        .map(|(_, supervisor)| std::sync::Arc::clone(supervisor));
     let control_server = control_socket.map(|(listener, supervisor)| {
         tokio::spawn(crate::supervisor::serve_local_socket(listener, supervisor))
     });
@@ -291,6 +294,9 @@ pub async fn run_supervisor_with_control_socket(
             () = tokio::time::sleep(tick_interval) => {
                 if let Err(error) = rotate_log(&config) { tracing::warn!(%error, "log rotation failed"); }
                 tick_supervised_projects(&projects).await;
+                if let Some(supervisor) = &control_supervisor {
+                    supervisor.lock().await.tick_attached_queues().await;
+                }
             }
         }
     }
