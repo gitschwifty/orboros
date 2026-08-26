@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use orbs::dep::{DepEdge, EdgeType};
 use orbs::dep_store::DepStore;
 use orbs::orb::{Orb, OrbPhase, OrbType};
 use orbs::orb_store::OrbStore;
@@ -16,6 +17,77 @@ pub struct PlanConfig {
     pub shallow: bool,
     /// If set, read the task description from this file.
     pub file: Option<PathBuf>,
+}
+
+/// Builds the records for a shallow plan without opening a store.
+///
+/// Shared-state callers submit the returned records as one supervisor
+/// operation; unlike the historical pipeline implementation this cannot leave
+/// a partially-created plan visible after a concurrent mutation or crash.
+pub fn build_shared_plan(
+    title: &str,
+    description: &str,
+) -> anyhow::Result<(Orb, Vec<Orb>, Vec<DepEdge>)> {
+    let mut epic = Orb::new(title, description).with_type(OrbType::Epic);
+    epic.set_phase(OrbPhase::Speccing)
+        .map_err(|e| anyhow::anyhow!("speccing transition rejected: {e}"))?;
+    epic.set_phase(OrbPhase::Decomposing)
+        .map_err(|e| anyhow::anyhow!("decomposing transition rejected: {e}"))?;
+
+    let lines: Vec<&str> = description
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let subtasks: Vec<(String, String)> = if lines.len() > 1 {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                (
+                    format!("{title} - subtask {}", index + 1),
+                    (*line).to_owned(),
+                )
+            })
+            .collect()
+    } else {
+        vec![(format!("{title} - implementation"), description.to_owned())]
+    };
+    let mut children = Vec::with_capacity(subtasks.len());
+    let mut edges = Vec::new();
+    for (index, (child_title, child_description)) in subtasks.into_iter().enumerate() {
+        let child_id = epic.id.child(u32::try_from(index + 1).unwrap_or(u32::MAX));
+        let mut child = Orb::new(&child_title, &child_description).with_type(OrbType::Task);
+        child.id = child_id.clone();
+        child.parent_id = Some(epic.id.clone());
+        child.root_id = Some(epic.id.clone());
+        edges.push(DepEdge::new(
+            epic.id.clone(),
+            child_id.clone(),
+            EdgeType::Parent,
+        ));
+        edges.push(DepEdge::new(
+            child_id.clone(),
+            epic.id.clone(),
+            EdgeType::Child,
+        ));
+        if index > 0 {
+            edges.push(DepEdge::new(
+                child_id,
+                epic.id.child(u32::try_from(index).unwrap_or(u32::MAX)),
+                EdgeType::DependsOn,
+            ));
+        }
+        children.push(child);
+    }
+    epic.set_phase(OrbPhase::Refining)
+        .map_err(|e| anyhow::anyhow!("refining transition rejected: {e}"))?;
+    Ok((epic, children, edges))
+}
+
+/// Parses plan text in the same format accepted by `--file`.
+pub fn parse_plan_text(content: &str) -> anyhow::Result<(String, String)> {
+    parse_plan_file(content)
 }
 
 /// Creates a plan: an epic orb with shallow decomposition into child orbs.

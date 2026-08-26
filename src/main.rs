@@ -813,9 +813,6 @@ fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&state_dir)?;
 
     match cli.command {
-        Commands::Run { .. } if shared_project.is_some() => anyhow::bail!(
-            "`orboros run` is not yet available in shared-state mode; start the shared supervisor and use `orboros orb create` instead"
-        ),
         Commands::Run {
             task,
             priority,
@@ -833,9 +830,7 @@ fn main() -> anyhow::Result<()> {
             max_ticks,
             interval_ms,
             cli.skip_prereq_check,
-        ),
-        Commands::Execute { .. } if shared_project.is_some() => anyhow::bail!(
-            "`orboros execute` is not yet available in shared-state mode; the supervisor queue dispatches shared orbs"
+            shared_project.as_ref(),
         ),
         Commands::Execute {
             id,
@@ -852,15 +847,19 @@ fn main() -> anyhow::Result<()> {
             max_ticks,
             interval_ms,
             cli.skip_prereq_check,
-        ),
-        Commands::Plan { .. } if shared_project.is_some() => anyhow::bail!(
-            "`orboros plan` is not yet available in shared-state mode; it would bypass the authoritative writer"
+            shared_project.as_ref(),
         ),
         Commands::Plan {
             description,
             file,
             shallow,
-        } => cmd_plan(&state_dir, description.as_deref(), file.as_deref(), shallow),
+        } => cmd_plan(
+            &state_dir,
+            description.as_deref(),
+            file.as_deref(),
+            shallow,
+            shared_project.as_ref(),
+        ),
         Commands::Init => cmd_init(),
         Commands::Config { action } => cmd_config(action, effective_state.project_dir.as_deref()),
         Commands::Daemon {
@@ -902,18 +901,23 @@ fn main() -> anyhow::Result<()> {
             let shared_writer = shared_project.as_ref().map(|project| {
                 std::sync::Arc::new(orboros::supervisor::SupervisorStoreWriter::new(
                     orboros::supervisor::control_socket_path(
-                        &dirs::home_dir().expect("shared-state configuration requires a home directory"),
+                        &dirs::home_dir()
+                            .expect("shared-state configuration requires a home directory"),
                     ),
                     project.name.clone(),
                 ))
             });
             let orb_store = shared_writer.as_ref().map_or_else(
                 || OrbStore::new(state_dir.join("orbs.jsonl")),
-                |writer| OrbStore::new(state_dir.join("orbs.jsonl")).with_write_sink(writer.clone()),
+                |writer| {
+                    OrbStore::new(state_dir.join("orbs.jsonl")).with_write_sink(writer.clone())
+                },
             );
             let dep_store = shared_writer.as_ref().map_or_else(
                 || DepStore::new(state_dir.join("deps.jsonl")),
-                |writer| DepStore::new(state_dir.join("deps.jsonl")).with_write_sink(writer.clone()),
+                |writer| {
+                    DepStore::new(state_dir.join("deps.jsonl")).with_write_sink(writer.clone())
+                },
             );
             let project_cwd = std::env::current_dir().unwrap_or_else(|_| state_dir.clone());
             let hooks = orboros::hooks::HookSink::from_state_dir(&state_dir, &project_cwd)
@@ -1385,9 +1389,24 @@ fn foreground_worker_config(
 fn foreground_queue_with_project(
     state_dir: &std::path::Path,
     project_dir: Option<&std::path::Path>,
+    shared_project: Option<&config::ProjectEntry>,
 ) -> QueueLoop {
-    let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
-    let dep_store = DepStore::new(state_dir.join("deps.jsonl"));
+    let writer = shared_project.map(|project| {
+        std::sync::Arc::new(orboros::supervisor::SupervisorStoreWriter::new(
+            orboros::supervisor::control_socket_path(
+                &dirs::home_dir().expect("shared-state configuration requires a home directory"),
+            ),
+            project.name.clone(),
+        ))
+    });
+    let orb_store = writer.as_ref().map_or_else(
+        || OrbStore::new(state_dir.join("orbs.jsonl")),
+        |writer| OrbStore::new(state_dir.join("orbs.jsonl")).with_write_sink(writer.clone()),
+    );
+    let dep_store = writer.as_ref().map_or_else(
+        || DepStore::new(state_dir.join("deps.jsonl")),
+        |writer| DepStore::new(state_dir.join("deps.jsonl")).with_write_sink(writer.clone()),
+    );
     let project_cwd = project_dir
         .map(Path::to_path_buf)
         .or_else(|| std::env::current_dir().ok())
@@ -1434,8 +1453,20 @@ fn cmd_run_orb(
     max_ticks: u32,
     interval_ms: u64,
     skip_prereq_check: bool,
+    shared_project: Option<&config::ProjectEntry>,
 ) -> anyhow::Result<()> {
-    let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
+    let writer = shared_project.map(|project| {
+        std::sync::Arc::new(orboros::supervisor::SupervisorStoreWriter::new(
+            orboros::supervisor::control_socket_path(
+                &dirs::home_dir().expect("shared-state configuration requires a home directory"),
+            ),
+            project.name.clone(),
+        ))
+    });
+    let orb_store = writer.as_ref().map_or_else(
+        || OrbStore::new(state_dir.join("orbs.jsonl")),
+        |writer| OrbStore::new(state_dir.join("orbs.jsonl")).with_write_sink(writer.clone()),
+    );
     let mut orb = Orb::new(description, description).with_type(OrbType::Task);
     orb.priority = priority;
     orb_store
@@ -1451,7 +1482,7 @@ fn cmd_run_orb(
 
     let worker_config =
         foreground_worker_config(project_dir, worker_binary, model, skip_prereq_check)?;
-    let queue = foreground_queue_with_project(state_dir, project_dir);
+    let queue = foreground_queue_with_project(state_dir, project_dir, shared_project);
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(queue.drain_target(
         &orb.id,
@@ -1479,11 +1510,12 @@ fn cmd_execute_orb(
     max_ticks: u32,
     interval_ms: u64,
     skip_prereq_check: bool,
+    shared_project: Option<&config::ProjectEntry>,
 ) -> anyhow::Result<()> {
     let target_id = OrbId::from_raw(id);
     let worker_config =
         foreground_worker_config(project_dir, worker_binary, model, skip_prereq_check)?;
-    let queue = foreground_queue_with_project(state_dir, project_dir);
+    let queue = foreground_queue_with_project(state_dir, project_dir, shared_project);
     let rt = tokio::runtime::Runtime::new()?;
     let result = rt.block_on(queue.drain_target(
         &target_id,
@@ -1505,7 +1537,49 @@ fn cmd_plan(
     description: Option<&str>,
     file: Option<&std::path::Path>,
     shallow: bool,
+    shared_project: Option<&config::ProjectEntry>,
 ) -> anyhow::Result<()> {
+    if let Some(project) = shared_project {
+        let content = match (description, file) {
+            (_, Some(path)) => std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("failed to read plan file {}: {e}", path.display()))?,
+            (Some(description), None) => description.to_owned(),
+            (None, None) => anyhow::bail!("Provide a description or use --file <path>"),
+        };
+        let (title, body) = if file.is_some() {
+            plan::parse_plan_text(&content)?
+        } else if let Some((first, rest)) = content.split_once('\n') {
+            (first.trim().to_owned(), rest.trim().to_owned())
+        } else {
+            (content.clone(), content)
+        };
+        let (epic, children, edges) = plan::build_shared_plan(&title, &body)?;
+        let mut mutations = Vec::with_capacity(1 + children.len() + edges.len());
+        mutations.push(orboros::supervisor::SharedStateMutation::UpsertOrb { orb: epic.clone() });
+        mutations.extend(
+            children
+                .into_iter()
+                .map(|orb| orboros::supervisor::SharedStateMutation::UpsertOrb { orb }),
+        );
+        mutations.extend(
+            edges
+                .into_iter()
+                .map(|edge| orboros::supervisor::SharedStateMutation::UpsertDependency { edge }),
+        );
+        let writer = orboros::supervisor::SupervisorStoreWriter::new(
+            orboros::supervisor::control_socket_path(
+                &dirs::home_dir().expect("shared-state configuration requires a home directory"),
+            ),
+            project.name.clone(),
+        );
+        writer
+            .submit_batch(mutations)
+            .map_err(|e| anyhow::anyhow!("failed to submit shared plan: {e}"))?;
+        let store = OrbStore::new(state_dir.join("orbs.jsonl"));
+        let deps = DepStore::new(state_dir.join("deps.jsonl"));
+        plan::print_plan_tree(&store, &deps, &epic);
+        return Ok(());
+    }
     let config = PlanConfig {
         shallow,
         file: file.map(PathBuf::from),

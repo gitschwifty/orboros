@@ -104,6 +104,10 @@ pub enum SharedStateMutation {
     UpsertOrb { orb: Orb },
     /// Create or replace the latest record for one dependency edge.
     UpsertDependency { edge: DepEdge },
+    /// Apply several related changes as one authoritative operation. This is
+    /// used for composite intents such as creating a decomposed plan, so a
+    /// reader never observes only part of that intent.
+    Batch { mutations: Vec<SharedStateMutation> },
 }
 
 impl StateOperation {
@@ -535,6 +539,11 @@ impl SupervisorStoreWriter {
         ))
     }
 
+    /// Submit related mutations as one revisioned, replayable operation.
+    pub fn submit_batch(&self, mutations: Vec<SharedStateMutation>) -> io::Result<u64> {
+        self.submit(SharedStateMutation::Batch { mutations }, None)
+    }
+
     fn request(&self, request: SupervisorRequest) -> io::Result<SupervisorResponse> {
         let mut stream = StdUnixStream::connect(&self.socket_path)?;
         let row = serde_json::to_vec(&request).map_err(io::Error::other)?;
@@ -871,14 +880,7 @@ impl StateProjection {
     }
 
     fn apply(&self, state_dir: &Path, receipt: &StateReceipt) -> Result<(), StateProjectionError> {
-        match receipt.operation.shared_mutation()? {
-            SharedStateMutation::UpsertOrb { orb } => {
-                append_materialized(&state_dir.join("orbs.jsonl"), &orb)?;
-            }
-            SharedStateMutation::UpsertDependency { edge } => {
-                append_materialized(&state_dir.join("deps.jsonl"), &edge)?;
-            }
-        }
+        self.apply_mutation(state_dir, receipt.operation.shared_mutation()?)?;
         let path = Self::watermark_path(state_dir);
         let mut file = OpenOptions::new()
             .create(true)
@@ -893,6 +895,27 @@ impl StateProjection {
             .and_then(|()| file.write_all(b"\n"))
             .and_then(|()| file.sync_data())
             .map_err(|source| StateProjectionError::Write { path, source })
+    }
+
+    fn apply_mutation(
+        &self,
+        state_dir: &Path,
+        mutation: SharedStateMutation,
+    ) -> Result<(), StateProjectionError> {
+        match mutation {
+            SharedStateMutation::UpsertOrb { orb } => {
+                append_materialized(&state_dir.join("orbs.jsonl"), &orb)?;
+            }
+            SharedStateMutation::UpsertDependency { edge } => {
+                append_materialized(&state_dir.join("deps.jsonl"), &edge)?;
+            }
+            SharedStateMutation::Batch { mutations } => {
+                for mutation in mutations {
+                    self.apply_mutation(state_dir, mutation)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1010,6 +1033,9 @@ fn write_metadata(
 
 #[cfg(test)]
 mod tests {
+    use orbs::dep_store::DepStore;
+    use orbs::orb_store::OrbStore;
+
     use super::*;
 
     fn metadata(project_id: &str, epoch: u64) -> ProjectLeaseMetadata {
@@ -1274,6 +1300,64 @@ mod tests {
                 project_name: "alpha".into(),
             }),
             SupervisorResponse::Status { revision: 1 }
+        );
+    }
+
+    #[test]
+    fn batch_projection_replays_all_records_as_one_revision() {
+        let home = tempfile::tempdir().unwrap();
+        let mut supervisor = LocalSupervisor::new(home.path().to_path_buf());
+        supervisor.attach(project("batch")).unwrap();
+        let parent = Orb::new("parent", "parent");
+        let child = Orb::new("child", "child");
+        let edge = DepEdge::new(
+            parent.id.clone(),
+            child.id.clone(),
+            orbs::dep::EdgeType::Parent,
+        );
+        let response = supervisor.handle(SupervisorRequest::Mutate {
+            project_name: "batch".into(),
+            operation: StateOperation::mutation(
+                uuid::Uuid::new_v4(),
+                0,
+                SharedStateMutation::Batch {
+                    mutations: vec![
+                        SharedStateMutation::UpsertOrb {
+                            orb: parent.clone(),
+                        },
+                        SharedStateMutation::UpsertOrb { orb: child.clone() },
+                        SharedStateMutation::UpsertDependency { edge: edge.clone() },
+                    ],
+                },
+            ),
+        });
+        assert!(
+            matches!(response, SupervisorResponse::Accepted { ref receipt } if receipt.revision == 1)
+        );
+
+        let state_dir = supervisor
+            .project("batch")
+            .unwrap()
+            .state_dir()
+            .to_path_buf();
+        assert_eq!(
+            OrbStore::new(state_dir.join("orbs.jsonl"))
+                .load_all()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            DepStore::new(state_dir.join("deps.jsonl"))
+                .all_edges()
+                .unwrap(),
+            vec![edge]
+        );
+        assert_eq!(
+            std::fs::read_to_string(state_dir.join("projection-revision"))
+                .unwrap()
+                .trim(),
+            "1"
         );
     }
 
