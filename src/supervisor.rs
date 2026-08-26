@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Seek, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -19,7 +20,9 @@ use tokio::sync::Mutex;
 
 use crate::config::ProjectEntry;
 use orbs::dep::DepEdge;
+use orbs::dep_store::DepWriteSink;
 use orbs::orb::Orb;
+use orbs::orb_store::OrbWriteSink;
 
 /// Metadata written by the process that currently owns a project state lease.
 ///
@@ -463,6 +466,102 @@ pub async fn request_local_socket(
         io::Error::new(io::ErrorKind::UnexpectedEof, "supervisor closed response")
     })?;
     serde_json::from_str(&line).map_err(io::Error::other)
+}
+
+/// Blocking writer used by the synchronous CLI and queue storage APIs.
+///
+/// It is installed only for shared state. Every write discovers the current
+/// revision then submits a typed operation; a concurrent client causes a
+/// bounded retry with a fresh revision rather than a direct JSONL fallback.
+#[derive(Debug, Clone)]
+pub struct SupervisorStoreWriter {
+    socket_path: PathBuf,
+    project_name: String,
+}
+
+impl SupervisorStoreWriter {
+    #[must_use]
+    pub fn new(socket_path: PathBuf, project_name: String) -> Self {
+        Self {
+            socket_path,
+            project_name,
+        }
+    }
+
+    fn submit(&self, mutation: SharedStateMutation) -> io::Result<()> {
+        const MAX_CONFLICT_RETRIES: u8 = 4;
+        for _ in 0..MAX_CONFLICT_RETRIES {
+            let revision = match self.request(SupervisorRequest::Status {
+                project_name: self.project_name.clone(),
+            })? {
+                SupervisorResponse::Status { revision } => revision,
+                SupervisorResponse::Rejected { code, detail } => {
+                    return Err(io::Error::other(format!(
+                        "supervisor rejected status ({code}): {detail}"
+                    )));
+                }
+                other => {
+                    return Err(io::Error::other(format!(
+                        "unexpected supervisor status response: {other:?}"
+                    )))
+                }
+            };
+            let operation =
+                StateOperation::mutation(uuid::Uuid::new_v4(), revision, mutation.clone());
+            match self.request(SupervisorRequest::Mutate {
+                project_name: self.project_name.clone(),
+                operation,
+            })? {
+                SupervisorResponse::Accepted { .. } => return Ok(()),
+                SupervisorResponse::Rejected { code, .. } if code == "revision_conflict" => {
+                    continue
+                }
+                SupervisorResponse::Rejected { code, detail } => {
+                    return Err(io::Error::other(format!(
+                        "supervisor rejected mutation ({code}): {detail}"
+                    )));
+                }
+                other => {
+                    return Err(io::Error::other(format!(
+                        "unexpected supervisor mutation response: {other:?}"
+                    )))
+                }
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "shared state remained contended after four retries",
+        ))
+    }
+
+    fn request(&self, request: SupervisorRequest) -> io::Result<SupervisorResponse> {
+        let mut stream = StdUnixStream::connect(&self.socket_path)?;
+        let row = serde_json::to_vec(&request).map_err(io::Error::other)?;
+        stream.write_all(&row)?;
+        stream.write_all(b"\n")?;
+        stream.flush()?;
+        let mut response = String::new();
+        BufReader::new(stream).read_line(&mut response)?;
+        if response.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "supervisor closed response",
+            ));
+        }
+        serde_json::from_str(&response).map_err(io::Error::other)
+    }
+}
+
+impl OrbWriteSink for SupervisorStoreWriter {
+    fn write_orb(&self, orb: &Orb) -> io::Result<()> {
+        self.submit(SharedStateMutation::UpsertOrb { orb: orb.clone() })
+    }
+}
+
+impl DepWriteSink for SupervisorStoreWriter {
+    fn write_edge(&self, edge: &DepEdge) -> io::Result<()> {
+        self.submit(SharedStateMutation::UpsertDependency { edge: edge.clone() })
+    }
 }
 
 async fn serve_connection(
@@ -1132,6 +1231,42 @@ mod tests {
                 outcome: AttachOutcomeWire::Attached
             }
         );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn store_writer_serializes_orb_updates_through_the_supervisor() {
+        let home = tempfile::tempdir().unwrap();
+        let socket = control_socket_path(home.path());
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let supervisor = Arc::new(Mutex::new(LocalSupervisor::new(home.path().to_path_buf())));
+        let task = tokio::spawn(serve_local_socket(listener, Arc::clone(&supervisor)));
+        request_local_socket(
+            &socket,
+            &SupervisorRequest::Attach {
+                project: project("alpha"),
+            },
+        )
+        .await
+        .unwrap();
+
+        let writer = SupervisorStoreWriter::new(socket, "alpha".into());
+        let orb = Orb::new("shared writer", "must use the authority");
+        tokio::task::spawn_blocking(move || writer.write_orb(&orb))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let state_dir = supervisor
+            .lock()
+            .await
+            .project("alpha")
+            .unwrap()
+            .state_dir()
+            .to_path_buf();
+        let stored = orbs::orb_store::OrbStore::new(state_dir.join("orbs.jsonl"));
+        assert_eq!(stored.load_all().unwrap().len(), 1);
         task.abort();
     }
 }

@@ -254,6 +254,19 @@ pub async fn tick_supervised_projects(projects: &[SupervisedProject]) {
 /// A failed queue or worker setup in one project is logged and does not prevent
 /// the remaining projects from receiving their tick.
 pub async fn run_supervisor(config: DaemonConfig, projects: Vec<SupervisedProject>) -> Result<()> {
+    run_supervisor_with_control_socket(config, projects, None).await
+}
+
+/// Runs the supervisor and, when supplied, serves its authoritative local
+/// shared-state control socket for the lifetime of the daemon.
+pub async fn run_supervisor_with_control_socket(
+    config: DaemonConfig,
+    projects: Vec<SupervisedProject>,
+    control_socket: Option<(
+        tokio::net::UnixListener,
+        std::sync::Arc<tokio::sync::Mutex<crate::supervisor::LocalSupervisor>>,
+    )>,
+) -> Result<()> {
     write_pid_file(&config).context("failed to write PID file")?;
     tracing::info!(
         pid = std::process::id(),
@@ -262,6 +275,9 @@ pub async fn run_supervisor(config: DaemonConfig, projects: Vec<SupervisedProjec
     );
     let mut shutdown_rx = setup_signal_handlers();
     let tick_interval = std::time::Duration::from_millis(config.tick_interval_ms);
+    let control_server = control_socket.map(|(listener, supervisor)| {
+        tokio::spawn(crate::supervisor::serve_local_socket(listener, supervisor))
+    });
 
     loop {
         tokio::select! {
@@ -280,6 +296,9 @@ pub async fn run_supervisor(config: DaemonConfig, projects: Vec<SupervisedProjec
     }
     if let Err(error) = remove_pid_file(&config) {
         tracing::warn!(%error, "failed to remove PID file");
+    }
+    if let Some(server) = control_server {
+        server.abort();
     }
     tracing::info!("supervisor daemon stopped");
     Ok(())

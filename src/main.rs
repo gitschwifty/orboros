@@ -599,6 +599,34 @@ fn project_log_file(
     ))
 }
 
+/// Resolves the registered project whose runtime state is explicitly shared.
+///
+/// Shared state is opt-in and only available to registered projects. This
+/// prevents an unrelated worktree that happens to contain `.orbs/` from
+/// silently attaching to a user's authoritative state home.
+fn shared_state_project(
+    project_dir: Option<&Path>,
+) -> anyhow::Result<Option<config::ProjectEntry>> {
+    let Some(project_dir) = project_dir else {
+        return Ok(None);
+    };
+    if !config::load_config(Some(project_dir))?.daemon.shared_state {
+        return Ok(None);
+    }
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+    config::list_projects(&home)?
+        .into_iter()
+        .find(|entry| entry.config_root() == Some(project_dir))
+        .map_or_else(
+            || anyhow::bail!(
+                "shared state is enabled for {}, but this project is not registered; run `orboros init` from the project root first",
+                project_dir.display()
+            ),
+            |entry| Ok(Some(entry)),
+        )
+}
+
 fn supervisor_log_file() -> anyhow::Result<PathBuf> {
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
@@ -696,7 +724,15 @@ fn main() -> anyhow::Result<()> {
         std::env::set_var("ORBOROS_CONFIG_PATH", config_path);
     }
     let effective_state = resolve_effective_state_dir(&cli.state_dir);
-    let state_dir = effective_state.state_dir;
+    let shared_project = shared_state_project(effective_state.project_dir.as_deref())?;
+    let state_dir = shared_project.as_ref().map_or_else(
+        || effective_state.state_dir.clone(),
+        |project| {
+            let home =
+                dirs::home_dir().expect("shared-state configuration requires a home directory");
+            project.shared_state_dir(&home)
+        },
+    );
 
     let (project_logging, global_logging) =
         config::load_logging_config_sources(effective_state.project_dir.as_deref())?;
@@ -777,6 +813,9 @@ fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&state_dir)?;
 
     match cli.command {
+        Commands::Run { .. } if shared_project.is_some() => anyhow::bail!(
+            "`orboros run` is not yet available in shared-state mode; start the shared supervisor and use `orboros orb create` instead"
+        ),
         Commands::Run {
             task,
             priority,
@@ -795,6 +834,9 @@ fn main() -> anyhow::Result<()> {
             interval_ms,
             cli.skip_prereq_check,
         ),
+        Commands::Execute { .. } if shared_project.is_some() => anyhow::bail!(
+            "`orboros execute` is not yet available in shared-state mode; the supervisor queue dispatches shared orbs"
+        ),
         Commands::Execute {
             id,
             wait,
@@ -810,6 +852,9 @@ fn main() -> anyhow::Result<()> {
             max_ticks,
             interval_ms,
             cli.skip_prereq_check,
+        ),
+        Commands::Plan { .. } if shared_project.is_some() => anyhow::bail!(
+            "`orboros plan` is not yet available in shared-state mode; it would bypass the authoritative writer"
         ),
         Commands::Plan {
             description,
@@ -854,8 +899,22 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Orb { action } => {
-            let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
-            let dep_store = DepStore::new(state_dir.join("deps.jsonl"));
+            let shared_writer = shared_project.as_ref().map(|project| {
+                std::sync::Arc::new(orboros::supervisor::SupervisorStoreWriter::new(
+                    orboros::supervisor::control_socket_path(
+                        &dirs::home_dir().expect("shared-state configuration requires a home directory"),
+                    ),
+                    project.name.clone(),
+                ))
+            });
+            let orb_store = shared_writer.as_ref().map_or_else(
+                || OrbStore::new(state_dir.join("orbs.jsonl")),
+                |writer| OrbStore::new(state_dir.join("orbs.jsonl")).with_write_sink(writer.clone()),
+            );
+            let dep_store = shared_writer.as_ref().map_or_else(
+                || DepStore::new(state_dir.join("deps.jsonl")),
+                |writer| DepStore::new(state_dir.join("deps.jsonl")).with_write_sink(writer.clone()),
+            );
             let project_cwd = std::env::current_dir().unwrap_or_else(|_| state_dir.clone());
             let hooks = orboros::hooks::HookSink::from_state_dir(&state_dir, &project_cwd)
                 .unwrap_or_else(|e| {
@@ -1546,6 +1605,8 @@ fn cmd_supervisor_start(
     selected_project: Option<&str>,
 ) -> anyhow::Result<()> {
     use orboros::daemon::SupervisedProject;
+    use orboros::supervisor::{control_socket_path, LocalSupervisor, SupervisorStoreWriter};
+    use std::sync::Arc;
     let (registered, skipped) = config::registered_project_state_dirs(home)?;
     for project in skipped {
         let path = project
@@ -1571,12 +1632,46 @@ fn cmd_supervisor_start(
         }
     }
 
+    let socket_path = control_socket_path(home);
+    let shared_supervisor = Arc::new(tokio::sync::Mutex::new(LocalSupervisor::new(home.into())));
+    let mut has_shared_state = false;
     let mut projects = Vec::with_capacity(registered.len());
     for project in registered {
         let entry = project.entry;
-        let project_state_dir = project.state_dir;
-        let orb_store = OrbStore::new(project_state_dir.join("orbs.jsonl"));
-        let dep_store = DepStore::new(project_state_dir.join("deps.jsonl"));
+        let project_config = config::load_config(entry.config_root())?;
+        let shared_state = project_config.daemon.shared_state;
+        let project_state_dir = if shared_state {
+            let mut supervisor = shared_supervisor.blocking_lock();
+            supervisor
+                .attach(entry.clone())
+                .map_err(anyhow::Error::from)?;
+            supervisor
+                .project(&entry.name)
+                .expect("newly attached project is present")
+                .state_dir()
+                .to_path_buf()
+        } else {
+            project.state_dir
+        };
+        let writer = shared_state.then(|| {
+            Arc::new(SupervisorStoreWriter::new(
+                socket_path.clone(),
+                entry.name.clone(),
+            ))
+        });
+        let orb_store = writer.as_ref().map_or_else(
+            || OrbStore::new(project_state_dir.join("orbs.jsonl")),
+            |writer| {
+                OrbStore::new(project_state_dir.join("orbs.jsonl")).with_write_sink(writer.clone())
+            },
+        );
+        let dep_store = writer.as_ref().map_or_else(
+            || DepStore::new(project_state_dir.join("deps.jsonl")),
+            |writer| {
+                DepStore::new(project_state_dir.join("deps.jsonl")).with_write_sink(writer.clone())
+            },
+        );
+        has_shared_state |= shared_state;
         let mut queue = QueueLoop::new(orb_store, dep_store, project_state_dir.clone());
         let project_cwd = entry
             .runnable_path()
@@ -1586,11 +1681,10 @@ fn cmd_supervisor_start(
         {
             queue = queue.with_hooks(sink);
         }
-        let project_max_concurrency =
-            config::load_config(Some(&project_state_dir))?.max_concurrency;
+        let project_max_concurrency = project_config.max_concurrency;
         let dispatch = match orboros::worker::dispatcher::default_worker_config(
             Some(home),
-            Some(&project_state_dir),
+            entry.config_root(),
         ) {
             Ok(base_worker_config) => Some(orboros::daemon::DispatchSettings {
                 base_worker_config,
@@ -1611,8 +1705,31 @@ fn cmd_supervisor_start(
         "Starting supervisor for {} registered project(s)...",
         projects.len()
     );
+    let control_socket = if has_shared_state {
+        if socket_path.exists() {
+            anyhow::bail!(
+                "shared-state supervisor socket already exists at {}; stop the existing supervisor before starting another",
+                socket_path.display()
+            );
+        }
+        std::fs::create_dir_all(socket_path.parent().expect("socket has parent"))?;
+        Some((
+            tokio::net::UnixListener::bind(&socket_path)?,
+            Arc::clone(&shared_supervisor),
+        ))
+    } else {
+        None
+    };
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(orboros::daemon::run_supervisor(daemon_config, projects))
+    let result = rt.block_on(orboros::daemon::run_supervisor_with_control_socket(
+        daemon_config,
+        projects,
+        control_socket,
+    ));
+    if has_shared_state && socket_path.exists() {
+        std::fs::remove_file(&socket_path)?;
+    }
+    result
 }
 
 fn cmd_daemon_stop(daemon_config: &DaemonConfig) -> anyhow::Result<()> {

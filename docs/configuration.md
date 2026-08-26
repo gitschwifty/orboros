@@ -228,7 +228,10 @@ packaged template defines `read_only`, `research`, `test`, `edit`, and
   `orboros=debug,tokio=warn`) and `file` for foreground command logs. The
   global `--log-level` and `--log-file` flags override these settings.
 - `[daemon]`: optional `pid_file`, `log_file`, `log_max_size`, and
-  `tick_interval_ms` process settings. Project `max_concurrency` controls that
+  `tick_interval_ms` process settings. Set `shared_state = true` only for a
+  registered project that is run by the shared supervisor; its orb and
+  dependency writes then go through the local authority rather than the
+  worktree `.orbs` files. Project `max_concurrency` controls that
   project's dispatch cap; explicit daemon CLI flags override these settings.
   Without a configured file, a multi-project supervisor appends to
   `~/.orboros/supervisor.log`; a daemon targeted to one project appends
