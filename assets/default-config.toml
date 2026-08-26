@@ -40,6 +40,11 @@ desktop_enabled = false
 # level = "orboros=info,heddle=warn"
 # file = "/absolute/path/to/orboros.log"
 
+[workers]
+# Retry attempts after the first failure. 0 disables retries; -1 retries
+# retryable failures with capped exponential backoff until the process stops.
+retries = 1
+
 [daemon]
 # pid_file = "/absolute/path/to/orboros.pid"
 # log_file = "/absolute/path/to/orboros.log"

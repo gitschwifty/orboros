@@ -29,6 +29,7 @@ pub struct OrbConfig {
     pub second_opinion: SecondOpinionConfig,
     pub notification: NotificationConfig,
     pub logging: LoggingConfig,
+    pub workers: WorkerSettingsConfig,
     pub daemon: DaemonSettingsConfig,
 }
 
@@ -64,6 +65,7 @@ impl Default for OrbConfig {
             second_opinion: SecondOpinionConfig::default(),
             notification: NotificationConfig::default(),
             logging: LoggingConfig::default(),
+            workers: WorkerSettingsConfig::default(),
             daemon: DaemonSettingsConfig::default(),
         }
     }
@@ -78,6 +80,32 @@ pub struct LoggingConfig {
     pub level: Option<String>,
     /// Append foreground command logs to this path.
     pub file: Option<String>,
+}
+
+/// Retry policy for worker dispatches. Values count retries after the first
+/// attempt; `-1` means unlimited retries with capped exponential backoff.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkerSettingsConfig {
+    pub retries: i32,
+}
+
+impl Default for WorkerSettingsConfig {
+    fn default() -> Self {
+        Self { retries: 1 }
+    }
+}
+
+impl WorkerSettingsConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.retries < -1 {
+            return Err(format!(
+                "workers.retries must be -1 or a non-negative count; got {}",
+                self.retries
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Optional daemon process settings. Worker dispatch concurrency remains the
@@ -854,6 +882,7 @@ pub(crate) fn load_config_with_home_and_bench(
         .validate()
         .map_err(|e| anyhow::anyhow!(e))?;
     config.models.validate().map_err(|e| anyhow::anyhow!(e))?;
+    config.workers.validate().map_err(|e| anyhow::anyhow!(e))?;
     validate_profiles(&config.tool_profiles).map_err(|e| anyhow::anyhow!(e))?;
     Ok(config)
 }
@@ -1204,11 +1233,20 @@ mod tests {
         assert!(cfg.notification.enabled);
         assert!(!cfg.notification.desktop_enabled);
         assert!(!cfg.daemon.shared_state);
+        assert_eq!(cfg.workers.retries, 1);
         assert_eq!(cfg.second_opinion.mode, SecondOpinionMode::Off);
         assert!((cfg.second_opinion.confidence_threshold - 0.7).abs() < f32::EPSILON);
         assert!((cfg.second_opinion.sampling_rate - 0.1).abs() < f32::EPSILON);
         assert!(cfg.second_opinion.reviewer_model.is_none());
         assert_eq!(cfg.config_version, current_config_version());
+    }
+
+    #[test]
+    fn worker_retries_validation_accepts_disabled_finite_and_unlimited() {
+        for retries in [0, 3, -1] {
+            assert!(WorkerSettingsConfig { retries }.validate().is_ok());
+        }
+        assert!(WorkerSettingsConfig { retries: -2 }.validate().is_err());
     }
 
     #[test]
@@ -2000,6 +2038,7 @@ system = "project speccing"
                 level: Some("orboros=debug".into()),
                 file: Some("/tmp/orboros-general.log".into()),
             },
+            workers: WorkerSettingsConfig { retries: -1 },
             daemon: DaemonSettingsConfig {
                 shared_state: true,
                 pid_file: Some("/tmp/orboros.pid".into()),

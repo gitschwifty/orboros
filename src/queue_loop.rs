@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use std::collections::HashMap;
 
@@ -15,6 +16,20 @@ use tracing::{debug, instrument};
 const MAX_PARTIAL_ARTIFACT_RECOVERY_ITERATIONS: u32 = 8;
 const PARTIAL_ARTIFACT_RECOVERY_SYSTEM_PROMPT: &str =
     include_str!("../assets/prompts/recover-partial-artifact.md");
+const COMPLETED_DISPATCH_RETRY_INITIAL: Duration = Duration::from_millis(250);
+const COMPLETED_DISPATCH_RETRY_MAX: Duration = Duration::from_secs(30);
+
+fn completed_dispatch_retry_allowed(configured_retries: i32, retries_completed: u32) -> bool {
+    configured_retries == -1
+        || u32::try_from(configured_retries).is_ok_and(|limit| retries_completed < limit)
+}
+
+fn completed_dispatch_retry_backoff(retries_completed: u32) -> Duration {
+    COMPLETED_DISPATCH_RETRY_INITIAL
+        .checked_mul(1_u32 << retries_completed.min(7))
+        .unwrap_or(COMPLETED_DISPATCH_RETRY_MAX)
+        .min(COMPLETED_DISPATCH_RETRY_MAX)
+}
 
 /// Result of a single tick of the queue loop.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1216,9 +1231,31 @@ async fn dispatch_one_owned(
         Some(workdir) => workspace_fingerprint(workdir).await.ok(),
         None => None,
     };
-    let mut outcome = dispatch_orb(&orb, &user, &wc, hooks.as_deref())
-        .await
-        .map_err(std::io::Error::other)?;
+    // This is intentionally above the dispatcher's fixed provider/transport
+    // retry. A configured retry repeats a completed failed orb/phase attempt;
+    // malformed-output, provider, and bounded-recovery behavior inside one
+    // attempt remains unconditional.
+    let mut completed_retries = 0_u32;
+    let mut outcome = loop {
+        let outcome = dispatch_orb(&orb, &user, &wc, hooks.as_deref())
+            .await
+            .map_err(std::io::Error::other)?;
+        let failed = matches!(
+            outcome.status,
+            crate::worker::dispatcher::DispatchStatus::Error
+                | crate::worker::dispatcher::DispatchStatus::Failed
+        );
+        if !failed
+            || !completed_dispatch_retry_allowed(model_config.workers.retries, completed_retries)
+        {
+            break outcome;
+        }
+        let backoff = completed_dispatch_retry_backoff(completed_retries);
+        completed_retries = completed_retries.saturating_add(1);
+        tracing::warn!(orb = %orb.id, retry = completed_retries, backoff_ms = backoff.as_millis(), "retrying completed failed orb dispatch");
+        tokio::time::sleep(backoff).await;
+    };
+    outcome.retries = outcome.retries.saturating_add(completed_retries);
     if outcome.status == crate::worker::dispatcher::DispatchStatus::Done
         && target == DispatchTarget::Decomposing
         && model_config.models.coordinator_model_choice
@@ -1426,6 +1463,15 @@ mod tests {
         let orb_store = OrbStore::new(base.join("orbs.jsonl"));
         let dep_store = DepStore::new(base.join("deps.jsonl"));
         (tmp, orb_store, dep_store, base)
+    }
+
+    #[test]
+    fn completed_dispatch_retry_policy_handles_disabled_finite_and_unlimited() {
+        assert!(!completed_dispatch_retry_allowed(0, 0));
+        assert!(completed_dispatch_retry_allowed(2, 0));
+        assert!(completed_dispatch_retry_allowed(2, 1));
+        assert!(!completed_dispatch_retry_allowed(2, 2));
+        assert!(completed_dispatch_retry_allowed(-1, 10_000));
     }
 
     #[tokio::test]
