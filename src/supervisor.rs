@@ -1372,6 +1372,21 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_supervisor_writer_fails_without_local_fallback() {
+        let home = tempfile::tempdir().unwrap();
+        let socket = control_socket_path(home.path());
+        let writer = SupervisorStoreWriter::new(socket, "missing".into());
+        let error = writer
+            .write_orb(&Orb::new("must not fall back", "shared mode"), None)
+            .unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+        ));
+        assert!(!home.path().join("orbs.jsonl").exists());
+    }
+
+    #[test]
     fn batch_projection_replays_all_records_as_one_revision() {
         let home = tempfile::tempdir().unwrap();
         let mut supervisor = LocalSupervisor::new(home.path().to_path_buf());
