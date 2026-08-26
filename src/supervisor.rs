@@ -758,22 +758,25 @@ impl LocalSupervisor {
         self.dispatch.insert(project_name.into(), dispatch);
     }
 
-    /// Advances queues added by live control-plane attachment.
-    pub async fn tick_attached_queues(&mut self) {
-        for (name, queue) in &mut self.queues {
-            if let Err(error) = queue.tick_async().await {
-                tracing::error!(project = %name, %error, "dynamically attached project tick failed");
-            }
-            if let Some(Some(settings)) = self.dispatch.get(name) {
-                if let Err(error) = queue
-                    .dispatch_ready_orbs(&settings.base_worker_config, settings.max_concurrency)
-                    .await
-                {
-                    tracing::error!(project = %name, %error, "dynamically attached project dispatch failed");
-                }
-            }
-            queue.fire_on_queue_tick().await;
-        }
+    pub fn take_attached_queues(
+        &mut self,
+    ) -> (
+        HashMap<String, crate::queue_loop::QueueLoop>,
+        HashMap<String, Option<crate::daemon::DispatchSettings>>,
+    ) {
+        (
+            std::mem::take(&mut self.queues),
+            std::mem::take(&mut self.dispatch),
+        )
+    }
+
+    pub fn restore_attached_queues(
+        &mut self,
+        queues: HashMap<String, crate::queue_loop::QueueLoop>,
+        dispatch: HashMap<String, Option<crate::daemon::DispatchSettings>>,
+    ) {
+        self.queues.extend(queues);
+        self.dispatch.extend(dispatch);
     }
 }
 

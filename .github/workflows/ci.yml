@@ -26,5 +26,15 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
 
-      - name: Run tests
-        run: cargo test --workspace --locked
+      - name: Run parallel-safe tests
+        run: >-
+          cargo test --workspace --locked
+          --skip supervisor::tests::local_socket_serves_typed_supervisor_requests
+          --skip supervisor::tests::local_socket_client_surfaces_typed_responses
+          --skip supervisor::tests::store_writer_serializes_orb_updates_through_the_supervisor
+
+      - name: Run Unix-socket supervisor tests serially
+        run: |
+          cargo test --workspace --locked supervisor::tests::local_socket_serves_typed_supervisor_requests -- --test-threads=1
+          cargo test --workspace --locked supervisor::tests::local_socket_client_surfaces_typed_responses -- --test-threads=1
+          cargo test --workspace --locked supervisor::tests::store_writer_serializes_orb_updates_through_the_supervisor -- --test-threads=1

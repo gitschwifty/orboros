@@ -295,7 +295,20 @@ pub async fn run_supervisor_with_control_socket(
                 if let Err(error) = rotate_log(&config) { tracing::warn!(%error, "log rotation failed"); }
                 tick_supervised_projects(&projects).await;
                 if let Some(supervisor) = &control_supervisor {
-                    supervisor.lock().await.tick_attached_queues().await;
+                    let (mut queues, dispatch) = supervisor.lock().await.take_attached_queues();
+                    for (name, queue) in &mut queues {
+                        if let Err(error) = queue.tick_async().await {
+                            tracing::error!(project = %name, %error, "dynamically attached project tick failed");
+                            continue;
+                        }
+                        if let Some(Some(settings)) = dispatch.get(name) {
+                            if let Err(error) = queue.dispatch_ready_orbs(&settings.base_worker_config, settings.max_concurrency).await {
+                                tracing::error!(project = %name, %error, "dynamically attached project dispatch failed");
+                            }
+                        }
+                        queue.fire_on_queue_tick().await;
+                    }
+                    supervisor.lock().await.restore_attached_queues(queues, dispatch);
                 }
             }
         }
