@@ -375,6 +375,7 @@ pub struct LocalSupervisor {
     next_epoch: u64,
     projects: HashMap<String, ProjectStateAuthority>,
     queues: HashMap<String, crate::queue_loop::QueueLoop>,
+    dispatch: HashMap<String, Option<crate::daemon::DispatchSettings>>,
 }
 
 /// Result of an idempotent project attachment request.
@@ -633,6 +634,7 @@ impl LocalSupervisor {
             next_epoch: 1,
             projects: HashMap::new(),
             queues: HashMap::new(),
+            dispatch: HashMap::new(),
         }
     }
 
@@ -656,6 +658,7 @@ impl LocalSupervisor {
         if let Some(queue) = self.queues.remove(project_name) {
             queue.stop();
         }
+        self.dispatch.remove(project_name);
         self.projects.remove(project_name)
     }
 
@@ -716,6 +719,11 @@ impl LocalSupervisor {
         self.projects.len()
     }
 
+    #[cfg(test)]
+    fn queue_count(&self) -> usize {
+        self.queues.len()
+    }
+
     fn ensure_queue(&mut self, project_name: &str) {
         if self.queues.contains_key(project_name) {
             return;
@@ -735,6 +743,19 @@ impl LocalSupervisor {
             state_dir,
         );
         self.queues.insert(project_name.into(), queue);
+        let dispatch = crate::worker::dispatcher::default_worker_config(
+            Some(&self.home),
+            authority.project().config_root(),
+        )
+        .map(|base_worker_config| crate::daemon::DispatchSettings {
+            base_worker_config,
+            max_concurrency: crate::config::load_config(authority.project().config_root())
+                .map(|config| config.max_concurrency)
+                .unwrap_or(1),
+        })
+        .map_err(|error| tracing::warn!(project = %project_name, %error, "dynamic project dispatch disabled"))
+        .ok();
+        self.dispatch.insert(project_name.into(), dispatch);
     }
 
     /// Advances queues added by live control-plane attachment.
@@ -742,6 +763,14 @@ impl LocalSupervisor {
         for (name, queue) in &mut self.queues {
             if let Err(error) = queue.tick_async().await {
                 tracing::error!(project = %name, %error, "dynamically attached project tick failed");
+            }
+            if let Some(Some(settings)) = self.dispatch.get(name) {
+                if let Err(error) = queue
+                    .dispatch_ready_orbs(&settings.base_worker_config, settings.max_concurrency)
+                    .await
+                {
+                    tracing::error!(project = %name, %error, "dynamically attached project dispatch failed");
+                }
             }
             queue.fire_on_queue_tick().await;
         }
@@ -1323,6 +1352,7 @@ mod tests {
                 outcome: AttachOutcomeWire::Attached
             }
         );
+        assert_eq!(supervisor.queue_count(), 1);
         let accepted = supervisor.handle(SupervisorRequest::Mutate {
             project_name: "alpha".into(),
             operation: operation(uuid::Uuid::new_v4()),

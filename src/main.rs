@@ -1613,7 +1613,15 @@ fn cmd_daemon_start(
     project: Option<&str>,
     requested_state_dir: &str,
 ) -> anyhow::Result<()> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
+    let supervisor_mode = project.is_some() || requested_state_dir == DEFAULT_STATE_DIR;
     if orboros::daemon::is_running(&daemon_config) {
+        if supervisor_mode {
+            if let Some(project_name) = project {
+                return cmd_supervisor_attach(&home, project_name);
+            }
+        }
         let pid = orboros::daemon::read_pid_file(&daemon_config)?;
         anyhow::bail!(
             "Daemon is already running (PID {}). Use --stop first.",
@@ -1621,9 +1629,6 @@ fn cmd_daemon_start(
         );
     }
 
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-    let supervisor_mode = project.is_some() || requested_state_dir == DEFAULT_STATE_DIR;
     if supervisor_mode {
         return cmd_supervisor_start(&home, daemon_config, project);
     }
@@ -1671,6 +1676,33 @@ fn cmd_daemon_start(
     rt.block_on(orboros::daemon::run_daemon(daemon_config, queue, dispatch))?;
 
     Ok(())
+}
+
+fn cmd_supervisor_attach(home: &Path, project_name: &str) -> anyhow::Result<()> {
+    let (registered, _) = config::registered_project_state_dirs(home)?;
+    let project = registered
+        .into_iter()
+        .find(|project| project.entry.name == project_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!("Registered project {project_name:?} was not initialized")
+        })?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let response = runtime.block_on(orboros::supervisor::request_local_socket(
+        &orboros::supervisor::control_socket_path(home),
+        &orboros::supervisor::SupervisorRequest::Attach {
+            project: project.entry,
+        },
+    ))?;
+    match response {
+        orboros::supervisor::SupervisorResponse::Attached { outcome } => {
+            println!("Supervisor project {project_name}: {outcome:?}");
+            Ok(())
+        }
+        orboros::supervisor::SupervisorResponse::Rejected { code, detail } => {
+            anyhow::bail!("supervisor rejected attachment ({code}): {detail}")
+        }
+        response => anyhow::bail!("unexpected supervisor attachment response: {response:?}"),
+    }
 }
 
 fn cmd_supervisor_start(
