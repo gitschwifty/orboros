@@ -578,9 +578,15 @@ pub fn with_prompt_metadata(
 }
 
 /// Mutates `orb` in place based on the dispatch outcome. Sets
-/// `result`, `confidence`, and `execution` on Done outcomes;
-/// records error in `result` on Failed outcomes; transitions the
-/// orb's status or phase per its type.
+/// `result` and `confidence` on Done outcomes; records error in
+/// `result` on Failed outcomes; transitions the orb's status or
+/// phase per its type.
+///
+/// `Orb.execution` is an in-flight dispatch marker for phase orbs, not their
+/// durable attempt history. A successful non-terminal phase transition clears
+/// it so the next phase is eligible for dispatch. The queue persists detailed
+/// attempt records separately in `executions.jsonl` before applying this
+/// outcome.
 ///
 /// `Aborted` is a no-op — the orb is left exactly as the caller
 /// passed it. Callers can detect abort via the returned outcome.
@@ -646,6 +652,13 @@ pub fn apply_dispatch_outcome_with_review(
                     next_phase_on_dispatch_success(orb.phase)
                 };
                 orb.set_phase(next)?;
+                if !next.is_terminal() {
+                    // A completed phase must not keep looking like an active
+                    // dispatch. `dispatch_target_for` deliberately excludes
+                    // phase orbs with this marker, so retaining it would
+                    // permanently strand the next lifecycle step.
+                    orb.execution = None;
+                }
             } else {
                 orb.set_status(OrbStatus::Done)?;
             }
@@ -893,6 +906,57 @@ mod tests {
         o.phase = Some(OrbPhase::Executing);
         apply_dispatch_outcome(&mut o, &done_outcome()).unwrap();
         assert_eq!(o.phase, Some(OrbPhase::Done));
+        assert!(
+            o.execution.is_some(),
+            "terminal completion retains final worker attribution"
+        );
+    }
+
+    #[test]
+    fn successful_nonterminal_phase_transitions_clear_the_dispatch_marker() {
+        let transitions = [
+            (OrbPhase::Speccing, OrbPhase::Decomposing),
+            (OrbPhase::Decomposing, OrbPhase::Refining),
+            (OrbPhase::Refining, OrbPhase::Review),
+            (OrbPhase::Reevaluating, OrbPhase::Executing),
+        ];
+
+        for (kind_name, orb_type) in [("feature", OrbType::Feature), ("epic", OrbType::Epic)] {
+            for (current, expected_next) in transitions {
+                let mut orb = Orb::new(kind_name, "x").with_type(orb_type.clone());
+                // Each case isolates the dispatcher completion boundary. The
+                // transition table itself is exercised by the production call
+                // to `set_phase`; setting the source lets this table cover
+                // every worker-driven lifecycle edge without unrelated setup.
+                orb.phase = Some(current);
+
+                apply_dispatch_outcome(&mut orb, &done_outcome()).unwrap();
+
+                assert_eq!(
+                    orb.phase,
+                    Some(expected_next),
+                    "{kind_name} from {current:?}"
+                );
+                assert!(
+                    orb.execution.is_none(),
+                    "{kind_name} {current:?} completion must leave {expected_next:?} dispatchable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reviewed_execution_completion_clears_marker_for_review_gate() {
+        let mut orb = Orb::new("Feature", "x").with_type(OrbType::Feature);
+        orb.phase = Some(OrbPhase::Executing);
+
+        apply_dispatch_outcome_with_review(&mut orb, &done_outcome(), true).unwrap();
+
+        assert_eq!(orb.phase, Some(OrbPhase::Review));
+        assert!(
+            orb.execution.is_none(),
+            "the review gate must not retain the completed execution as an in-flight marker"
+        );
     }
 
     // ── apply_dispatch_outcome — Failed ───────────────────────

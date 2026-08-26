@@ -1660,6 +1660,10 @@ mod tests {
             .with_type(OrbType::Epic)
             .with_parent_final_work(true);
         parent.phase = Some(OrbPhase::Waiting);
+        parent.execution = Some(orbs::orb::ExecutionMeta {
+            worker_model: Some("completed-refinement".into()),
+            ..Default::default()
+        });
         orb_store.append(&parent).unwrap();
 
         let mut child =
@@ -1673,6 +1677,10 @@ mod tests {
         assert_eq!(result.roots_completed, 1);
         let updated = orb_store.load_by_id(&parent.id).unwrap().unwrap();
         assert_eq!(updated.phase, Some(OrbPhase::Executing));
+        assert!(
+            updated.execution.is_none(),
+            "the final epic execution must be eligible after child completion"
+        );
     }
 
     #[test]
