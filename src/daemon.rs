@@ -212,13 +212,22 @@ fn log_run_summary(projects: &[SupervisedProject], started: chrono::DateTime<chr
     let mut done = 0_u64;
     let mut failed = 0_u64;
     let mut retries = 0_u64;
-    let mut tokens = 0_u64;
+    let mut input_tokens = 0_u64;
+    let mut output_tokens = 0_u64;
+    let mut cache_read_tokens = 0_u64;
+    let mut cache_write_tokens = 0_u64;
     let mut cost_micros = 0_u64;
     for project in projects {
         match project.queue.execution_store().read_all() {
             Ok(records) => {
                 for record in records.into_iter().filter(|r| r.dispatched_at >= started) {
-                    tokens = tokens.saturating_add(record.total_tokens.unwrap_or(0));
+                    input_tokens = input_tokens.saturating_add(record.prompt_tokens.unwrap_or(0));
+                    output_tokens =
+                        output_tokens.saturating_add(record.completion_tokens.unwrap_or(0));
+                    cache_read_tokens =
+                        cache_read_tokens.saturating_add(record.cache_read_tokens.unwrap_or(0));
+                    cache_write_tokens =
+                        cache_write_tokens.saturating_add(record.cache_write_tokens.unwrap_or(0));
                     cost_micros = cost_micros.saturating_add(record.cost_micros.unwrap_or(0));
                     retries = retries.saturating_add(u64::from(record.retries));
                     match record.status.as_str() {
@@ -238,7 +247,10 @@ fn log_run_summary(projects: &[SupervisedProject], started: chrono::DateTime<chr
         completed = done,
         failed,
         retries,
-        tokens,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
         cost_micros,
         "supervisor run summary"
     );

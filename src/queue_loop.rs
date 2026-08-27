@@ -1333,7 +1333,12 @@ async fn dispatch_one_owned(
         completed_retries = completed_retries.saturating_add(1);
         outer_attempt = outer_attempt.saturating_add(1);
         configure_worker_runtime(&mut wc, &log_root, &orb.id.to_string(), outer_attempt)?;
-        tracing::warn!(orb = %orb.id, retry = completed_retries, backoff_ms = backoff.as_millis(), "retrying completed failed orb dispatch");
+        let retry_progress = if model_config.workers.retries == -1 {
+            format!("{completed_retries}/unlimited")
+        } else {
+            format!("{completed_retries}/{}", model_config.workers.retries)
+        };
+        tracing::warn!(orb = %orb.id, retry = %retry_progress, backoff_ms = backoff.as_millis(), "retrying completed failed orb dispatch");
         tokio::time::sleep(backoff).await;
     };
     outcome.retries = outcome.retries.saturating_add(completed_retries);
@@ -1367,6 +1372,7 @@ async fn dispatch_one_owned(
                 outcome.error = Some("refinement response was not a valid plan".into());
                 break;
             };
+            tracing::info!(orb = %orb.id, refinement_round = round, max_refinement_rounds = max_rounds, "processing refinement round");
             let before = (
                 orb.description.clone(),
                 orb.design.clone(),
@@ -1458,8 +1464,7 @@ async fn dispatch_one_owned(
                 tracing::warn!(
                     orb = %orb.id,
                     refinement_round = round,
-                    retry = round_retries,
-                    retry_limit = model_config.workers.retries,
+                    retry = %if model_config.workers.retries == -1 { format!("{round_retries}/unlimited") } else { format!("{round_retries}/{}", model_config.workers.retries) },
                     backoff_ms = backoff.as_millis(),
                     "retrying completed failed refinement round"
                 );
