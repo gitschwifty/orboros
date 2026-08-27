@@ -228,7 +228,9 @@ packaged template defines `read_only`, `research`, `test`, `edit`, and
   `orboros=debug,tokio=warn`) and `file` for foreground command logs. The
   global `--log-level` and `--log-file` flags override these settings.
 - `[daemon]`: optional `pid_file`, `log_file`, `log_max_size`, and
-  `tick_interval_ms` process settings. Set `shared_state = true` only for a
+  `tick_interval_ms` process settings. `global_max_concurrency` optionally
+  caps all workers across a multi-project supervisor; each project retains its
+  own `max_concurrency` local cap. Set `shared_state = true` only for a
   registered project that is run by the shared supervisor; its orb and
   dependency writes then go through the local authority rather than the
   worktree `.orbs` files. Project `max_concurrency` controls that
@@ -237,6 +239,17 @@ packaged template defines `read_only`, `research`, `test`, `edit`, and
   `~/.orboros/supervisor.log`; a daemon targeted to one project appends
   to `~/.orboros/projects/<project>/daemon.log`. Foreground project
   commands default to the sibling `cli.log` path.
+
+### Worker evidence
+
+Every queue-dispatched Heddle worker receives an isolated runtime placement.
+Its state and transcript are written beneath the project's state home at
+`logs/heddle/<orb-id>/attempt-<n>/`. This keeps projects separate while
+preserving a transcript for every configured outer retry. The compact
+per-dispatch index remains `executions.jsonl` in that same project state home;
+use an orb ID together with the `attempt-<n>` directory or worker ID in the
+transcript filename to locate the corresponding evidence. Benchmark runs keep
+the same layout under their isolated case state directory.
 
 Hooks intentionally use a separate schema and files: `~/.orboros/hooks.toml`
 followed by `<project>/.orboros/hooks.toml` (with `<state-dir>/hooks.toml` as

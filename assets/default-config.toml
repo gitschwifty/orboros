@@ -50,6 +50,8 @@ retries = 1
 # log_file = "/absolute/path/to/orboros.log"
 # log_max_size = 10485760
 # tick_interval_ms = 1000
+# Optional aggregate cap across every project supervised by one daemon.
+# global_max_concurrency = 8
 
 # Tool profiles are allowlists. An empty allowed_tools array explicitly grants no tools.
 [tool_profiles.read_only]
