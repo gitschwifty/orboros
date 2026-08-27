@@ -769,6 +769,10 @@ impl QueueLoop {
             crate::prompt::PromptResolver::from_config(prompt_config, Some(&self.base_dir));
 
         let semaphore = Arc::new(Semaphore::new(max_concurrency.max(1)));
+        // `stop()` is a graceful admission barrier: workers that have already
+        // started are allowed to finish and persist their outcome, while work
+        // still waiting for a permit must not begin during shutdown.
+        let running = self.running_flag();
         let context_orbs = Arc::new(all_orbs);
         let context_edges = Arc::new(all_edges);
         let mut join_set = JoinSet::new();
@@ -787,7 +791,11 @@ impl QueueLoop {
             let hooks = self.hooks.as_ref().map(Arc::clone);
             let execution_store = self.execution_store.clone();
             let prompt_store = self.prompt_store.clone();
+            let running = Arc::clone(&running);
             join_set.spawn(async move {
+                if !running.load(Ordering::SeqCst) {
+                    return Ok(false);
+                }
                 let Ok(_permit) = sem.acquire_owned().await else {
                     return Ok(false);
                 };
@@ -798,6 +806,9 @@ impl QueueLoop {
                     },
                     None => None,
                 };
+                if !running.load(Ordering::SeqCst) {
+                    return Ok(false);
+                }
                 let context = DispatchContext {
                     orbs: &context_orbs,
                     edges: &context_edges,
@@ -2061,6 +2072,39 @@ mod tests {
 
         // Task-type orbs don't get re-evaluated
         assert_eq!(result.orbs_reevaluated, 0);
+    }
+
+    #[tokio::test]
+    async fn stopped_queue_does_not_admit_ready_dispatches() {
+        let (_tmp, orb_store, dep_store, base) = setup();
+        let mut task = Orb::new("Queued task", "must not start during shutdown");
+        task.set_status(OrbStatus::Active).unwrap();
+        orb_store.append(&task).unwrap();
+
+        let ql = QueueLoop::new(orb_store.clone(), dep_store, base);
+        ql.stop();
+        let worker = crate::worker::process::WorkerConfig {
+            command: "this-command-must-not-run".into(),
+            args: vec![],
+            cwd: None,
+            env: vec![],
+            model: "mock/stopped".into(),
+            system_prompt: String::new(),
+            tools: vec![],
+            max_iterations: Some(1),
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
+            runtime: None,
+            routing: None,
+        };
+
+        assert_eq!(ql.dispatch_ready_orbs(&worker, 1).await.unwrap(), 0);
+        let updated = orb_store.load_by_id(&task.id).unwrap().unwrap();
+        assert_eq!(updated.status, Some(OrbStatus::Active));
+        assert!(updated.execution.is_none());
     }
 
     #[tokio::test]

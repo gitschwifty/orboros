@@ -310,13 +310,13 @@ pub async fn run_supervisor_with_control_socket(
         tokio::spawn(crate::supervisor::serve_local_socket(listener, supervisor))
     });
 
-    loop {
+    'supervisor: loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
                     tracing::info!("shutdown signal received, stopping supervisor");
                     for project in &projects { project.queue.stop(); }
-                    break;
+                    break 'supervisor;
                 }
             }
             () = tokio::time::sleep(tick_interval) => {
@@ -326,9 +326,16 @@ pub async fn run_supervisor_with_control_socket(
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {
-                            tracing::info!("shutdown signal received, cancelling supervisor dispatches");
+                            tracing::info!("shutdown signal received, draining supervisor dispatches");
                             for project in &projects { project.queue.stop(); }
-                            break;
+                            // Do not drop the tick future here: dropping it
+                            // aborts its JoinSet and turns an operator-requested
+                            // shutdown into worker transport errors. `stop()`
+                            // prevents still-queued work from starting; work
+                            // that already holds a permit finishes and writes
+                            // its normal outcome before we exit.
+                            (&mut tick).await;
+                            break 'supervisor;
                         }
                     }
                     () = &mut tick => {}
