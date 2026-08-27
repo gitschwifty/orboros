@@ -473,6 +473,11 @@ enum OrbAction {
         /// Parent epic or feature ID whose saved response should be recovered.
         id: String,
     },
+    /// Reset a failed orb to the phase or status it can safely retry from.
+    Reset {
+        /// Failed orb ID.
+        id: String,
+    },
     /// Apply a review decision (approve, reject, revise).
     Review {
         /// Orb ID.
@@ -1036,6 +1041,7 @@ fn main() -> anyhow::Result<()> {
                         &model_config,
                     )
                 }
+                OrbAction::Reset { id } => orb_cmd::cmd_orb_reset(&orb_store, &id),
                 OrbAction::Review { id, decision } => {
                     orb_cmd::cmd_orb_review(&orb_store, &id, &decision, hooks_ref)
                 }

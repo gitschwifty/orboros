@@ -59,6 +59,39 @@ pub fn cmd_orb_recover_decomposition(
     Ok(())
 }
 
+/// Appends a retryable state for a failed orb without erasing its prior JSONL
+/// diagnostic record. Phase parents return to the failed dispatch phase;
+/// ordinary task orbs return to Pending.
+pub fn cmd_orb_reset(store: &OrbStore, id: &str) -> anyhow::Result<()> {
+    let mut orb = store
+        .load_by_id(&OrbId::from_raw(id))?
+        .ok_or_else(|| anyhow::anyhow!("orb not found: {id}"))?;
+    anyhow::ensure!(
+        orb.phase == Some(OrbPhase::Failed) || orb.status == Some(OrbStatus::Failed),
+        "orb {id} is not failed"
+    );
+    if orb.orb_type.uses_phase() {
+        let category = orb
+            .execution
+            .as_ref()
+            .and_then(|execution| execution.prompt_category.as_deref());
+        orb.phase = Some(match category {
+            Some("phase.speccing") => OrbPhase::Speccing,
+            Some("phase.decomposing") => OrbPhase::Decomposing,
+            Some("phase.refining") => OrbPhase::Refining,
+            Some("phase.reevaluating") => OrbPhase::Reevaluating,
+            _ => OrbPhase::Executing,
+        });
+    } else {
+        orb.status = Some(OrbStatus::Pending);
+        orb.closed_at = None;
+    }
+    orb.execution = None;
+    store.update(&orb)?;
+    println!("Reset {id} for retry.");
+    Ok(())
+}
+
 // ── Parsing helpers ────────────────────────────────────────────
 
 /// Parses a string into an `OrbType`.
