@@ -1435,7 +1435,12 @@ fn foreground_queue_with_project(
         .map(Path::to_path_buf)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| state_dir.to_path_buf());
-    let queue = QueueLoop::new(orb_store, dep_store, state_dir.to_path_buf());
+    let mut queue = QueueLoop::new(orb_store, dep_store, state_dir.to_path_buf());
+    if let Some(project) = shared_project {
+        let home = dirs::home_dir().expect("shared-state configuration requires a home directory");
+        queue =
+            queue.with_worker_evidence_dir(project.shared_project_dir(&home).join("transcripts"));
+    }
     if let Some(sink) = orboros::hooks::HookSink::from_state_dir(state_dir, &project_cwd)
         .unwrap_or_else(|e| {
             tracing::warn!(error = %e, "failed to load hooks; continuing without them");
@@ -1814,7 +1819,9 @@ fn cmd_supervisor_start(
             },
         );
         has_shared_state |= shared_state;
-        let mut queue = QueueLoop::new(orb_store, dep_store, project_state_dir.clone());
+        let transcript_dir = entry.shared_project_dir(home).join("transcripts");
+        let mut queue = QueueLoop::new(orb_store, dep_store, project_state_dir.clone())
+            .with_worker_evidence_dir(transcript_dir);
         let project_cwd = entry
             .runnable_path()
             .unwrap_or_else(|| project_state_dir.parent().unwrap_or(&project_state_dir));
@@ -1828,10 +1835,13 @@ fn cmd_supervisor_start(
             Some(home),
             entry.config_root(),
         ) {
-            Ok(base_worker_config) => Some(orboros::daemon::DispatchSettings {
-                base_worker_config,
-                max_concurrency: project_max_concurrency,
-            }),
+            Ok(mut base_worker_config) => {
+                base_worker_config.cwd = entry.runnable_path().map(Path::to_path_buf);
+                Some(orboros::daemon::DispatchSettings {
+                    base_worker_config,
+                    max_concurrency: project_max_concurrency,
+                })
+            }
             Err(error) => {
                 tracing::warn!(project = %entry.name, %error, "project dispatch disabled — worker_binary unconfigured");
                 None

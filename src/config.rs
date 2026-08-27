@@ -1077,11 +1077,16 @@ impl ProjectEntry {
 
     /// Returns the user-local authoritative state home for this project.
     #[must_use]
-    pub fn shared_state_dir(&self, home: &Path) -> PathBuf {
+    pub fn shared_project_dir(&self, home: &Path) -> PathBuf {
         home.join(".orboros")
             .join("projects")
             .join(self.state_key())
-            .join("state")
+    }
+
+    /// Returns the user-local authoritative state home for this project.
+    #[must_use]
+    pub fn shared_state_dir(&self, home: &Path) -> PathBuf {
+        self.shared_project_dir(home).join("state")
     }
 }
 
@@ -2145,6 +2150,10 @@ system = "project speccing"
         };
 
         assert_eq!(project.state_key(), "feature_a_b-13250f2ab119");
+        assert_eq!(
+            project.shared_project_dir(Path::new("/tmp/home")),
+            Path::new("/tmp/home/.orboros/projects/feature_a_b-13250f2ab119")
+        );
         assert_eq!(
             project.shared_state_dir(Path::new("/tmp/home")),
             Path::new("/tmp/home/.orboros/projects/feature_a_b-13250f2ab119/state")

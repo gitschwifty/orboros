@@ -252,13 +252,16 @@ packaged template defines `read_only`, `research`, `test`, `edit`, and
 ### Worker evidence
 
 Every queue-dispatched Heddle worker receives an isolated runtime placement.
-Its state and transcript are written beneath the project's state home at
-`logs/heddle/<orb-id>/attempt-<n>/`. This keeps projects separate while
-preserving a transcript for every configured outer retry. The compact
-per-dispatch index remains `executions.jsonl` in that same project state home;
-use an orb ID together with the `attempt-<n>` directory or worker ID in the
-transcript filename to locate the corresponding evidence. Benchmark runs keep
-the same layout under their isolated case state directory.
+For a registered project, its state and transcript are written beneath the
+stable user-local project home at
+`~/.orboros/projects/<project-key>/transcripts/<orb-id>/attempt-<n>/`.
+This preserves worker evidence across worktrees and across local versus shared
+orb state. The compact per-dispatch index remains `executions.jsonl` beside
+the active orb state (`.orbs/` by default, or the shared `state/` directory
+when `[daemon] shared_state = true`). Use an orb ID together with the
+`attempt-<n>` directory or worker ID in the transcript filename to locate the
+corresponding evidence. Benchmark runs keep the same layout under their
+isolated case state directory.
 
 Hooks intentionally use a separate schema and files: `~/.orboros/hooks.toml`
 followed by `<project>/.orboros/hooks.toml` (with `<state-dir>/hooks.toml` as

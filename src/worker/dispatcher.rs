@@ -736,7 +736,10 @@ pub fn default_worker_config(
     Ok(WorkerConfig {
         command: binary,
         args: vec![],
-        cwd: None,
+        // A supervisor may manage projects from a different process cwd.
+        // Bind each worker to its configured project root rather than letting
+        // it inherit the daemon's launch directory.
+        cwd: project_dir.map(std::path::Path::to_path_buf),
         env: vec![],
         model,
         system_prompt: String::new(),
@@ -1193,6 +1196,22 @@ config_path = "/Users/test/.orboros/heddle-config.toml"
             Some("/Users/test/.orboros/heddle-config.toml")
         );
         assert_eq!(wc.model, "anthropic/test");
+    }
+
+    #[test]
+    fn default_worker_config_uses_configured_project_as_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let cfg_dir = home.path().join(".orboros");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "worker_binary = \"/usr/local/bin/heddle\"\n",
+        )
+        .unwrap();
+
+        let wc = default_worker_config(Some(home.path()), Some(project.path())).unwrap();
+        assert_eq!(wc.cwd.as_deref(), Some(project.path()));
     }
 
     #[test]

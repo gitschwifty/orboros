@@ -109,6 +109,7 @@ pub struct QueueLoop {
     tool_policy: Option<crate::routing::profile::PhaseToolPolicy>,
     execution_store: crate::execution::ExecutionStore,
     prompt_store: Option<crate::execution::PromptStore>,
+    worker_evidence_dir: PathBuf,
 }
 
 impl QueueLoop {
@@ -119,6 +120,7 @@ impl QueueLoop {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("executions.jsonl");
+        let worker_evidence_dir = base_dir.join("logs").join("heddle");
         Self {
             orb_store,
             dep_store,
@@ -132,7 +134,17 @@ impl QueueLoop {
             tool_policy: None,
             execution_store: crate::execution::ExecutionStore::new(execution_path),
             prompt_store: None,
+            worker_evidence_dir,
         }
+    }
+
+    /// Overrides the directory where isolated worker transcripts and runtime
+    /// state are written. Registered supervisor projects use their shared
+    /// project home so evidence is stable across worktrees.
+    #[must_use]
+    pub fn with_worker_evidence_dir(mut self, worker_evidence_dir: PathBuf) -> Self {
+        self.worker_evidence_dir = worker_evidence_dir;
+        self
     }
 
     /// Enables durable resolved-prompt capture for an isolated embedded run.
@@ -791,6 +803,7 @@ impl QueueLoop {
             let hooks = self.hooks.as_ref().map(Arc::clone);
             let execution_store = self.execution_store.clone();
             let prompt_store = self.prompt_store.clone();
+            let worker_evidence_dir = self.worker_evidence_dir.clone();
             let running = Arc::clone(&running);
             join_set.spawn(async move {
                 if !running.load(Ordering::SeqCst) {
@@ -826,6 +839,7 @@ impl QueueLoop {
                     hooks,
                     execution_store,
                     prompt_store,
+                    worker_evidence_dir,
                 )
                 .await
             });
@@ -1196,6 +1210,7 @@ async fn dispatch_one_owned(
     hooks: Option<Arc<crate::hooks::HookSink>>,
     execution_store: crate::execution::ExecutionStore,
     prompt_store: Option<crate::execution::PromptStore>,
+    worker_evidence_dir: PathBuf,
 ) -> std::io::Result<bool> {
     use crate::worker::dispatcher::{
         apply_dispatch_outcome_with_review, dispatch_orb, worker_config_for_with_model_config,
@@ -1256,12 +1271,7 @@ async fn dispatch_one_owned(
     );
     let mut wc = worker_config_for_with_model_config(&orb, &target_base_wc, &system, model_config)
         .map_err(std::io::Error::other)?;
-    let log_root = execution_store
-        .path()
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("logs")
-        .join("heddle");
+    let log_root = worker_evidence_dir;
     configure_worker_runtime(&mut wc, &log_root, &orb.id.to_string(), 1)?;
     let effective_system_prompt =
         crate::worker::process::effective_system_prompt(&wc.system_prompt, &wc.tools);
@@ -1742,6 +1752,16 @@ mod tests {
             .unwrap()
             .ends_with("orb-a/attempt-2/worker-worker-1.jsonl"));
         assert_eq!(runtime.config_path.as_deref(), Some("/tmp/heddle.toml"));
+    }
+
+    #[test]
+    fn custom_worker_evidence_dir_overrides_local_log_default() {
+        let (_tmp, orb_store, dep_store, base) = setup();
+        let evidence_dir = base.join("shared-project").join("transcripts");
+        let queue = QueueLoop::new(orb_store, dep_store, base)
+            .with_worker_evidence_dir(evidence_dir.clone());
+
+        assert_eq!(queue.worker_evidence_dir, evidence_dir);
     }
 
     #[tokio::test]

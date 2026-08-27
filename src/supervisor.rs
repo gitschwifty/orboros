@@ -736,22 +736,30 @@ impl LocalSupervisor {
             control_socket_path(&self.home),
             project_name.into(),
         ));
+        let transcript_dir = authority
+            .project()
+            .shared_project_dir(&self.home)
+            .join("transcripts");
         let queue = crate::queue_loop::QueueLoop::new(
             orbs::orb_store::OrbStore::new(state_dir.join("orbs.jsonl"))
                 .with_write_sink(writer.clone()),
             orbs::dep_store::DepStore::new(state_dir.join("deps.jsonl")).with_write_sink(writer),
             state_dir,
-        );
+        )
+        .with_worker_evidence_dir(transcript_dir);
         self.queues.insert(project_name.into(), queue);
         let dispatch = crate::worker::dispatcher::default_worker_config(
             Some(&self.home),
             authority.project().config_root(),
         )
-        .map(|base_worker_config| crate::daemon::DispatchSettings {
-            base_worker_config,
-            max_concurrency: crate::config::load_config(authority.project().config_root())
-                .map(|config| config.max_concurrency)
-                .unwrap_or(1),
+        .map(|mut base_worker_config| {
+            base_worker_config.cwd = authority.project().runnable_path().map(Path::to_path_buf);
+            crate::daemon::DispatchSettings {
+                base_worker_config,
+                max_concurrency: crate::config::load_config(authority.project().config_root())
+                    .map(|config| config.max_concurrency)
+                    .unwrap_or(1),
+            }
         })
         .map_err(|error| tracing::warn!(project = %project_name, %error, "dynamic project dispatch disabled"))
         .ok();
