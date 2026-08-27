@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use orbs::dep::{DepEdge, EdgeType};
 use orbs::dep_store::DepStore;
+use orbs::id::OrbId;
 use orbs::orb::{Orb, OrbPhase, OrbType};
 use orbs::orb_store::OrbStore;
 use orbs::pipeline::{self, PipelineDir};
@@ -296,6 +297,69 @@ pub fn apply_model_option(child: &mut Orb, subtask: &DecomposedSubtask) {
     child.preferred_model.clone_from(&subtask.model_option);
 }
 
+/// Converts an accepted worker plan into the durable child graph.  This is
+/// deliberately separate from parsing: a response is not a decomposition
+/// until the caller has persisted this result through its configured stores.
+///
+/// # Errors
+///
+/// Returns an error when the parent is not currently decomposing or the plan
+/// contains no actionable subtasks.
+pub fn materialize_plan(parent: &Orb, plan: &DecompositionPlan) -> anyhow::Result<DecomposeResult> {
+    anyhow::ensure!(
+        parent.phase == Some(OrbPhase::Decomposing),
+        "parent orb must be in Decomposing phase, got {:?}",
+        parent.phase
+    );
+    anyhow::ensure!(
+        !plan.subtasks.is_empty(),
+        "decomposition plan has no subtasks"
+    );
+
+    let root_id = parent.root_id.clone().unwrap_or_else(|| parent.id.clone());
+    let mut children = Vec::with_capacity(plan.subtasks.len());
+    let mut edges = Vec::new();
+    let mut previous_by_order: std::collections::BTreeMap<u32, OrbId> =
+        std::collections::BTreeMap::new();
+
+    for (index, subtask) in plan.subtasks.iter().enumerate() {
+        anyhow::ensure!(
+            !subtask.title.trim().is_empty() && !subtask.description.trim().is_empty(),
+            "decomposition subtask {} has an empty title or description",
+            index + 1
+        );
+        let child_id = parent
+            .id
+            .child(u32::try_from(index + 1).unwrap_or(u32::MAX));
+        let mut child = Orb::new(&subtask.title, &subtask.description).with_type(OrbType::Task);
+        child.id = child_id.clone();
+        child.parent_id = Some(parent.id.clone());
+        child.root_id = Some(root_id.clone());
+        apply_model_option(&mut child, subtask);
+
+        edges.push(DepEdge::new(
+            parent.id.clone(),
+            child_id.clone(),
+            EdgeType::Parent,
+        ));
+        edges.push(DepEdge::new(
+            child_id.clone(),
+            parent.id.clone(),
+            EdgeType::Child,
+        ));
+        if let Some((_, previous)) = previous_by_order.range(..subtask.order).next_back() {
+            edges.push(DepEdge::new(
+                child_id.clone(),
+                previous.clone(),
+                EdgeType::DependsOn,
+            ));
+        }
+        previous_by_order.insert(subtask.order, child_id);
+        children.push(child);
+    }
+    Ok(DecomposeResult { children, edges })
+}
+
 /// Parses the worker's response into a `DecompositionPlan`. Accepts
 /// strict JSON or a fenced JSON block.
 #[must_use]
@@ -532,6 +596,53 @@ mod tests {
 
         let children = store.load_children(&OrbId::from_raw("orb-feat1")).unwrap();
         assert_eq!(children.len(), 3);
+    }
+
+    #[test]
+    fn materialized_worker_plan_keeps_parallel_groups_and_model_choices() {
+        let (_dir, store, dep_store) = tmp_stores();
+        let mut parent = feature_orb("Auth", "Implement auth");
+        parent.phase = Some(OrbPhase::Decomposing);
+        let plan = DecompositionPlan {
+            subtasks: vec![
+                DecomposedSubtask {
+                    title: "schema".into(),
+                    description: "Add the schema".into(),
+                    order: 1,
+                    model_option: Some("fast".into()),
+                    model_reason: None,
+                },
+                DecomposedSubtask {
+                    title: "api".into(),
+                    description: "Add the API".into(),
+                    order: 1,
+                    model_option: None,
+                    model_reason: None,
+                },
+                DecomposedSubtask {
+                    title: "tests".into(),
+                    description: "Add tests".into(),
+                    order: 2,
+                    model_option: None,
+                    model_reason: None,
+                },
+            ],
+            has_parent_final_work: true,
+        };
+
+        let result = materialize_plan(&parent, &plan).unwrap();
+        assert_eq!(result.children[0].preferred_model.as_deref(), Some("fast"));
+        assert_eq!(result.children.len(), 3);
+        assert_eq!(
+            result
+                .edges
+                .iter()
+                .filter(|edge| edge.edge_type == EdgeType::DependsOn)
+                .count(),
+            1
+        );
+        apply_decomposition(&result, &store, &dep_store).unwrap();
+        assert_eq!(store.load_children(&parent.id).unwrap().len(), 3);
     }
 
     // ── snapshot_decomposition ───────────────────────────────

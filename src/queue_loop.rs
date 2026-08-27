@@ -763,6 +763,7 @@ impl QueueLoop {
         for (orb, target) in targets {
             let sem = semaphore.clone();
             let store = self.orb_store.clone();
+            let dep_store = self.dep_store.clone();
             let base_wc = base_worker_config.clone();
             let orb_config = orb_config.clone();
             let prompt_resolver = prompt_resolver.clone();
@@ -782,6 +783,7 @@ impl QueueLoop {
                 };
                 dispatch_one_owned(
                     store,
+                    dep_store,
                     orb,
                     target,
                     &base_wc,
@@ -1144,6 +1146,7 @@ struct DispatchContext<'a> {
 
 async fn dispatch_one_owned(
     store: OrbStore,
+    dep_store: DepStore,
     mut orb: Orb,
     target: DispatchTarget,
     base_wc: &crate::worker::process::WorkerConfig,
@@ -1399,6 +1402,35 @@ async fn dispatch_one_owned(
         if recovery_outcome.status == crate::worker::dispatcher::DispatchStatus::Done {
             outcome = recovery_outcome;
         }
+    }
+
+    // A successful decomposition is only complete once its children and
+    // edges exist.  Materialize before advancing the parent so a crash or a
+    // failed write cannot expose a parent in Refining with no child graph.
+    // The stores deduplicate child IDs and edges on replay, making a repeated
+    // control-plane delivery safe.
+    if outcome.status == crate::worker::dispatcher::DispatchStatus::Done
+        && target == DispatchTarget::Decomposing
+    {
+        let response = outcome.response.as_deref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "decomposition completed without a response",
+            )
+        })?;
+        let plan = crate::phases::decompose::parse_response(response).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "decomposition response was not a valid plan",
+            )
+        })?;
+        crate::phases::decompose::validate_model_options(&plan, &model_config.models)
+            .map_err(std::io::Error::other)?;
+        let result = crate::phases::decompose::materialize_plan(&orb, &plan)
+            .map_err(std::io::Error::other)?;
+        crate::phases::decompose::apply_decomposition(&result, &store, &dep_store)
+            .map_err(std::io::Error::other)?;
+        orb.has_parent_final_work = plan.has_parent_final_work;
     }
 
     apply_dispatch_outcome_with_review(
