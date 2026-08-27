@@ -14,6 +14,47 @@ use orbs::task::TaskStatus;
 
 use crate::hooks::{FireCtx, HookEvent, HookSink};
 
+/// Materializes the valid decomposition response already saved on a parent.
+/// This recovers queues dispatched before runtime materialization existed and
+/// does not spawn a worker or change the parent's current phase.
+pub fn cmd_orb_recover_decomposition(
+    store: &OrbStore,
+    dep_store: &DepStore,
+    id: &str,
+    models: &crate::config::ModelConfig,
+) -> anyhow::Result<()> {
+    let mut parent = store
+        .load_by_id(&OrbId::from_raw(id))?
+        .ok_or_else(|| anyhow::anyhow!("orb not found: {id}"))?;
+    anyhow::ensure!(
+        parent.orb_type.uses_phase(),
+        "orb {id} is not an epic or feature"
+    );
+    let response = parent
+        .result
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("orb {id} has no saved decomposition response"))?;
+    let plan = crate::phases::decompose::parse_response(response)
+        .ok_or_else(|| anyhow::anyhow!("orb {id} has no valid saved decomposition plan"))?;
+    crate::phases::decompose::validate_model_options(&plan, models)?;
+
+    // The old runtime path had already advanced the parent to Refining. Use a
+    // temporary Decomposing view only to construct the exact graph, then keep
+    // the durable parent phase unchanged.
+    let mut decomposition_parent = parent.clone();
+    decomposition_parent.phase = Some(OrbPhase::Decomposing);
+    let result = crate::phases::decompose::materialize_plan(&decomposition_parent, &plan)?;
+    crate::phases::decompose::apply_decomposition(&result, store, dep_store)?;
+    parent.has_parent_final_work = plan.has_parent_final_work;
+    store.update(&parent)?;
+    println!(
+        "Recovered {} child orb(s) and {} dependency edge(s) for {id}.",
+        result.children.len(),
+        result.edges.len()
+    );
+    Ok(())
+}
+
 // ── Parsing helpers ────────────────────────────────────────────
 
 /// Parses a string into an `OrbType`.
@@ -1697,6 +1738,30 @@ mod tests {
         let (_dir, dep_store) = temp_dep_store();
         // Should succeed but print "no matching edge"
         cmd_orb_dep_remove(&dep_store, "orb-x", "orb-y", EdgeType::Related).unwrap();
+    }
+
+    #[test]
+    fn recover_decomposition_materializes_saved_response_without_changing_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OrbStore::new(dir.path().join("orbs.jsonl"));
+        let deps = DepStore::new(dir.path().join("deps.jsonl"));
+        let mut parent = Orb::new("Feature", "description").with_type(OrbType::Feature);
+        parent.phase = Some(OrbPhase::Refining);
+        parent.result = Some(
+            r#"{"subtasks":[{"title":"child","description":"implement it","order":1}],"has_parent_final_work":true}"#
+                .into(),
+        );
+        let id = parent.id.to_string();
+        store.append(&parent).unwrap();
+
+        cmd_orb_recover_decomposition(&store, &deps, &id, &crate::config::ModelConfig::default())
+            .unwrap();
+
+        let recovered = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
+        assert_eq!(recovered.phase, Some(OrbPhase::Refining));
+        assert!(recovered.has_parent_final_work);
+        assert_eq!(store.load_children(&recovered.id).unwrap().len(), 1);
+        assert_eq!(deps.all_edges().unwrap().len(), 2);
     }
 
     #[test]

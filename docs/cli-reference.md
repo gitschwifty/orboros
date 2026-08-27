@@ -162,6 +162,17 @@ orboros orb update orb-k4f --priority 1 --status active
 | `--priority, -p <N>` | New priority 1-5 |
 | `--status, -s <STATUS>` | New status |
 
+#### `orb recover-decomposition <ID>`
+
+Materialize the valid decomposition response already saved on an epic or
+feature. This is intended for parent orbs that reached Refining before runtime
+decomposition materialization was available. It does not call a worker or
+change the parent phase.
+
+```bash
+orboros orb recover-decomposition orb-k4f
+```
+
 #### `orb delete <ID>`
 
 Soft-delete (tombstone) an orb. Tombstoned orbs are excluded from queries.

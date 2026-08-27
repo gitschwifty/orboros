@@ -468,6 +468,11 @@ enum OrbAction {
         /// Orb ID.
         id: String,
     },
+    /// Materialize a previously saved decomposition response without running a worker.
+    RecoverDecomposition {
+        /// Parent epic or feature ID whose saved response should be recovered.
+        id: String,
+    },
     /// Apply a review decision (approve, reject, revise).
     Review {
         /// Orb ID.
@@ -1021,6 +1026,16 @@ fn main() -> anyhow::Result<()> {
                     }
                 },
                 OrbAction::Deps { id } => orb_cmd::cmd_orb_deps(&dep_store, &id),
+                OrbAction::RecoverDecomposition { id } => {
+                    let model_config =
+                        config::load_config(effective_state.project_dir.as_deref())?.models;
+                    orb_cmd::cmd_orb_recover_decomposition(
+                        &orb_store,
+                        &dep_store,
+                        &id,
+                        &model_config,
+                    )
+                }
                 OrbAction::Review { id, decision } => {
                     orb_cmd::cmd_orb_review(&orb_store, &id, &decision, hooks_ref)
                 }
