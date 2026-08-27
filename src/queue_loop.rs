@@ -1337,7 +1337,20 @@ async fn dispatch_one_owned(
         && outcome.status == crate::worker::dispatcher::DispatchStatus::Done
     {
         let max_rounds = model_config.refinement.max_rounds;
-        let mut round = 1_u32;
+        // A reset preserves the edits already applied to the orb. Resume the
+        // next unfinished round from existing evidence rather than replaying
+        // those successful rounds or adding a new mutable orb-state field.
+        let resumed_round = execution_store
+            .read_all()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|record| record.orb_id == orb.id.to_string() && record.status == "done")
+            .filter_map(|record| record.refinement_round)
+            .filter(|round| round.termination_reason.is_none())
+            .map(|round| round.round)
+            .max()
+            .unwrap_or(0);
+        let mut round = resumed_round.saturating_add(1).max(1);
         loop {
             let Some(response) = outcome.response.as_deref() else {
                 outcome.status = crate::worker::dispatcher::DispatchStatus::Failed;
@@ -1397,9 +1410,57 @@ async fn dispatch_one_owned(
             configure_worker_runtime(&mut wc, &log_root, &orb.id.to_string(), round)?;
             let (_, next_user) = crate::phases::refinement::build_prompt(&orb);
             user = crate::prompt_context::append_task_context(&next_user, &task_context.text);
-            outcome = dispatch_orb(&orb, &user, &wc, hooks.as_deref())
-                .await
-                .map_err(std::io::Error::other)?;
+            let mut round_retries = 0_u32;
+            outcome = loop {
+                let round_outcome = dispatch_orb(&orb, &user, &wc, hooks.as_deref())
+                    .await
+                    .map_err(std::io::Error::other)?;
+                let failed = matches!(
+                    round_outcome.status,
+                    crate::worker::dispatcher::DispatchStatus::Error
+                        | crate::worker::dispatcher::DispatchStatus::Failed
+                );
+                if !failed
+                    || !completed_dispatch_retry_allowed(
+                        model_config.workers.retries,
+                        round_retries,
+                    )
+                {
+                    break round_outcome;
+                }
+                let mut retry_record = crate::execution::ExecutionRecord::from_outcome(
+                    &orb,
+                    prompt_category.clone(),
+                    target.tool_policy_key(),
+                    Some("outer_retry".into()),
+                    wc.tools.clone(),
+                    &round_outcome,
+                    None,
+                );
+                retry_record.phase_retry = Some(crate::execution::PhaseRetryDiagnostic {
+                    attempt: round_retries.saturating_add(1),
+                    reason: "completed_dispatch_failed".into(),
+                });
+                execution_store.append(&retry_record)?;
+                let backoff = completed_dispatch_retry_backoff(round_retries);
+                round_retries = round_retries.saturating_add(1);
+                configure_worker_runtime(
+                    &mut wc,
+                    &log_root,
+                    &orb.id.to_string(),
+                    round.saturating_mul(1_000).saturating_add(round_retries),
+                )?;
+                tracing::warn!(
+                    orb = %orb.id,
+                    refinement_round = round,
+                    retry = round_retries,
+                    retry_limit = model_config.workers.retries,
+                    backoff_ms = backoff.as_millis(),
+                    "retrying completed failed refinement round"
+                );
+                tokio::time::sleep(backoff).await;
+            };
+            outcome.retries = outcome.retries.saturating_add(round_retries);
             if outcome.status != crate::worker::dispatcher::DispatchStatus::Done {
                 refinement_round = Some(crate::execution::RefinementRoundDiagnostic {
                     round,
