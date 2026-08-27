@@ -431,6 +431,18 @@ async fn dispatch_orb_with_retry_limit(
         cost_currency = %outcome.cost_currency.as_deref().unwrap_or("none"),
         "dispatch completed",
     );
+    if matches!(
+        outcome.status,
+        DispatchStatus::Error | DispatchStatus::Failed
+    ) {
+        tracing::error!(
+            orb = %orb.id,
+            title = %orb.title,
+            phase = ?orb.phase.unwrap_or(orbs::orb::OrbPhase::Pending),
+            error = %outcome.error.as_deref().unwrap_or("worker returned no error detail"),
+            "dispatch failed"
+        );
+    }
 
     // 3. post-worker-* — async / fire-and-forget. The event picked
     //    depends on the outcome.
