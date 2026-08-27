@@ -2013,6 +2013,57 @@ done
         );
     }
 
+    #[tokio::test]
+    async fn runtime_decomposition_creates_children_before_parent_advances() {
+        let (_tmp, orb_store, dep_store, base) = setup();
+        let worker_path = base.join("decompose.sh");
+        std::fs::write(
+            &worker_path,
+            r#"while IFS= read -r line; do
+  type=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['type'])")
+  id=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['id'])")
+  case "$type" in
+    init) echo "{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"s\",\"protocol_version\":\"0.3.0\"}" ;;
+    send) echo "{\"type\":\"result\",\"id\":\"$id\",\"status\":\"ok\",\"response\":\"{\\\"subtasks\\\":[{\\\"title\\\":\\\"first\\\",\\\"description\\\":\\\"do first\\\",\\\"order\\\":1},{\\\"title\\\":\\\"second\\\",\\\"description\\\":\\\"do second\\\",\\\"order\\\":2}],\\\"has_parent_final_work\\\":true}\",\"tool_calls_made\":[],\"iterations\":1}" ;;
+    shutdown) echo "{\"type\":\"shutdown_ok\",\"id\":\"$id\"}"; exit 0 ;;
+  esac
+done"#,
+        )
+        .unwrap();
+        let mut feature = Orb::new("Feature", "decompose me").with_type(OrbType::Feature);
+        feature.set_phase(OrbPhase::Speccing).unwrap();
+        feature.set_phase(OrbPhase::Decomposing).unwrap();
+        orb_store.append(&feature).unwrap();
+        let ql = QueueLoop::new(orb_store.clone(), dep_store.clone(), base.clone());
+        let worker = crate::worker::process::WorkerConfig {
+            command: "bash".into(),
+            args: vec![worker_path.to_string_lossy().into()],
+            cwd: Some(base),
+            env: vec![],
+            model: "mock/decompose".into(),
+            system_prompt: String::new(),
+            tools: vec![],
+            max_iterations: Some(1),
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
+            task_id: None,
+            worker_id: None,
+            runtime: None,
+            routing: None,
+        };
+        assert_eq!(ql.dispatch_ready_orbs(&worker, 1).await.unwrap(), 1);
+        let parent = orb_store.load_by_id(&feature.id).unwrap().unwrap();
+        assert_eq!(parent.phase, Some(OrbPhase::Refining));
+        assert!(parent.has_parent_final_work);
+        assert_eq!(orb_store.load_children(&feature.id).unwrap().len(), 2);
+        assert!(dep_store
+            .all_edges()
+            .unwrap()
+            .iter()
+            .any(|edge| edge.edge_type == EdgeType::DependsOn));
+    }
+
     // ── pause/resume ─────────────────────────────────────────────────
 
     #[test]
