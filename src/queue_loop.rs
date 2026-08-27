@@ -952,27 +952,22 @@ fn is_terminal(orb: &Orb) -> bool {
 /// parent's `OrbId` to its child orbs. Lets the tick loop look up
 /// children in O(1) instead of paying a full `OrbStore::load_all`
 /// replay per orb.
-/// Returns true when a parent has not yet released its children for execution.
-/// A phase parent only releases descendants after its Refining/review work is
-/// complete and it reaches Waiting (or a later execution phase).
+/// Returns true when a parent has not successfully released its children for
+/// execution. A phase parent releases descendants only after its
+/// Refining/review work completes and it reaches Waiting or an execution
+/// phase; failed and cancelled parents never release descendants.
 fn blocked_by_parent_review(orb: &Orb, orbs: &[Orb]) -> bool {
     let mut parent_id = orb.parent_id.as_ref();
     while let Some(id) = parent_id {
         let Some(parent) = orbs.iter().find(|candidate| &candidate.id == id) else {
             break;
         };
+        let phase_parent_released = matches!(
+            parent.phase,
+            Some(OrbPhase::Waiting | OrbPhase::Executing | OrbPhase::ExecutingChildren)
+        );
         if parent.status == Some(OrbStatus::Review)
-            || matches!(
-                parent.phase,
-                Some(
-                    OrbPhase::Pending
-                        | OrbPhase::Speccing
-                        | OrbPhase::Decomposing
-                        | OrbPhase::Refining
-                        | OrbPhase::Review
-                        | OrbPhase::Reevaluating
-                )
-            )
+            || (parent.orb_type.uses_phase() && !phase_parent_released)
         {
             return true;
         }
@@ -1691,6 +1686,26 @@ mod tests {
         assert!(completed_dispatch_retry_allowed(2, 1));
         assert!(!completed_dispatch_retry_allowed(2, 2));
         assert!(completed_dispatch_retry_allowed(-1, 10_000));
+    }
+
+    #[test]
+    fn failed_phase_parent_does_not_release_child_dispatch() {
+        let mut parent = Orb::new("Parent", "must finish refining first").with_type(OrbType::Epic);
+        parent.set_phase(OrbPhase::Failed).unwrap();
+        let child = Orb::new("Child", "must remain blocked")
+            .with_parent(parent.id.clone(), Some(parent.id.clone()));
+
+        assert!(blocked_by_parent_review(&child, &[parent]));
+    }
+
+    #[test]
+    fn waiting_phase_parent_releases_child_dispatch() {
+        let mut parent = Orb::new("Parent", "finished refining").with_type(OrbType::Epic);
+        parent.phase = Some(OrbPhase::Waiting); // test setup: prior phases completed
+        let child = Orb::new("Child", "may execute")
+            .with_parent(parent.id.clone(), Some(parent.id.clone()));
+
+        assert!(!blocked_by_parent_review(&child, &[parent]));
     }
 
     #[test]
