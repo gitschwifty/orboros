@@ -1821,7 +1821,8 @@ fn cmd_supervisor_start(
         has_shared_state |= shared_state;
         let transcript_dir = entry.shared_project_dir(home).join("transcripts");
         let mut queue = QueueLoop::new(orb_store, dep_store, project_state_dir.clone())
-            .with_worker_evidence_dir(transcript_dir);
+            .with_worker_evidence_dir(transcript_dir)
+            .with_project_key(entry.name.clone());
         let project_cwd = entry
             .runnable_path()
             .unwrap_or_else(|| project_state_dir.parent().unwrap_or(&project_state_dir));

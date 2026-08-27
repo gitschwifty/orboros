@@ -746,7 +746,8 @@ impl LocalSupervisor {
             orbs::dep_store::DepStore::new(state_dir.join("deps.jsonl")).with_write_sink(writer),
             state_dir,
         )
-        .with_worker_evidence_dir(transcript_dir);
+        .with_worker_evidence_dir(transcript_dir)
+        .with_project_key(project_name);
         self.queues.insert(project_name.into(), queue);
         let dispatch = crate::worker::dispatcher::default_worker_config(
             Some(&self.home),

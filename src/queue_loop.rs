@@ -110,6 +110,7 @@ pub struct QueueLoop {
     execution_store: crate::execution::ExecutionStore,
     prompt_store: Option<crate::execution::PromptStore>,
     worker_evidence_dir: PathBuf,
+    project_key: Option<String>,
 }
 
 impl QueueLoop {
@@ -135,6 +136,7 @@ impl QueueLoop {
             execution_store: crate::execution::ExecutionStore::new(execution_path),
             prompt_store: None,
             worker_evidence_dir,
+            project_key: None,
         }
     }
 
@@ -144,6 +146,11 @@ impl QueueLoop {
     #[must_use]
     pub fn with_worker_evidence_dir(mut self, worker_evidence_dir: PathBuf) -> Self {
         self.worker_evidence_dir = worker_evidence_dir;
+        self
+    }
+    #[must_use]
+    pub fn with_project_key(mut self, project_key: impl Into<String>) -> Self {
+        self.project_key = Some(project_key.into());
         self
     }
 
@@ -809,6 +816,7 @@ impl QueueLoop {
             let execution_store = self.execution_store.clone();
             let prompt_store = self.prompt_store.clone();
             let worker_evidence_dir = self.worker_evidence_dir.clone();
+            let project_key = self.project_key.clone();
             let running = Arc::clone(&running);
             join_set.spawn(async move {
                 if !running.load(Ordering::SeqCst) {
@@ -845,6 +853,7 @@ impl QueueLoop {
                     execution_store,
                     prompt_store,
                     worker_evidence_dir,
+                    project_key,
                 )
                 .await
             });
@@ -1216,6 +1225,7 @@ async fn dispatch_one_owned(
     execution_store: crate::execution::ExecutionStore,
     prompt_store: Option<crate::execution::PromptStore>,
     worker_evidence_dir: PathBuf,
+    project_key: Option<String>,
 ) -> std::io::Result<bool> {
     use crate::worker::dispatcher::{
         apply_dispatch_outcome_with_review, dispatch_orb, worker_config_for_with_model_config,
@@ -1286,7 +1296,8 @@ async fn dispatch_one_owned(
         orb = %orb.id,
         title = %orb.title,
         target = ?target,
-        phase = %optional_debug(orb.phase),
+        project = project_key.as_deref().unwrap_or("unregistered"),
+        phase = ?orb.phase.unwrap_or(OrbPhase::Pending),
         tools = ?wc.tools,
         "dispatching ready orb",
     );

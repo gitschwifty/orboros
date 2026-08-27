@@ -293,7 +293,7 @@ async fn dispatch_orb_with_retry_limit(
         orb = %orb.id,
         title = %orb.title,
         orb_type = ?orb.orb_type,
-        phase = ?orb.phase,
+        phase = ?orb.phase.unwrap_or(orbs::orb::OrbPhase::Pending),
         model = %worker_config.model,
         "dispatch started"
     );
