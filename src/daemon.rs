@@ -321,7 +321,18 @@ pub async fn run_supervisor_with_control_socket(
             }
             () = tokio::time::sleep(tick_interval) => {
                 if let Err(error) = rotate_log(&config) { tracing::warn!(%error, "log rotation failed"); }
-                tick_supervised_projects_with_global(&projects, global_semaphore.clone()).await;
+                let tick = tick_supervised_projects_with_global(&projects, global_semaphore.clone());
+                tokio::pin!(tick);
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            tracing::info!("shutdown signal received, cancelling supervisor dispatches");
+                            for project in &projects { project.queue.stop(); }
+                            break;
+                        }
+                    }
+                    () = &mut tick => {}
+                }
                 if let Some(supervisor) = &control_supervisor {
                     let (queues, dispatch) = supervisor.lock().await.take_attached_queues();
                     let attached: Vec<_> = queues.iter().filter_map(|(name, queue)| {

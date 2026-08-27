@@ -941,16 +941,28 @@ fn is_terminal(orb: &Orb) -> bool {
 /// parent's `OrbId` to its child orbs. Lets the tick loop look up
 /// children in O(1) instead of paying a full `OrbStore::load_all`
 /// replay per orb.
-/// Returns true when an orb is nested under a parent waiting for review.
-/// Review is a gate for all descendant execution, not merely a label on the
-/// parent; checking the full chain also handles nested feature/task trees.
+/// Returns true when a parent has not yet released its children for execution.
+/// A phase parent only releases descendants after its Refining/review work is
+/// complete and it reaches Waiting (or a later execution phase).
 fn blocked_by_parent_review(orb: &Orb, orbs: &[Orb]) -> bool {
     let mut parent_id = orb.parent_id.as_ref();
     while let Some(id) = parent_id {
         let Some(parent) = orbs.iter().find(|candidate| &candidate.id == id) else {
             break;
         };
-        if parent.phase == Some(OrbPhase::Review) || parent.status == Some(OrbStatus::Review) {
+        if parent.status == Some(OrbStatus::Review)
+            || matches!(
+                parent.phase,
+                Some(
+                    OrbPhase::Pending
+                        | OrbPhase::Speccing
+                        | OrbPhase::Decomposing
+                        | OrbPhase::Refining
+                        | OrbPhase::Review
+                        | OrbPhase::Reevaluating
+                )
+            )
+        {
             return true;
         }
         parent_id = parent.parent_id.as_ref();
