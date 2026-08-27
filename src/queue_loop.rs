@@ -1235,8 +1235,15 @@ async fn dispatch_one_owned(
         target.tool_profile(),
         tool_policy,
     );
-    let wc = worker_config_for_with_model_config(&orb, &target_base_wc, &system, model_config)
+    let mut wc = worker_config_for_with_model_config(&orb, &target_base_wc, &system, model_config)
         .map_err(std::io::Error::other)?;
+    let log_root = execution_store
+        .path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("logs")
+        .join("heddle");
+    configure_worker_runtime(&mut wc, &log_root, &orb.id.to_string(), 1)?;
     let effective_system_prompt =
         crate::worker::process::effective_system_prompt(&wc.system_prompt, &wc.tools);
     prompt_context.effective_system_prompt_chars =
@@ -1259,6 +1266,7 @@ async fn dispatch_one_owned(
     // malformed-output, provider, and bounded-recovery behavior inside one
     // attempt remains unconditional.
     let mut completed_retries = 0_u32;
+    let mut outer_attempt = 1_u32;
     let mut outcome = loop {
         let outcome = dispatch_orb(&orb, &user, &wc, hooks.as_deref())
             .await
@@ -1273,8 +1281,24 @@ async fn dispatch_one_owned(
         {
             break outcome;
         }
+        let mut retry_record = crate::execution::ExecutionRecord::from_outcome(
+            &orb,
+            prompt_category.clone(),
+            target.tool_policy_key(),
+            Some("outer_retry".into()),
+            wc.tools.clone(),
+            &outcome,
+            None,
+        );
+        retry_record.phase_retry = Some(crate::execution::PhaseRetryDiagnostic {
+            attempt: outer_attempt,
+            reason: "completed_dispatch_failed".into(),
+        });
+        execution_store.append(&retry_record)?;
         let backoff = completed_dispatch_retry_backoff(completed_retries);
         completed_retries = completed_retries.saturating_add(1);
+        outer_attempt = outer_attempt.saturating_add(1);
+        configure_worker_runtime(&mut wc, &log_root, &orb.id.to_string(), outer_attempt)?;
         tracing::warn!(orb = %orb.id, retry = completed_retries, backoff_ms = backoff.as_millis(), "retrying completed failed orb dispatch");
         tokio::time::sleep(backoff).await;
     };
@@ -1502,6 +1526,37 @@ async fn dispatch_one_owned(
     Ok(outcome.status == crate::worker::dispatcher::DispatchStatus::Done)
 }
 
+/// Requests an isolated Heddle runtime beneath the project-local evidence
+/// home. The worker ID and outer retry ordinal make every transcript distinct.
+fn configure_worker_runtime(
+    worker_config: &mut crate::worker::process::WorkerConfig,
+    log_root: &Path,
+    orb_id: &str,
+    outer_attempt: u32,
+) -> std::io::Result<()> {
+    let worker_id = worker_config
+        .worker_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    worker_config.worker_id = Some(worker_id.clone());
+    let attempt_dir = log_root
+        .join(orb_id)
+        .join(format!("attempt-{outer_attempt}"));
+    std::fs::create_dir_all(&attempt_dir)?;
+    worker_config.runtime = Some(crate::ipc::types::RuntimePlacementConfig {
+        mode: Some(crate::ipc::types::RuntimeMode::Isolated),
+        state_root: Some(attempt_dir.join("state").display().to_string()),
+        transcript_path: Some(
+            attempt_dir
+                .join(format!("worker-{worker_id}.jsonl"))
+                .display()
+                .to_string(),
+        ),
+        inherit_ambient_config: Some(false),
+    });
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1524,6 +1579,35 @@ mod tests {
         assert!(completed_dispatch_retry_allowed(2, 1));
         assert!(!completed_dispatch_retry_allowed(2, 2));
         assert!(completed_dispatch_retry_allowed(-1, 10_000));
+    }
+
+    #[test]
+    fn worker_runtime_isolated_under_project_log_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = crate::worker::process::WorkerConfig {
+            command: "mock".into(),
+            args: vec![],
+            cwd: None,
+            env: vec![],
+            model: "test".into(),
+            system_prompt: String::new(),
+            tools: vec![],
+            max_iterations: None,
+            init_timeout: None,
+            send_timeout: None,
+            shutdown_timeout: None,
+            task_id: None,
+            worker_id: Some("worker-1".into()),
+            runtime: None,
+            routing: None,
+        };
+        configure_worker_runtime(&mut config, dir.path(), "orb-a", 2).unwrap();
+        let runtime = config.runtime.unwrap();
+        assert_eq!(runtime.mode, Some(crate::ipc::types::RuntimeMode::Isolated));
+        assert!(runtime
+            .transcript_path
+            .unwrap()
+            .ends_with("orb-a/attempt-2/worker-worker-1.jsonl"));
     }
 
     #[tokio::test]
