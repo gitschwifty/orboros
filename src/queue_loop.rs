@@ -1210,7 +1210,7 @@ async fn dispatch_one_owned(
     );
     let mut prompt_context = task_context.metrics;
     prompt_context.base_user_chars = u32::try_from(user.chars().count()).unwrap_or(u32::MAX);
-    let user = crate::prompt_context::append_task_context(&user, &task_context.text);
+    let mut user = crate::prompt_context::append_task_context(&user, &task_context.text);
     prompt_context.final_user_prompt_chars =
         u32::try_from(user.chars().count()).unwrap_or(u32::MAX);
 
@@ -1304,6 +1304,86 @@ async fn dispatch_one_owned(
         tokio::time::sleep(backoff).await;
     };
     outcome.retries = outcome.retries.saturating_add(completed_retries);
+    let mut refinement_round = None;
+    if target == DispatchTarget::Refining
+        && outcome.status == crate::worker::dispatcher::DispatchStatus::Done
+    {
+        let max_rounds = model_config.refinement.max_rounds;
+        let mut round = 1_u32;
+        loop {
+            let Some(response) = outcome.response.as_deref() else {
+                outcome.status = crate::worker::dispatcher::DispatchStatus::Failed;
+                outcome.error = Some("refinement completed without a response".into());
+                break;
+            };
+            let Some(plan) = crate::phases::refinement::parse_response(response) else {
+                outcome.status = crate::worker::dispatcher::DispatchStatus::Failed;
+                outcome.error = Some("refinement response was not a valid plan".into());
+                break;
+            };
+            let before = (
+                orb.description.clone(),
+                orb.design.clone(),
+                orb.acceptance_criteria.clone(),
+            );
+            crate::phases::refinement::apply_plan(&mut orb, &plan);
+            let material_changed = before
+                != (
+                    orb.description.clone(),
+                    orb.design.clone(),
+                    orb.acceptance_criteria.clone(),
+                );
+            let reason = if model_config.refinement.stop_on_model_complete && plan.complete {
+                Some("model_declared_complete")
+            } else if model_config.refinement.stop_on_no_material_change && !material_changed {
+                Some("no_material_change")
+            } else if round >= max_rounds {
+                Some("max_rounds")
+            } else {
+                None
+            };
+            let diagnostic = crate::execution::RefinementRoundDiagnostic {
+                round,
+                max_rounds,
+                material_changed,
+                model_declared_complete: plan.complete,
+                termination_reason: reason.map(str::to_string),
+            };
+            if reason.is_some() {
+                refinement_round = Some(diagnostic);
+                break;
+            }
+            let mut round_record = crate::execution::ExecutionRecord::from_outcome(
+                &orb,
+                prompt_category.clone(),
+                target.tool_policy_key(),
+                Some("refinement_round".into()),
+                wc.tools.clone(),
+                &outcome,
+                None,
+            );
+            round_record.refinement_round = Some(diagnostic);
+            execution_store.append(&round_record)?;
+            round = round.saturating_add(1);
+            wc.worker_id = Some(uuid::Uuid::new_v4().to_string());
+            configure_worker_runtime(&mut wc, &log_root, &orb.id.to_string(), round)?;
+            let (_, next_user) = crate::phases::refinement::build_prompt(&orb);
+            user = crate::prompt_context::append_task_context(&next_user, &task_context.text);
+            outcome = dispatch_orb(&orb, &user, &wc, hooks.as_deref())
+                .await
+                .map_err(std::io::Error::other)?;
+            if outcome.status != crate::worker::dispatcher::DispatchStatus::Done {
+                refinement_round = Some(crate::execution::RefinementRoundDiagnostic {
+                    round,
+                    max_rounds,
+                    material_changed: false,
+                    model_declared_complete: false,
+                    termination_reason: Some("worker_failed".into()),
+                });
+                break;
+            }
+        }
+    }
     if outcome.status == crate::worker::dispatcher::DispatchStatus::Done
         && target == DispatchTarget::Decomposing
         && model_config.models.coordinator_model_choice
@@ -1374,6 +1454,9 @@ async fn dispatch_one_owned(
             attempt: 1,
             reason: "initial".into(),
         });
+    }
+    if let Some(round) = refinement_round {
+        execution_record.refinement_round = Some(round);
     }
     if recovery_eligible {
         execution_record.partial_artifact_recovery =

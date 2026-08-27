@@ -157,6 +157,9 @@ pub struct RefinementPlan {
     /// applied to the orb but useful in audit / hook payloads.
     #[serde(default)]
     pub notes: Option<String>,
+    /// Explicit model-declared completion signal for a configured loop.
+    #[serde(default)]
+    pub complete: bool,
 }
 
 /// Returns `(system, user)` prompts for the refinement worker.
@@ -172,7 +175,8 @@ code fences — in this shape:\n\
   {\"description\": \"<revised>\" | null,\n\
    \"design\": \"<revised>\" | null,\n\
    \"acceptance_criteria\": \"<revised>\" | null,\n\
-   \"notes\": \"<what you changed and why>\"}\n\
+   \"notes\": \"<what you changed and why>\",\n\
+   \"complete\": false}\n\
 Use null for any field you don't want to change. If nothing needs revision, \
 return all-null and a brief note explaining why."
         .to_string();
@@ -468,6 +472,7 @@ mod tests {
             design: None, // leave alone
             acceptance_criteria: None,
             notes: None,
+            complete: false,
         };
         apply_plan(&mut orb, &plan);
         assert_eq!(orb.description, "new desc");
@@ -486,6 +491,7 @@ mod tests {
                 design: None,
                 acceptance_criteria: None,
                 notes: Some("nothing".into()),
+                complete: false,
             },
         );
         assert_eq!(orb.content_hash, before);

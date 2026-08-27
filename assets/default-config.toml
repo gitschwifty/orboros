@@ -45,6 +45,12 @@ desktop_enabled = false
 # retryable failures with capped exponential backoff until the process stops.
 retries = 1
 
+[refinement]
+# The default preserves the historical single structured refinement pass.
+max_rounds = 1
+stop_on_no_material_change = true
+stop_on_model_complete = true
+
 [daemon]
 # pid_file = "/absolute/path/to/orboros.pid"
 # log_file = "/absolute/path/to/orboros.log"

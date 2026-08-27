@@ -30,6 +30,7 @@ pub struct OrbConfig {
     pub notification: NotificationConfig,
     pub logging: LoggingConfig,
     pub workers: WorkerSettingsConfig,
+    pub refinement: RefinementSettingsConfig,
     pub daemon: DaemonSettingsConfig,
 }
 
@@ -66,6 +67,7 @@ impl Default for OrbConfig {
             notification: NotificationConfig::default(),
             logging: LoggingConfig::default(),
             workers: WorkerSettingsConfig::default(),
+            refinement: RefinementSettingsConfig::default(),
             daemon: DaemonSettingsConfig::default(),
         }
     }
@@ -103,6 +105,35 @@ impl WorkerSettingsConfig {
                 "workers.retries must be -1 or a non-negative count; got {}",
                 self.retries
             ));
+        }
+        Ok(())
+    }
+}
+
+/// Policy for repeated structured Refining phase dispatches. The default is
+/// deliberately one round, preserving the historical queue behavior.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RefinementSettingsConfig {
+    pub max_rounds: u32,
+    pub stop_on_no_material_change: bool,
+    pub stop_on_model_complete: bool,
+}
+
+impl Default for RefinementSettingsConfig {
+    fn default() -> Self {
+        Self {
+            max_rounds: 1,
+            stop_on_no_material_change: true,
+            stop_on_model_complete: true,
+        }
+    }
+}
+
+impl RefinementSettingsConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_rounds == 0 {
+            return Err("refinement.max_rounds must be at least 1".into());
         }
         Ok(())
     }
@@ -895,6 +926,10 @@ pub(crate) fn load_config_with_home_and_bench(
         .map_err(|e| anyhow::anyhow!(e))?;
     config.models.validate().map_err(|e| anyhow::anyhow!(e))?;
     config.workers.validate().map_err(|e| anyhow::anyhow!(e))?;
+    config
+        .refinement
+        .validate()
+        .map_err(|e| anyhow::anyhow!(e))?;
     config.daemon.validate().map_err(|e| anyhow::anyhow!(e))?;
     validate_profiles(&config.tool_profiles).map_err(|e| anyhow::anyhow!(e))?;
     Ok(config)
@@ -2052,6 +2087,11 @@ system = "project speccing"
                 file: Some("/tmp/orboros-general.log".into()),
             },
             workers: WorkerSettingsConfig { retries: -1 },
+            refinement: RefinementSettingsConfig {
+                max_rounds: 3,
+                stop_on_no_material_change: true,
+                stop_on_model_complete: false,
+            },
             daemon: DaemonSettingsConfig {
                 shared_state: true,
                 pid_file: Some("/tmp/orboros.pid".into()),

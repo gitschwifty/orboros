@@ -100,6 +100,9 @@ pub struct ExecutionRecord {
     /// worker retry left a materially changed workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partial_artifact_recovery: Option<PartialArtifactRecoveryDiagnostic>,
+    /// Per-round evidence for a configured Refining loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refinement_round: Option<RefinementRoundDiagnostic>,
     /// Every worker attempt, including fresh retries that did not produce a
     /// final successful result. Missing on historical records.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -147,6 +150,17 @@ pub struct PhaseRetryDiagnostic {
     pub attempt: u32,
     /// Stable eligibility reason, for example `after_invalid_output`.
     pub reason: String,
+}
+
+/// Durable termination evidence for one Refining phase round.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefinementRoundDiagnostic {
+    pub round: u32,
+    pub max_rounds: u32,
+    pub material_changed: bool,
+    pub model_declared_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination_reason: Option<String>,
 }
 
 /// Attribution for the one bounded recovery pass permitted after a failed
@@ -213,6 +227,7 @@ impl ExecutionRecord {
             phase_retry: None,
             terminal_retry: outcome.terminal_retry.clone(),
             partial_artifact_recovery: None,
+            refinement_round: None,
             attempts: outcome.attempts.clone(),
         }
     }

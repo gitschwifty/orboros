@@ -239,6 +239,11 @@ packaged template defines `read_only`, `research`, `test`, `edit`, and
   `~/.orboros/supervisor.log`; a daemon targeted to one project appends
   to `~/.orboros/projects/<project>/daemon.log`. Foreground project
   commands default to the sibling `cli.log` path.
+- `[refinement]`: `max_rounds` controls the bounded number of structured
+  Refining workers (default `1`); `stop_on_no_material_change` stops when a
+  round leaves description/design/acceptance criteria unchanged, and
+  `stop_on_model_complete` honors a worker's explicit `"complete": true`
+  response after applying that round's edits.
 
 ### Worker evidence
 
