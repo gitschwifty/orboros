@@ -1585,6 +1585,7 @@ fn benchmark_runtime_placement(artifact_dir: &Path) -> RuntimePlacementConfig {
         // Leave the filename to Heddle so concurrent dispatcher workers each
         // receive a distinct session transcript under `state/sessions/`.
         transcript_path: None,
+        config_path: None,
         inherit_ambient_config: Some(false),
     }
 }

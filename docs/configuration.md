@@ -244,6 +244,10 @@ packaged template defines `read_only`, `research`, `test`, `edit`, and
   round leaves description/design/acceptance criteria unchanged, and
   `stop_on_model_complete` honors a worker's explicit `"complete": true`
   response after applying that round's edits.
+- `[heddle]`: `config_path` is an optional Heddle headless configuration file
+  passed as `runtime.config_path` on worker initialization. The normal layered
+  config merge applies, so a project setting overrides a global setting. Use
+  an absolute path because workers may run from different worktrees.
 
 ### Worker evidence
 

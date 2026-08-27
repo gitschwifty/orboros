@@ -30,6 +30,7 @@ pub struct OrbConfig {
     pub notification: NotificationConfig,
     pub logging: LoggingConfig,
     pub workers: WorkerSettingsConfig,
+    pub heddle: HeddleSettingsConfig,
     pub refinement: RefinementSettingsConfig,
     pub daemon: DaemonSettingsConfig,
 }
@@ -67,6 +68,7 @@ impl Default for OrbConfig {
             notification: NotificationConfig::default(),
             logging: LoggingConfig::default(),
             workers: WorkerSettingsConfig::default(),
+            heddle: HeddleSettingsConfig::default(),
             refinement: RefinementSettingsConfig::default(),
             daemon: DaemonSettingsConfig::default(),
         }
@@ -108,6 +110,15 @@ impl WorkerSettingsConfig {
         }
         Ok(())
     }
+}
+
+/// Optional configuration passed directly to Heddle's isolated runtime.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct HeddleSettingsConfig {
+    /// Absolute path recommended: it is interpreted by the Heddle process,
+    /// whose working directory may be the assigned project worktree.
+    pub config_path: Option<String>,
 }
 
 /// Policy for repeated structured Refining phase dispatches. The default is
@@ -2087,6 +2098,9 @@ system = "project speccing"
                 file: Some("/tmp/orboros-general.log".into()),
             },
             workers: WorkerSettingsConfig { retries: -1 },
+            heddle: HeddleSettingsConfig {
+                config_path: Some("/tmp/heddle.toml".into()),
+            },
             refinement: RefinementSettingsConfig {
                 max_rounds: 3,
                 stop_on_no_material_change: true,

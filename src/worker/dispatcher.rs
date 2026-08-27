@@ -750,7 +750,15 @@ pub fn default_worker_config(
         shutdown_timeout: None,
         task_id: None,
         worker_id: None,
-        runtime: None,
+        runtime: cfg.heddle.config_path.map(|config_path| {
+            crate::ipc::types::RuntimePlacementConfig {
+                mode: None,
+                state_root: None,
+                transcript_path: None,
+                config_path: Some(config_path),
+                inherit_ambient_config: None,
+            }
+        }),
         routing: None,
     })
 }
@@ -1170,11 +1178,20 @@ model = "catalog/fast"
             r#"
 default_model = "anthropic/test"
 worker_binary = "/usr/local/bin/heddle"
+
+[heddle]
+config_path = "/Users/test/.orboros/heddle-config.toml"
 "#,
         )
         .unwrap();
         let wc = default_worker_config(Some(home.path()), None).unwrap();
         assert_eq!(wc.command, "/usr/local/bin/heddle");
+        assert_eq!(
+            wc.runtime
+                .as_ref()
+                .and_then(|runtime| runtime.config_path.as_deref()),
+            Some("/Users/test/.orboros/heddle-config.toml")
+        );
         assert_eq!(wc.model, "anthropic/test");
     }
 

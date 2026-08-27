@@ -45,6 +45,10 @@ desktop_enabled = false
 # retryable failures with capped exponential backoff until the process stops.
 retries = 1
 
+[heddle]
+# Absolute path to a Heddle headless config file. Project values override global.
+# config_path = "/Users/you/.orboros/heddle-config.toml"
+
 [refinement]
 # The default preserves the historical single structured refinement pass.
 max_rounds = 1

@@ -1618,6 +1618,10 @@ fn configure_worker_runtime(
     orb_id: &str,
     outer_attempt: u32,
 ) -> std::io::Result<()> {
+    let config_path = worker_config
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.config_path.clone());
     let worker_id = worker_config
         .worker_id
         .clone()
@@ -1636,6 +1640,7 @@ fn configure_worker_runtime(
                 .display()
                 .to_string(),
         ),
+        config_path,
         inherit_ambient_config: Some(false),
     });
     Ok(())
@@ -1682,7 +1687,13 @@ mod tests {
             shutdown_timeout: None,
             task_id: None,
             worker_id: Some("worker-1".into()),
-            runtime: None,
+            runtime: Some(crate::ipc::types::RuntimePlacementConfig {
+                mode: None,
+                state_root: None,
+                transcript_path: None,
+                config_path: Some("/tmp/heddle.toml".into()),
+                inherit_ambient_config: None,
+            }),
             routing: None,
         };
         configure_worker_runtime(&mut config, dir.path(), "orb-a", 2).unwrap();
@@ -1692,6 +1703,7 @@ mod tests {
             .transcript_path
             .unwrap()
             .ends_with("orb-a/attempt-2/worker-worker-1.jsonl"));
+        assert_eq!(runtime.config_path.as_deref(), Some("/tmp/heddle.toml"));
     }
 
     #[tokio::test]

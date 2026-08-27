@@ -97,6 +97,11 @@ pub struct RuntimePlacementConfig {
     pub state_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_path: Option<String>,
+    /// Optional Heddle headless configuration file. Orboros resolves this
+    /// through its global/project config layering and passes it only to the
+    /// worker runtime, never into prompts or execution records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherit_ambient_config: Option<bool>,
 }
@@ -500,6 +505,22 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let parsed: IpcRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(req, parsed);
+    }
+
+    #[test]
+    fn init_runtime_serializes_optional_config_path() {
+        let runtime = RuntimePlacementConfig {
+            mode: Some(RuntimeMode::Isolated),
+            state_root: Some("/tmp/state".into()),
+            transcript_path: Some("/tmp/transcript.jsonl".into()),
+            config_path: Some("/Users/test/.orboros/heddle-config.toml".into()),
+            inherit_ambient_config: Some(false),
+        };
+        let json = serde_json::to_value(&runtime).unwrap();
+        assert_eq!(
+            json["config_path"],
+            "/Users/test/.orboros/heddle-config.toml"
+        );
     }
 
     #[test]

@@ -538,6 +538,7 @@ fn benchmark_runtime_placement(artifact_dir: &Path, attempt: u32) -> RuntimePlac
                 .to_string_lossy()
                 .into_owned(),
         ),
+        config_path: None,
         inherit_ambient_config: Some(false),
     }
 }

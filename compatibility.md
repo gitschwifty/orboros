@@ -36,6 +36,13 @@
 
 ## Changelog
 
+### 0.5.0
+
+**Summary:** Let an isolated Heddle runtime load an explicit configuration
+file selected through Orboros's merged global/project configuration.
+
+**From 0.4.0:** `InitConfig.runtime` gains optional `config_path`.
+
 ### 0.4.0
 
 **Summary:** Add isolated headless runtime placement, routing metadata, and
