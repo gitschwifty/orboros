@@ -233,6 +233,11 @@ impl QueueLoop {
         Arc::clone(&self.running)
     }
 
+    #[must_use]
+    pub fn execution_store(&self) -> crate::execution::ExecutionStore {
+        self.execution_store.clone()
+    }
+
     /// Performs a single iteration of the queue loop.
     ///
     /// 1. Detects pipeline-phase orbs (Pending epics/features) and creates pipeline dirs.

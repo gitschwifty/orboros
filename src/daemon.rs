@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -207,6 +208,42 @@ pub struct SupervisedProject {
     pub dispatch: Option<DispatchSettings>,
 }
 
+fn log_run_summary(projects: &[SupervisedProject], started: chrono::DateTime<chrono::Utc>) {
+    let mut done = 0_u64;
+    let mut failed = 0_u64;
+    let mut retries = 0_u64;
+    let mut tokens = 0_u64;
+    let mut cost_micros = 0_u64;
+    for project in projects {
+        match project.queue.execution_store().read_all() {
+            Ok(records) => {
+                for record in records.into_iter().filter(|r| r.dispatched_at >= started) {
+                    tokens = tokens.saturating_add(record.total_tokens.unwrap_or(0));
+                    cost_micros = cost_micros.saturating_add(record.cost_micros.unwrap_or(0));
+                    retries = retries.saturating_add(u64::from(record.retries));
+                    match record.status.as_str() {
+                        "done" => done += 1,
+                        "error" | "failed" => failed += 1,
+                        _ => {}
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(project = %project.name, %error, "could not read execution summary")
+            }
+        }
+    }
+    tracing::info!(
+        elapsed_secs = (chrono::Utc::now() - started).num_seconds(),
+        completed = done,
+        failed,
+        retries,
+        tokens,
+        cost_micros,
+        "supervisor run summary"
+    );
+}
+
 async fn tick_project(
     project: SupervisedProject,
     global_semaphore: Option<std::sync::Arc<tokio::sync::Semaphore>>,
@@ -299,6 +336,8 @@ pub async fn run_supervisor_with_control_socket(
         "supervisor daemon started"
     );
     let mut shutdown_rx = setup_signal_handlers();
+    let run_started_at = chrono::Utc::now();
+    let mut next_summary = Instant::now() + Duration::from_secs(60);
     let tick_interval = std::time::Duration::from_millis(config.tick_interval_ms);
     let global_semaphore = config
         .global_max_concurrency
@@ -320,6 +359,10 @@ pub async fn run_supervisor_with_control_socket(
                 }
             }
             () = tokio::time::sleep(tick_interval) => {
+                if Instant::now() >= next_summary {
+                    log_run_summary(&projects, run_started_at);
+                    next_summary += Duration::from_secs(60);
+                }
                 if let Err(error) = rotate_log(&config) { tracing::warn!(%error, "log rotation failed"); }
                 let tick = tick_supervised_projects_with_global(&projects, global_semaphore.clone());
                 tokio::pin!(tick);
