@@ -719,6 +719,18 @@ impl QueueLoop {
         base_worker_config: &crate::worker::process::WorkerConfig,
         max_concurrency: usize,
     ) -> std::io::Result<u32> {
+        self.dispatch_ready_orbs_with_global(base_worker_config, max_concurrency, None)
+            .await
+    }
+
+    /// Dispatches ready work subject to the project-local limit and an
+    /// optional supervisor-wide permit pool.
+    pub async fn dispatch_ready_orbs_with_global(
+        &self,
+        base_worker_config: &crate::worker::process::WorkerConfig,
+        max_concurrency: usize,
+        global_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    ) -> std::io::Result<u32> {
         use tokio::sync::Semaphore;
         use tokio::task::JoinSet;
 
@@ -762,6 +774,7 @@ impl QueueLoop {
 
         for (orb, target) in targets {
             let sem = semaphore.clone();
+            let global_semaphore = global_semaphore.clone();
             let store = self.orb_store.clone();
             let dep_store = self.dep_store.clone();
             let base_wc = base_worker_config.clone();
@@ -776,6 +789,13 @@ impl QueueLoop {
             join_set.spawn(async move {
                 let Ok(_permit) = sem.acquire_owned().await else {
                     return Ok(false);
+                };
+                let _global_permit = match global_semaphore {
+                    Some(semaphore) => match semaphore.acquire_owned().await {
+                        Ok(permit) => Some(permit),
+                        Err(_) => return Ok(false),
+                    },
+                    None => None,
                 };
                 let context = DispatchContext {
                     orbs: &context_orbs,

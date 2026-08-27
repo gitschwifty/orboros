@@ -17,6 +17,8 @@ pub struct DaemonConfig {
     pub log_max_size: u64,
     /// Tick interval in milliseconds (default: 1000).
     pub tick_interval_ms: u64,
+    /// Optional aggregate cap shared by all supervisor-managed projects.
+    pub global_max_concurrency: Option<usize>,
 }
 
 impl Default for DaemonConfig {
@@ -30,6 +32,7 @@ impl Default for DaemonConfig {
             log_file: None,
             log_max_size: 10 * 1024 * 1024, // 10 MB
             tick_interval_ms: 1000,
+            global_max_concurrency: None,
         }
     }
 }
@@ -203,7 +206,10 @@ pub struct SupervisedProject {
     pub dispatch: Option<DispatchSettings>,
 }
 
-async fn tick_project(project: &SupervisedProject) {
+async fn tick_project(
+    project: &SupervisedProject,
+    global_semaphore: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+) {
     let project_name = project.name.as_str();
     match project.queue.tick_async().await {
         Ok(result) if !result.is_idle() => tracing::debug!(
@@ -224,7 +230,11 @@ async fn tick_project(project: &SupervisedProject) {
     if let Some(settings) = &project.dispatch {
         match project
             .queue
-            .dispatch_ready_orbs(&settings.base_worker_config, settings.max_concurrency)
+            .dispatch_ready_orbs_with_global(
+                &settings.base_worker_config,
+                settings.max_concurrency,
+                global_semaphore,
+            )
             .await
         {
             Ok(0) => {}
@@ -246,7 +256,7 @@ async fn tick_project(project: &SupervisedProject) {
 /// without waiting for signals or a timer.
 pub async fn tick_supervised_projects(projects: &[SupervisedProject]) {
     for project in projects {
-        tick_project(project).await;
+        tick_project(project, None).await;
     }
 }
 
@@ -275,6 +285,9 @@ pub async fn run_supervisor_with_control_socket(
     );
     let mut shutdown_rx = setup_signal_handlers();
     let tick_interval = std::time::Duration::from_millis(config.tick_interval_ms);
+    let global_semaphore = config
+        .global_max_concurrency
+        .map(|limit| std::sync::Arc::new(tokio::sync::Semaphore::new(limit.max(1))));
     let control_supervisor = control_socket
         .as_ref()
         .map(|(_, supervisor)| std::sync::Arc::clone(supervisor));
@@ -293,7 +306,9 @@ pub async fn run_supervisor_with_control_socket(
             }
             () = tokio::time::sleep(tick_interval) => {
                 if let Err(error) = rotate_log(&config) { tracing::warn!(%error, "log rotation failed"); }
-                tick_supervised_projects(&projects).await;
+                for project in &projects {
+                    tick_project(project, global_semaphore.clone()).await;
+                }
                 if let Some(supervisor) = &control_supervisor {
                     let (mut queues, dispatch) = supervisor.lock().await.take_attached_queues();
                     for (name, queue) in &mut queues {
@@ -302,7 +317,7 @@ pub async fn run_supervisor_with_control_socket(
                             continue;
                         }
                         if let Some(Some(settings)) = dispatch.get(name) {
-                            if let Err(error) = queue.dispatch_ready_orbs(&settings.base_worker_config, settings.max_concurrency).await {
+                            if let Err(error) = queue.dispatch_ready_orbs_with_global(&settings.base_worker_config, settings.max_concurrency, global_semaphore.clone()).await {
                                 tracing::error!(project = %name, %error, "dynamically attached project dispatch failed");
                             }
                         }
@@ -443,6 +458,7 @@ mod tests {
             log_file: None,
             log_max_size: 10 * 1024 * 1024,
             tick_interval_ms: 1000,
+            global_max_concurrency: None,
         }
     }
 

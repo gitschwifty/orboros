@@ -1086,6 +1086,9 @@ fn apply_daemon_settings(
     if let Some(tick_interval_ms) = settings.tick_interval_ms {
         daemon_config.tick_interval_ms = tick_interval_ms;
     }
+    if let Some(global_max_concurrency) = settings.global_max_concurrency {
+        daemon_config.global_max_concurrency = Some(global_max_concurrency);
+    }
 }
 
 #[allow(clippy::too_many_lines)]

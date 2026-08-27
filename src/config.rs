@@ -121,6 +121,18 @@ pub struct DaemonSettingsConfig {
     pub log_file: Option<String>,
     pub log_max_size: Option<u64>,
     pub tick_interval_ms: Option<u64>,
+    /// Optional aggregate worker cap for a multi-project supervisor. Each
+    /// project's `max_concurrency` remains its independent local limit.
+    pub global_max_concurrency: Option<usize>,
+}
+
+impl DaemonSettingsConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.global_max_concurrency == Some(0) {
+            return Err("daemon.global_max_concurrency must be greater than zero".into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -883,6 +895,7 @@ pub(crate) fn load_config_with_home_and_bench(
         .map_err(|e| anyhow::anyhow!(e))?;
     config.models.validate().map_err(|e| anyhow::anyhow!(e))?;
     config.workers.validate().map_err(|e| anyhow::anyhow!(e))?;
+    config.daemon.validate().map_err(|e| anyhow::anyhow!(e))?;
     validate_profiles(&config.tool_profiles).map_err(|e| anyhow::anyhow!(e))?;
     Ok(config)
 }
@@ -2045,6 +2058,7 @@ system = "project speccing"
                 log_file: Some("/tmp/orboros.log".into()),
                 log_max_size: Some(42),
                 tick_interval_ms: Some(500),
+                global_max_concurrency: Some(3),
             },
         };
         let serialized = toml::to_string_pretty(&cfg).unwrap();
