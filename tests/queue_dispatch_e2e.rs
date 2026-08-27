@@ -14,7 +14,7 @@ use orboros::worker::process::WorkerConfig;
 use orbs::dep::{DepEdge, EdgeType};
 use orbs::dep_store::DepStore;
 use orbs::id::OrbId;
-use orbs::orb::{Orb, OrbStatus, OrbType};
+use orbs::orb::{Orb, OrbPhase, OrbStatus, OrbType};
 use orbs::orb_store::OrbStore;
 
 fn make_executable(path: &Path) {
@@ -127,7 +127,8 @@ async fn dispatch_ready_orbs_injects_orb_context_into_user_prompt() {
     let orb_store = OrbStore::new(base.join("orbs.jsonl"));
     let dep_store = DepStore::new(base.join("deps.jsonl"));
 
-    let parent = Orb::new("Parent feature", "Parent spec").with_type(OrbType::Feature);
+    let mut parent = Orb::new("Parent feature", "Parent spec").with_type(OrbType::Feature);
+    parent.phase = Some(OrbPhase::Waiting);
     let mut blocker = active_task_orb("Prepare dependency");
     blocker.set_status(OrbStatus::Done).unwrap();
     blocker.result = Some("dependency output".into());
@@ -213,8 +214,9 @@ done
     let base = dir.path().to_path_buf();
     let orb_store = OrbStore::new(base.join("orbs.jsonl"));
     let dep_store = DepStore::new(base.join("deps.jsonl"));
-    let parent =
+    let mut parent =
         Orb::new("Parent", "must pass the focused verification").with_type(OrbType::Feature);
+    parent.phase = Some(OrbPhase::Waiting);
     let mut child = active_task_orb("Child");
     child.parent_id = Some(parent.id.clone());
     child.root_id = Some(parent.id.clone());

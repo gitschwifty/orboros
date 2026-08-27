@@ -1072,7 +1072,7 @@ impl ProjectEntry {
             })
             .collect();
         let hash = Sha256::digest(self.name.as_bytes());
-        format!("{readable}-{:x}", hash)[..readable.len() + 13].to_string()
+        format!("{readable}-{hash:x}")[..readable.len() + 13].to_string()
     }
 
     /// Returns the user-local authoritative state home for this project.
@@ -1228,9 +1228,11 @@ pub fn init_project(home: &Path, project_dir: &Path) -> anyhow::Result<()> {
         .lines()
         .any(|line| line.trim() == ignore_rule)
     {
-        let separator = (!existing_ignore.is_empty() && !existing_ignore.ends_with('\n'))
-            .then_some("\n")
-            .unwrap_or("");
+        let separator = if !existing_ignore.is_empty() && !existing_ignore.ends_with('\n') {
+            "\n"
+        } else {
+            ""
+        };
         std::fs::write(
             &gitignore_path,
             format!("{existing_ignore}{separator}{ignore_rule}\n"),

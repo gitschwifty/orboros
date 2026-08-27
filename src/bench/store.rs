@@ -349,7 +349,7 @@ impl BenchStorageReport {
         }
         if self.oldest_modified.is_some_and(|oldest| {
             now.duration_since(oldest)
-                .map_or(false, |age| age.as_secs() >= 90 * 24 * 60 * 60)
+                .is_ok_and(|age| age.as_secs() >= 90 * 24 * 60 * 60)
         }) {
             warnings
                 .push("benchmark evidence is older than 90 days; review retention policy".into());

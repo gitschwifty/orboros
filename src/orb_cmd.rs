@@ -14,6 +14,35 @@ use orbs::task::TaskStatus;
 
 use crate::hooks::{FireCtx, HookEvent, HookSink};
 
+const OPERATOR_UPDATE_DELIMITER: &str = "--- Operator update ---";
+
+fn orb_snapshots(store: &OrbStore, id: &str) -> anyhow::Result<Vec<Orb>> {
+    Ok(std::fs::read_to_string(store.path())?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Orb>(line).ok())
+        .filter(|orb| orb.id.to_string() == id)
+        .collect())
+}
+
+/// Returns the last worker-dispatchable phase before a failure. Aggregate
+/// phases are deliberately excluded: restoring a failed parent must never
+/// cause its children to start as a side effect of reset.
+fn retry_phase_from_history(snapshots: &[Orb]) -> Option<OrbPhase> {
+    snapshots
+        .iter()
+        .rev()
+        .find_map(|snapshot| match snapshot.phase {
+            Some(
+                phase @ (OrbPhase::Speccing
+                | OrbPhase::Decomposing
+                | OrbPhase::Refining
+                | OrbPhase::Reevaluating
+                | OrbPhase::Executing),
+            ) => Some(phase),
+            _ => None,
+        })
+}
+
 /// Materializes the valid decomposition response already saved on a parent.
 /// This recovers queues dispatched before runtime materialization existed and
 /// does not spawn a worker or change the parent's current phase.
@@ -63,6 +92,7 @@ pub fn cmd_orb_recover_decomposition(
 /// diagnostic record. Phase parents return to the failed dispatch phase;
 /// ordinary task orbs return to Pending.
 pub fn cmd_orb_reset(store: &OrbStore, id: &str) -> anyhow::Result<()> {
+    let snapshots = orb_snapshots(store, id)?;
     let mut orb = store
         .load_by_id(&OrbId::from_raw(id))?
         .ok_or_else(|| anyhow::anyhow!("orb not found: {id}"))?;
@@ -75,13 +105,17 @@ pub fn cmd_orb_reset(store: &OrbStore, id: &str) -> anyhow::Result<()> {
             .execution
             .as_ref()
             .and_then(|execution| execution.prompt_category.as_deref());
-        orb.phase = Some(match category {
-            Some("phase.speccing") => OrbPhase::Speccing,
-            Some("phase.decomposing") => OrbPhase::Decomposing,
-            Some("phase.refining") => OrbPhase::Refining,
-            Some("phase.reevaluating") => OrbPhase::Reevaluating,
-            _ => OrbPhase::Executing,
-        });
+        orb.phase = Some(category.map_or_else(
+            || retry_phase_from_history(&snapshots).unwrap_or(OrbPhase::Executing),
+            |category| match category {
+                "phase.speccing" => OrbPhase::Speccing,
+                "phase.decomposing" => OrbPhase::Decomposing,
+                "phase.refining" => OrbPhase::Refining,
+                "phase.reevaluating" => OrbPhase::Reevaluating,
+                _ => OrbPhase::Executing,
+            },
+        ));
+        orb.closed_at = None;
     } else {
         orb.status = Some(OrbStatus::Pending);
         orb.closed_at = None;
@@ -89,6 +123,99 @@ pub fn cmd_orb_reset(store: &OrbStore, id: &str) -> anyhow::Result<()> {
     orb.execution = None;
     store.update(&orb)?;
     println!("Reset {id} for retry.");
+    Ok(())
+}
+
+/// Restores an earlier append-only snapshot for an orb.
+pub fn cmd_orb_rollback(store: &OrbStore, id: &str, count: usize) -> anyhow::Result<()> {
+    let snapshots = orb_snapshots(store, id)?;
+    anyhow::ensure!(
+        snapshots.len() > count,
+        "orb {id} has no snapshot {count} step(s) back"
+    );
+    restore_snapshot(store, id, snapshots[snapshots.len() - 1 - count].clone())?;
+    println!("Rolled back {id} by {count} snapshot(s).");
+    Ok(())
+}
+
+pub fn cmd_orb_rollback_list(store: &OrbStore, id: &str) -> anyhow::Result<()> {
+    let snapshots = orb_snapshots(store, id)?;
+    let executions = crate::execution::ExecutionStore::new(
+        store
+            .path()
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("executions.jsonl"),
+    )
+    .read_all()?;
+    for (index, orb) in snapshots.iter().enumerate() {
+        let phase = orb
+            .phase
+            .map_or_else(|| "-".into(), |value| format!("{value:?}"));
+        let status = orb
+            .status
+            .map_or_else(String::new, |value| format!(" status={value:?}"));
+        let refinement = executions
+            .iter()
+            .rev()
+            .find(|record| record.orb_id == id && record.completed_at <= orb.updated_at)
+            .and_then(|record| record.refinement_round.as_ref())
+            .map_or_else(String::new, |round| {
+                format!(
+                    " refinement_round={}/{} material_changed={}{}",
+                    round.round,
+                    round.max_rounds,
+                    round.material_changed,
+                    round
+                        .termination_reason
+                        .as_ref()
+                        .map_or(String::new(), |reason| format!(" termination={reason}"))
+                )
+            });
+        println!(
+            "{index}: phase={phase}{status}{refinement} safe_restore={} updated_at={}",
+            snapshot_is_safe_to_restore(orb),
+            orb.updated_at
+        );
+    }
+    Ok(())
+}
+
+pub fn cmd_orb_restore_checkpoint(
+    store: &OrbStore,
+    id: &str,
+    checkpoint: usize,
+) -> anyhow::Result<()> {
+    let snapshots = orb_snapshots(store, id)?;
+    let orb = snapshots
+        .get(checkpoint)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("checkpoint {checkpoint} not found for {id}"))?;
+    restore_snapshot(store, id, orb)?;
+    println!("Restored {id} checkpoint {checkpoint}.");
+    Ok(())
+}
+
+fn snapshot_is_safe_to_restore(orb: &Orb) -> bool {
+    !matches!(orb.phase, Some(OrbPhase::ExecutingChildren))
+}
+
+fn restore_snapshot(store: &OrbStore, id: &str, mut orb: Orb) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        snapshot_is_safe_to_restore(&orb),
+        "orb {id} checkpoint is ExecutingChildren and cannot be restored; choose a worker phase checkpoint"
+    );
+    // Keep the historical `updated_at` as the ledger cutoff. The refinement
+    // dispatcher only considers evidence at or before that checkpoint, so a
+    // restore cannot inherit later rounds and skip ahead to child execution.
+    orb.execution = None;
+    if !matches!(
+        orb.phase,
+        Some(OrbPhase::Done | OrbPhase::Failed | OrbPhase::Cancelled | OrbPhase::Tombstone)
+    ) {
+        orb.closed_at = None;
+    }
+    store.update(&orb)?;
     Ok(())
 }
 
@@ -581,6 +708,30 @@ pub fn cmd_orb_update(
             let _ = sink.fire_blocking(HookEvent::OnCancel, FireCtx::for_orb(&orb));
         }
     }
+    Ok(())
+}
+
+/// Appends operator-supplied context without discarding the existing task
+/// specification.  The delimiter keeps repeated updates legible in both the
+/// CLI and the raw append-only orb history.
+pub fn cmd_orb_append_description(store: &OrbStore, id: &str, text: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !text.trim().is_empty(),
+        "append-description must not be empty"
+    );
+    let mut orb = store
+        .load_by_id(&OrbId::from_raw(id))?
+        .ok_or_else(|| anyhow::anyhow!("orb {id} not found"))?;
+    if !orb.description.trim().is_empty() {
+        orb.description.push_str("\n\n");
+        orb.description.push_str(OPERATOR_UPDATE_DELIMITER);
+        orb.description.push_str("\n\n");
+    }
+    orb.description.push_str(text.trim());
+    orb.updated_at = chrono::Utc::now();
+    orb.update_content_hash();
+    store.update(&orb)?;
+    println!("Appended description for orb {}", orb.id);
     Ok(())
 }
 
@@ -1441,6 +1592,72 @@ mod tests {
         assert_eq!(loaded.title, "Updated title");
         assert_eq!(loaded.priority, 1);
         assert_eq!(loaded.description, "desc"); // unchanged
+    }
+
+    #[test]
+    fn append_description_preserves_specification_with_delimiter() {
+        let (_dir, store) = temp_orb_store();
+        let orb = cmd_orb_create(
+            &store,
+            "Orb",
+            "Original specification",
+            OrbType::Task,
+            3,
+            vec![],
+            None,
+        )
+        .unwrap();
+        let id = orb.id.to_string();
+
+        cmd_orb_append_description(&store, &id, "Please also handle the error path.").unwrap();
+
+        let loaded = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
+        assert_eq!(
+            loaded.description,
+            "Original specification\n\n--- Operator update ---\n\nPlease also handle the error path."
+        );
+    }
+
+    #[test]
+    fn append_description_rejects_blank_input() {
+        let (_dir, store) = temp_orb_store();
+        let orb =
+            cmd_orb_create(&store, "Orb", "Original", OrbType::Task, 3, vec![], None).unwrap();
+        assert!(cmd_orb_append_description(&store, &orb.id.to_string(), " \n ").is_err());
+    }
+
+    #[test]
+    fn reset_failed_parent_without_marker_uses_prior_dispatch_phase() {
+        let (_dir, store) = temp_orb_store();
+        let mut parent = Orb::new("Parent", "specification").with_type(OrbType::Epic);
+        parent.phase = Some(OrbPhase::Refining);
+        let id = parent.id.to_string();
+        store.append(&parent).unwrap();
+
+        parent.phase = Some(OrbPhase::Failed);
+        parent.execution = None;
+        store.update(&parent).unwrap();
+
+        cmd_orb_reset(&store, &id).unwrap();
+        let restored = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
+        assert_eq!(restored.phase, Some(OrbPhase::Refining));
+        assert!(restored.execution.is_none());
+        assert!(restored.closed_at.is_none());
+    }
+
+    #[test]
+    fn rollback_refuses_executing_children_snapshot() {
+        let (_dir, store) = temp_orb_store();
+        let mut parent = Orb::new("Parent", "specification").with_type(OrbType::Epic);
+        parent.phase = Some(OrbPhase::ExecutingChildren);
+        let id = parent.id.to_string();
+        store.append(&parent).unwrap();
+
+        parent.phase = Some(OrbPhase::Failed);
+        store.update(&parent).unwrap();
+
+        let error = cmd_orb_rollback(&store, &id, 1).unwrap_err();
+        assert!(error.to_string().contains("ExecutingChildren"));
     }
 
     #[test]

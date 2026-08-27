@@ -425,6 +425,9 @@ enum OrbAction {
         /// New description.
         #[arg(long)]
         description: Option<String>,
+        /// Append operator context to the description without replacing it.
+        #[arg(long, conflicts_with = "description")]
+        append_description: Option<String>,
         /// New priority (1-5).
         #[arg(short, long)]
         priority: Option<u8>,
@@ -478,6 +481,18 @@ enum OrbAction {
         /// Failed orb ID.
         id: String,
     },
+    /// Restore an earlier append-only orb snapshot.
+    Rollback {
+        /// Orb ID.
+        id: String,
+        /// Number of snapshots to roll back (default: 1).
+        #[arg(long, default_value_t = 1)]
+        count: usize,
+        #[arg(long)]
+        checkpoint: Option<usize>,
+    },
+    /// List restorable orb checkpoints.
+    RollbackList { id: String },
     /// Apply a review decision (approve, reject, revise).
     Review {
         /// Orb ID.
@@ -578,9 +593,11 @@ fn safe_log_component(value: &str) -> String {
             }
         })
         .collect::<String>();
-    (!component.is_empty())
-        .then_some(component)
-        .unwrap_or_else(|| "project".into())
+    if component.is_empty() {
+        "project".into()
+    } else {
+        component
+    }
 }
 
 fn project_log_file(
@@ -978,6 +995,7 @@ fn main() -> anyhow::Result<()> {
                     id,
                     title,
                     description,
+                    append_description,
                     priority,
                     status,
                     confidence,
@@ -1004,6 +1022,9 @@ fn main() -> anyhow::Result<()> {
                         hooks_ref,
                     );
                     result?;
+                    if let Some(text) = append_description {
+                        orb_cmd::cmd_orb_append_description(&orb_store, &id, &text)?;
+                    }
                     if let Some(value) = parent_final_work {
                         orb_cmd::cmd_orb_set_parent_final_work(&orb_store, &id, value)?;
                     }
@@ -1042,6 +1063,15 @@ fn main() -> anyhow::Result<()> {
                     )
                 }
                 OrbAction::Reset { id } => orb_cmd::cmd_orb_reset(&orb_store, &id),
+                OrbAction::Rollback {
+                    id,
+                    count,
+                    checkpoint,
+                } => checkpoint.map_or_else(
+                    || orb_cmd::cmd_orb_rollback(&orb_store, &id, count),
+                    |value| orb_cmd::cmd_orb_restore_checkpoint(&orb_store, &id, value),
+                ),
+                OrbAction::RollbackList { id } => orb_cmd::cmd_orb_rollback_list(&orb_store, &id),
                 OrbAction::Review { id, decision } => {
                     orb_cmd::cmd_orb_review(&orb_store, &id, &decision, hooks_ref)
                 }
@@ -1734,6 +1764,7 @@ fn cmd_supervisor_attach(home: &Path, project_name: &str) -> anyhow::Result<()> 
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn cmd_supervisor_start(
     home: &Path,
     daemon_config: DaemonConfig,

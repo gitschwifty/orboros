@@ -31,6 +31,31 @@ fn completed_dispatch_retry_backoff(retries_completed: u32) -> Duration {
         .min(COMPLETED_DISPATCH_RETRY_MAX)
 }
 
+/// Determines the last completed refinement round visible from an orb
+/// checkpoint. Restored snapshots retain their original timestamp, which
+/// makes the append-only execution ledger a bounded, history-aware view.
+fn completed_refinement_round_at_checkpoint(
+    records: &[crate::execution::ExecutionRecord],
+    orb_id: &str,
+    checkpoint: chrono::DateTime<chrono::Utc>,
+) -> u32 {
+    records
+        .iter()
+        .filter(|record| record.orb_id == orb_id && record.completed_at <= checkpoint)
+        .filter_map(|record| record.refinement_round.as_ref())
+        .map(|diagnostic| {
+            // A failed round was never applied. Re-run that ordinal rather
+            // than treating the diagnostic as completed progress.
+            if diagnostic.termination_reason.as_deref() == Some("worker_failed") {
+                diagnostic.round.saturating_sub(1)
+            } else {
+                diagnostic.round
+            }
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// Result of a single tick of the queue loop.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TickResult {
@@ -1357,16 +1382,12 @@ async fn dispatch_one_owned(
         // A reset preserves the edits already applied to the orb. Resume the
         // next unfinished round from existing evidence rather than replaying
         // those successful rounds or adding a new mutable orb-state field.
-        let resumed_round = execution_store
-            .read_all()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|record| record.orb_id == orb.id.to_string() && record.status == "done")
-            .filter_map(|record| record.refinement_round)
-            .filter(|round| round.termination_reason.is_none())
-            .map(|round| round.round)
-            .max()
-            .unwrap_or(0);
+        let refinement_history = execution_store.read_all().unwrap_or_default();
+        let resumed_round = completed_refinement_round_at_checkpoint(
+            &refinement_history,
+            &orb.id.to_string(),
+            orb.updated_at,
+        );
         let mut round = resumed_round.saturating_add(1).max(1);
         loop {
             let Some(response) = outcome.response.as_deref() else {
@@ -1774,6 +1795,42 @@ mod tests {
         assert!(completed_dispatch_retry_allowed(2, 1));
         assert!(!completed_dispatch_retry_allowed(2, 2));
         assert!(completed_dispatch_retry_allowed(-1, 10_000));
+    }
+
+    #[test]
+    fn refinement_checkpoint_retries_failed_round_without_reading_later_history() {
+        let first = chrono::Utc::now();
+        let failed_second = first + chrono::Duration::seconds(1);
+        let later_third = first + chrono::Duration::seconds(2);
+        let record = |round, completed_at, termination_reason: Option<&str>| {
+            serde_json::from_value(serde_json::json!({
+                "orb_id": "orb-refine",
+                "parent_id": null,
+                "dispatch_kind": "phase.refining",
+                "status": termination_reason.map_or("done", |_| "error"),
+                "dispatched_at": first,
+                "completed_at": completed_at,
+                "refinement_round": {
+                    "round": round,
+                    "max_rounds": 3,
+                    "material_changed": true,
+                    "model_declared_complete": false,
+                    "termination_reason": termination_reason,
+                },
+            }))
+            .unwrap()
+        };
+        let records = vec![
+            record(1, first, None),
+            record(2, failed_second, Some("worker_failed")),
+            record(3, later_third, Some("max_rounds")),
+        ];
+
+        assert_eq!(
+            completed_refinement_round_at_checkpoint(&records, "orb-refine", failed_second),
+            1,
+            "round two must be retried and later round-three evidence ignored"
+        );
     }
 
     #[test]

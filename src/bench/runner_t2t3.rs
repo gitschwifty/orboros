@@ -535,10 +535,10 @@ fn grader_candidate_diff(seed_dir: &Path, workdir: &Path) -> String {
     command.arg("-ruN");
     add_generated_path_exclusions(&mut command);
     command.arg(seed_dir).arg(workdir);
-    command
-        .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_else(|error| format!("(could not collect candidate diff: {error})"))
+    command.output().map_or_else(
+        |error| format!("(could not collect candidate diff: {error})"),
+        |output| String::from_utf8_lossy(&output.stdout).into_owned(),
+    )
 }
 
 /// Paths excluded from candidate diffs and grader evidence. The benchmark
@@ -1005,7 +1005,9 @@ async fn fresh_decomposition_retry(
         }
     });
     diagnostic.fresh_retry_succeeded = Some(retry_plan.is_some());
-    diagnostic.fresh_retry_parse_error = retry_parse_error.clone();
+    diagnostic
+        .fresh_retry_parse_error
+        .clone_from(&retry_parse_error);
     let mut record = crate::execution::ExecutionRecord::from_outcome(
         root,
         "phase.decomposing",
@@ -1638,9 +1640,8 @@ pub async fn run_t3_case(
             "run_t3_case called on non-T3 case"
         );
     }
-    let criteria = match &case.expected {
-        BenchExpected::Rubric { criteria } => criteria,
-        _ => return Err(HarnessError::MissingRubric(case.id.clone())),
+    let BenchExpected::Rubric { criteria } = &case.expected else {
+        return Err(HarnessError::MissingRubric(case.id.clone()));
     };
 
     // T3 defaults to a genuinely empty project. A case-local fixture remains

@@ -1,6 +1,13 @@
 #![warn(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::must_use_candidate)]
+// Benchmark orchestration necessarily composes sizeable async state machines;
+// IPC/decomposition capability records mirror external protocol booleans.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::large_futures,
+    clippy::struct_excessive_bools
+)]
 // Public CLI and IPC boundaries deliberately use Result-returning helpers,
 // compact enums, and a few orchestration functions whose shape is clearer
 // than splitting them merely to satisfy style thresholds.

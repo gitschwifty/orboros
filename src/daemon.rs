@@ -238,7 +238,7 @@ fn log_run_summary(projects: &[SupervisedProject], started: chrono::DateTime<chr
                 }
             }
             Err(error) => {
-                tracing::warn!(project = %project.name, %error, "could not read execution summary")
+                tracing::warn!(project = %project.name, %error, "could not read execution summary");
             }
         }
     }
@@ -351,7 +351,7 @@ pub async fn run_supervisor_with_control_socket(
     let run_started_at = chrono::Utc::now();
     let summary_projects = projects.clone();
     let summary_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        let mut interval = tokio::time::interval(Duration::from_mins(1));
         interval.tick().await;
         loop {
             interval.tick().await;

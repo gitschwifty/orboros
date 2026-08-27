@@ -366,7 +366,6 @@ pub struct ProjectStateAuthority {
     state_dir: PathBuf,
     lease: ProjectStateLease,
     journal: OperationJournal,
-    projection: StateProjection,
 }
 
 /// The project registry owned by one user-level supervisor process.
@@ -497,7 +496,11 @@ impl SupervisorStoreWriter {
         }
     }
 
-    fn submit(&self, mutation: SharedStateMutation, base_revision: Option<u64>) -> io::Result<u64> {
+    fn submit(
+        &self,
+        mutation: &SharedStateMutation,
+        base_revision: Option<u64>,
+    ) -> io::Result<u64> {
         const MAX_CONFLICT_RETRIES: u8 = 4;
         for _ in 0..MAX_CONFLICT_RETRIES {
             let revision = match base_revision {
@@ -506,16 +509,13 @@ impl SupervisorStoreWriter {
             };
             let operation =
                 StateOperation::mutation(uuid::Uuid::new_v4(), revision, mutation.clone());
-            match self.request(SupervisorRequest::Mutate {
+            match self.request(&SupervisorRequest::Mutate {
                 project_name: self.project_name.clone(),
                 operation,
             })? {
                 SupervisorResponse::Accepted { receipt } => return Ok(receipt.revision),
                 SupervisorResponse::Rejected { code, .. }
-                    if code == "revision_conflict" && base_revision.is_none() =>
-                {
-                    continue
-                }
+                    if code == "revision_conflict" && base_revision.is_none() => {}
                 SupervisorResponse::Rejected { code, detail } if code == "revision_conflict" => {
                     return Err(io::Error::new(
                         io::ErrorKind::WouldBlock,
@@ -542,10 +542,10 @@ impl SupervisorStoreWriter {
 
     /// Submit related mutations as one revisioned, replayable operation.
     pub fn submit_batch(&self, mutations: Vec<SharedStateMutation>) -> io::Result<u64> {
-        self.submit(SharedStateMutation::Batch { mutations }, None)
+        self.submit(&SharedStateMutation::Batch { mutations }, None)
     }
 
-    fn request(&self, request: SupervisorRequest) -> io::Result<SupervisorResponse> {
+    fn request(&self, request: &SupervisorRequest) -> io::Result<SupervisorResponse> {
         let mut stream = StdUnixStream::connect(&self.socket_path)?;
         let row = serde_json::to_vec(&request).map_err(io::Error::other)?;
         stream.write_all(&row)?;
@@ -563,7 +563,7 @@ impl SupervisorStoreWriter {
     }
 
     fn snapshot_revision(&self) -> io::Result<u64> {
-        match self.request(SupervisorRequest::Status {
+        match self.request(&SupervisorRequest::Status {
             project_name: self.project_name.clone(),
         })? {
             SupervisorResponse::Status { revision } => Ok(revision),
@@ -584,7 +584,7 @@ impl OrbWriteSink for SupervisorStoreWriter {
 
     fn write_orb(&self, orb: &Orb, base_revision: Option<u64>) -> io::Result<u64> {
         self.submit(
-            SharedStateMutation::UpsertOrb { orb: orb.clone() },
+            &SharedStateMutation::UpsertOrb { orb: orb.clone() },
             base_revision,
         )
     }
@@ -597,7 +597,7 @@ impl DepWriteSink for SupervisorStoreWriter {
 
     fn write_edge(&self, edge: &DepEdge, base_revision: Option<u64>) -> io::Result<u64> {
         self.submit(
-            SharedStateMutation::UpsertDependency { edge: edge.clone() },
+            &SharedStateMutation::UpsertDependency { edge: edge.clone() },
             base_revision,
         )
     }
@@ -758,8 +758,7 @@ impl LocalSupervisor {
             crate::daemon::DispatchSettings {
                 base_worker_config,
                 max_concurrency: crate::config::load_config(authority.project().config_root())
-                    .map(|config| config.max_concurrency)
-                    .unwrap_or(1),
+                    .map_or(1, |config| config.max_concurrency),
             }
         })
         .map_err(|error| tracing::warn!(project = %project_name, %error, "dynamic project dispatch disabled"))
@@ -828,7 +827,6 @@ impl ProjectStateAuthority {
             state_dir,
             lease,
             journal,
-            projection: StateProjection::new(),
         };
         authority.project_pending_operations()?;
         Ok(authority)
@@ -881,9 +879,9 @@ impl ProjectStateAuthority {
     }
 
     fn project_pending_operations(&mut self) -> Result<(), StateProjectionError> {
-        let applied_revision = self.projection.applied_revision(&self.state_dir)?;
+        let applied_revision = StateProjection::applied_revision(&self.state_dir)?;
         for receipt in self.journal.receipts_after(applied_revision) {
-            self.projection.apply(&self.state_dir, &receipt)?;
+            StateProjection::apply(&self.state_dir, &receipt)?;
         }
         Ok(())
     }
@@ -938,15 +936,11 @@ impl ProjectStateAuthority {
 struct StateProjection;
 
 impl StateProjection {
-    fn new() -> Self {
-        Self
-    }
-
     fn watermark_path(state_dir: &Path) -> PathBuf {
         state_dir.join("projection-revision")
     }
 
-    fn applied_revision(&self, state_dir: &Path) -> Result<u64, StateProjectionError> {
+    fn applied_revision(state_dir: &Path) -> Result<u64, StateProjectionError> {
         let path = Self::watermark_path(state_dir);
         match std::fs::read_to_string(&path) {
             Ok(value) => value
@@ -958,8 +952,8 @@ impl StateProjection {
         }
     }
 
-    fn apply(&self, state_dir: &Path, receipt: &StateReceipt) -> Result<(), StateProjectionError> {
-        self.apply_mutation(state_dir, receipt.operation.shared_mutation()?)?;
+    fn apply(state_dir: &Path, receipt: &StateReceipt) -> Result<(), StateProjectionError> {
+        Self::apply_mutation(state_dir, receipt.operation.shared_mutation()?)?;
         let path = Self::watermark_path(state_dir);
         let mut file = OpenOptions::new()
             .create(true)
@@ -977,7 +971,6 @@ impl StateProjection {
     }
 
     fn apply_mutation(
-        &self,
         state_dir: &Path,
         mutation: SharedStateMutation,
     ) -> Result<(), StateProjectionError> {
@@ -990,7 +983,7 @@ impl StateProjection {
             }
             SharedStateMutation::Batch { mutations } => {
                 for mutation in mutations {
-                    self.apply_mutation(state_dir, mutation)?;
+                    Self::apply_mutation(state_dir, mutation)?;
                 }
             }
         }
@@ -1040,6 +1033,7 @@ impl ProjectStateLease {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(&path)
             .map_err(|source| ProjectLeaseError::Open {
                 path: path.clone(),
