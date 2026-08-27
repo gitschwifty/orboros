@@ -95,6 +95,7 @@ impl DrainResult {
 /// Main daemon loop that drives the orb pipeline.
 ///
 /// Polls stores for work and advances orbs through their lifecycle.
+#[derive(Clone)]
 pub struct QueueLoop {
     orb_store: OrbStore,
     dep_store: DepStore,

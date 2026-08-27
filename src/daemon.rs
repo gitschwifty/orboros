@@ -200,6 +200,7 @@ pub struct DispatchSettings {
 }
 
 /// One independently-ticked project managed by the supervisor daemon.
+#[derive(Clone)]
 pub struct SupervisedProject {
     pub name: String,
     pub queue: crate::queue_loop::QueueLoop,
@@ -207,7 +208,7 @@ pub struct SupervisedProject {
 }
 
 async fn tick_project(
-    project: &SupervisedProject,
+    project: SupervisedProject,
     global_semaphore: Option<std::sync::Arc<tokio::sync::Semaphore>>,
 ) {
     let project_name = project.name.as_str();
@@ -255,8 +256,22 @@ async fn tick_project(
 /// public for operator tooling and lets tests exercise supervisor behavior
 /// without waiting for signals or a timer.
 pub async fn tick_supervised_projects(projects: &[SupervisedProject]) {
-    for project in projects {
-        tick_project(project, None).await;
+    tick_supervised_projects_with_global(projects, None).await;
+}
+
+async fn tick_supervised_projects_with_global(
+    projects: &[SupervisedProject],
+    global_semaphore: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+) {
+    let mut tasks = tokio::task::JoinSet::new();
+    for project in projects.iter().cloned() {
+        let global_semaphore = global_semaphore.clone();
+        tasks.spawn(async move { tick_project(project, global_semaphore).await });
+    }
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            tracing::error!(%error, "supervised project tick panicked");
+        }
     }
 }
 
@@ -306,23 +321,17 @@ pub async fn run_supervisor_with_control_socket(
             }
             () = tokio::time::sleep(tick_interval) => {
                 if let Err(error) = rotate_log(&config) { tracing::warn!(%error, "log rotation failed"); }
-                for project in &projects {
-                    tick_project(project, global_semaphore.clone()).await;
-                }
+                tick_supervised_projects_with_global(&projects, global_semaphore.clone()).await;
                 if let Some(supervisor) = &control_supervisor {
-                    let (mut queues, dispatch) = supervisor.lock().await.take_attached_queues();
-                    for (name, queue) in &mut queues {
-                        if let Err(error) = queue.tick_async().await {
-                            tracing::error!(project = %name, %error, "dynamically attached project tick failed");
-                            continue;
-                        }
-                        if let Some(Some(settings)) = dispatch.get(name) {
-                            if let Err(error) = queue.dispatch_ready_orbs_with_global(&settings.base_worker_config, settings.max_concurrency, global_semaphore.clone()).await {
-                                tracing::error!(project = %name, %error, "dynamically attached project dispatch failed");
-                            }
-                        }
-                        queue.fire_on_queue_tick().await;
-                    }
+                    let (queues, dispatch) = supervisor.lock().await.take_attached_queues();
+                    let attached: Vec<_> = queues.iter().filter_map(|(name, queue)| {
+                        Some(SupervisedProject {
+                            name: name.clone(),
+                            queue: queue.clone(),
+                            dispatch: dispatch.get(name)?.clone(),
+                        })
+                    }).collect();
+                    tick_supervised_projects_with_global(&attached, global_semaphore.clone()).await;
                     supervisor.lock().await.restore_attached_queues(queues, dispatch);
                 }
             }
