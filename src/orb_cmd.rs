@@ -46,6 +46,10 @@ pub fn cmd_orb_recover_decomposition(
     let result = crate::phases::decompose::materialize_plan(&decomposition_parent, &plan)?;
     crate::phases::decompose::apply_decomposition(&result, store, dep_store)?;
     parent.has_parent_final_work = plan.has_parent_final_work;
+    // Legacy runtime decomposition advanced the parent but left its completed
+    // Decomposing dispatch marker behind. Clear it so the current Refining
+    // phase becomes eligible for its normal worker dispatch.
+    parent.execution = None;
     store.update(&parent)?;
     println!(
         "Recovered {} child orb(s) and {} dependency edge(s) for {id}.",
@@ -1751,6 +1755,7 @@ mod tests {
             r#"{"subtasks":[{"title":"child","description":"implement it","order":1}],"has_parent_final_work":true}"#
                 .into(),
         );
+        parent.execution = Some(orbs::orb::ExecutionMeta::default());
         let id = parent.id.to_string();
         store.append(&parent).unwrap();
 
@@ -1760,6 +1765,7 @@ mod tests {
         let recovered = store.load_by_id(&OrbId::from_raw(&id)).unwrap().unwrap();
         assert_eq!(recovered.phase, Some(OrbPhase::Refining));
         assert!(recovered.has_parent_final_work);
+        assert!(recovered.execution.is_none());
         assert_eq!(store.load_children(&recovered.id).unwrap().len(), 1);
         assert_eq!(deps.all_edges().unwrap().len(), 2);
     }
