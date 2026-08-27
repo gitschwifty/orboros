@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -349,7 +349,15 @@ pub async fn run_supervisor_with_control_socket(
     );
     let mut shutdown_rx = setup_signal_handlers();
     let run_started_at = chrono::Utc::now();
-    let mut next_summary = Instant::now() + Duration::from_secs(60);
+    let summary_projects = projects.clone();
+    let summary_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            log_run_summary(&summary_projects, run_started_at);
+        }
+    });
     let tick_interval = std::time::Duration::from_millis(config.tick_interval_ms);
     let global_semaphore = config
         .global_max_concurrency
@@ -371,10 +379,6 @@ pub async fn run_supervisor_with_control_socket(
                 }
             }
             () = tokio::time::sleep(tick_interval) => {
-                if Instant::now() >= next_summary {
-                    log_run_summary(&projects, run_started_at);
-                    next_summary += Duration::from_secs(60);
-                }
                 if let Err(error) = rotate_log(&config) { tracing::warn!(%error, "log rotation failed"); }
                 let tick = tick_supervised_projects_with_global(&projects, global_semaphore.clone());
                 tokio::pin!(tick);
@@ -416,6 +420,7 @@ pub async fn run_supervisor_with_control_socket(
     if let Some(server) = control_server {
         server.abort();
     }
+    summary_task.abort();
     tracing::info!("supervisor daemon stopped");
     Ok(())
 }
