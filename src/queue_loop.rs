@@ -1102,10 +1102,6 @@ fn dispatch_target_for(orb: &Orb) -> Option<DispatchTarget> {
     }
 }
 
-fn optional_debug<T: std::fmt::Debug>(value: Option<T>) -> String {
-    value.map_or_else(|| "none".to_string(), |value| format!("{value:?}"))
-}
-
 /// A deliberately small, content-based snapshot of an assigned workdir.
 /// Runtime and VCS metadata are excluded: they are not task artifacts and can
 /// change while a worker is running without proving implementation progress.
