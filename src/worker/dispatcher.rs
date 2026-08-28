@@ -415,9 +415,15 @@ async fn dispatch_orb_with_retry_limit(
                 retry_attempt = 2,
                 retry_kind = retry_kind_label,
                 terminal = terminal_retry.is_some(),
+                "retrying whole worker dispatch from a fresh worker"
+            );
+            warn!(
+                orb = %orb.id,
+                retry_attempt = 2,
+                retry_kind = retry_kind_label,
                 failure_code,
                 error,
-                "retrying whole worker dispatch from a fresh worker"
+                "worker dispatch retry cause"
             );
             continue;
         }
