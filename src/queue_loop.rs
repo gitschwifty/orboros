@@ -992,7 +992,11 @@ fn load_external_prompt_set(
     let selected = set.prompt_config();
     // A selected set owns its declared roles; roles it omits retain the
     // ordinary layered project configuration and built-in fallback.
+    if selected.default.system.is_some() {
+        prompt_config.default = selected.default;
+    }
     prompt_config.workers.extend(selected.workers);
+    prompt_config.coordinators.extend(selected.coordinators);
     prompt_config.phases.extend(selected.phases);
     Ok(prompt_config)
 }
@@ -1532,10 +1536,17 @@ async fn dispatch_one_owned(
     if target == DispatchTarget::Refining
         && outcome.status == crate::worker::dispatcher::DispatchStatus::Done
     {
+        let reviewer_prompt = prompt_resolver
+            .resolve_system_prompt(
+                crate::prompt::PromptKind::Worker("refinement_review"),
+                crate::phases::second_opinion::REFINEMENT_REVIEWER_SYSTEM_PROMPT,
+            )
+            .map_err(std::io::Error::other)?;
         match crate::phases::second_opinion::run_refinement_reviewer(
             &orb,
             &model_config.second_opinion,
             base_wc,
+            &reviewer_prompt.system_prompt,
         )
         .await
         {

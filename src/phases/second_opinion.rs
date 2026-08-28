@@ -20,6 +20,8 @@ use crate::config::SecondOpinionConfig;
 use crate::phases::prompt_util::extract_fenced_json;
 use crate::worker::process::{Worker, WorkerConfig};
 
+pub const REFINEMENT_REVIEWER_SYSTEM_PROMPT: &str = "You are an independent specification-quality reviewer. Evaluate the current task specification for completeness, internal consistency, concrete deliverables, and verifiable acceptance criteria. Do not approve a merely parseable or empty refinement. Respond with exactly one JSON object, no prose: {\"verdict\": \"accept\"} or {\"verdict\": {\"revise\": {\"scope\": \"decomposition\"}}, \"critique\": \"...\"} or {\"verdict\": \"reject\", \"critique\": \"...\"}.";
+
 /// Errors from the reviewer worker.
 #[derive(Debug, thiserror::Error)]
 pub enum ReviewerError {
@@ -225,17 +227,9 @@ pub async fn run_refinement_reviewer(
     orb: &Orb,
     cfg: &SecondOpinionConfig,
     base_worker_config: &WorkerConfig,
+    system_prompt: &str,
 ) -> Result<ReviewReport, ReviewerError> {
-    let system = format!(
-        "You are an independent specification-quality reviewer. Evaluate the \
-current task specification for completeness, internal consistency, concrete \
-deliverables, and verifiable acceptance criteria. Do not approve a merely \
-parseable or empty refinement. Respond with exactly one JSON object, no prose: \
-{{\"verdict\": \"accept\"}} or {{\"verdict\": {{\"revise\": {{\"scope\": \
-\"decomposition\"}}}}, \"critique\": \"...\"}} or {{\"verdict\": \
-\"reject\", \"critique\": \"...\"}}. {addendum}",
-        addendum = crate::worker::process::CONFIDENCE_PROMPT_ADDENDUM,
-    );
+    let system = crate::prompt::with_confidence_addendum(system_prompt);
     let mut user = format!(
         "Title:\n{}\n\nDescription:\n{}\n",
         orb.title, orb.description

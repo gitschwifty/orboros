@@ -89,6 +89,9 @@ packaged fallback prompts.
 | `reevaluating` | Dependency/blocker reassessment | `[prompts.phases.reevaluating]` |
 | `execute` | Task and parent-final implementation | `[prompts.workers.execute]` |
 | `partial_artifact_recovery` | One bounded recovery/verification pass after a failed changed-workspace dispatch | `[prompts.phases.partial_artifact_recovery]` |
+| `decomposition_review` | Dedicated reviewer contract for a decomposition plan (reserved until that gate is dispatched) | `[prompts.workers.decomposition_review]` |
+| `refinement_review` | Mandatory reviewer after refinement and before child release | `[prompts.workers.refinement_review]` |
+| `completion_review` | Dedicated reviewer contract for completed work (reserved until that gate is dispatched) | `[prompts.workers.completion_review]` |
 
 The non-composable prompt surfaces are still configurable individually:
 
@@ -97,9 +100,10 @@ The non-composable prompt surfaces are still configurable individually:
 | Default fallback | `[prompts.default]` |
 | Worker roles | `[prompts.workers.research]`, `edit`, `review`, `test`, `plan`, `execute` |
 | Coordinator roles | `[prompts.coordinators.decompose]`, `aggregate` |
-| Automated refinement-quality reviewer | Built into the reviewer contract; it currently uses the reviewer model, not a prompt-pack role. |
+| Legacy/general review worker | `[prompts.workers.review]` |
 
-The automated refinement-quality reviewer always runs. To require a human
+The automated refinement-quality reviewer always runs and resolves
+`refinement_review` when a prompt set supplies it. To require a human
 decision after it accepts, set `[review].requires_approval_by_default = true`
 (or set `requires_approval` on an individual orb); otherwise an accepted spec
 advances directly to `Waiting`.

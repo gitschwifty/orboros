@@ -15,12 +15,23 @@ use crate::config::{PromptConfig, PromptOverride};
 use crate::prompt::prompt_hash;
 
 const ROLES: &[&str] = &[
+    "default",
+    "research",
+    "edit",
+    "review",
+    "test",
+    "plan",
+    "aggregate",
+    "coordinator_decompose",
     "speccing",
     "decompose",
     "refining",
     "reevaluating",
     "execute",
     "partial_artifact_recovery",
+    "decomposition_review",
+    "refinement_review",
+    "completion_review",
 ];
 const COMPOSITION_FILE: &str = "composition.toml";
 
@@ -229,8 +240,23 @@ impl BenchPromptSet {
                 )),
             };
             match role.as_str() {
-                "execute" => {
-                    config.workers.insert("execute".into(), prompt);
+                "default" => config.default = prompt,
+                "research"
+                | "edit"
+                | "review"
+                | "test"
+                | "plan"
+                | "execute"
+                | "decomposition_review"
+                | "refinement_review"
+                | "completion_review" => {
+                    config.workers.insert(role.clone(), prompt);
+                }
+                "aggregate" => {
+                    config.coordinators.insert("aggregate".into(), prompt);
+                }
+                "coordinator_decompose" => {
+                    config.coordinators.insert("decompose".into(), prompt);
                 }
                 "decompose" => {
                     config.phases.insert("decomposing".into(), prompt);
@@ -364,6 +390,53 @@ mod tests {
         assert_eq!(
             manifest.roles[0].assembled_sha256,
             prompt_hash("base\n\nrole")
+        );
+    }
+
+    #[test]
+    fn maps_every_prompt_surface_to_its_distinct_runtime_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let set = dir.path().join("prompts/all-roles");
+        fs::create_dir_all(&set).unwrap();
+        for role in [
+            "default",
+            "research",
+            "aggregate",
+            "coordinator_decompose",
+            "decomposition_review",
+            "refinement_review",
+            "completion_review",
+        ] {
+            fs::write(set.join(format!("{role}.md")), role).unwrap();
+        }
+
+        let config = BenchPromptSet::load(dir.path(), "all-roles")
+            .unwrap()
+            .prompt_config();
+        assert_eq!(config.default.system.as_deref(), Some("default"));
+        assert_eq!(
+            config.workers["research"].system.as_deref(),
+            Some("research")
+        );
+        assert_eq!(
+            config.workers["decomposition_review"].system.as_deref(),
+            Some("decomposition_review")
+        );
+        assert_eq!(
+            config.workers["refinement_review"].system.as_deref(),
+            Some("refinement_review")
+        );
+        assert_eq!(
+            config.workers["completion_review"].system.as_deref(),
+            Some("completion_review")
+        );
+        assert_eq!(
+            config.coordinators["decompose"].system.as_deref(),
+            Some("coordinator_decompose")
+        );
+        assert_eq!(
+            config.coordinators["aggregate"].system.as_deref(),
+            Some("aggregate")
         );
     }
 
