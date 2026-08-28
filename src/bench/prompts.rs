@@ -86,7 +86,7 @@ impl BenchPromptSet {
     pub fn load(bench_root: &Path, name: &str) -> anyhow::Result<Self> {
         validate_set_name(name)?;
         let root = bench_root.join("prompts").join(name);
-        Self::load_from_dir_with_name(root, name.to_string())
+        Self::load_from_dir_with_name(root, name)
     }
 
     /// Loads a prompt set from its exact directory. This is used by normal
@@ -103,10 +103,10 @@ impl BenchPromptSet {
             })?
             .to_string();
         validate_set_name(&name)?;
-        Self::load_from_dir_with_name(root, name)
+        Self::load_from_dir_with_name(root, &name)
     }
 
-    fn load_from_dir_with_name(root: PathBuf, name: String) -> anyhow::Result<Self> {
+    fn load_from_dir_with_name(root: PathBuf, name: &str) -> anyhow::Result<Self> {
         if !root.is_dir() {
             anyhow::bail!("prompt set `{name}` not found at {}", root.display());
         }
@@ -208,7 +208,7 @@ impl BenchPromptSet {
             anyhow::bail!("prompt set `{name}` contains no supported role files or compositions");
         }
         Ok(Self {
-            name: name.to_string(),
+            name: name.to_owned(),
             root,
             roles,
             source_files,

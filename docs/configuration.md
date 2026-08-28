@@ -75,6 +75,42 @@ undeclared roles continue through normal config and built-in fallback. Each
 dispatch records a `prompt_set:<name>:<role>:<assembled-sha256>` source plus
 the effective prompt hash in its execution metadata.
 
+### Prompt roles and phases
+
+Use these names in a composable set's `composition.toml` under `[roles.<name>]`.
+Only listed roles are replaced; the rest continue to use ordinary overrides or
+packaged fallback prompts.
+
+| Composable role | Runtime use | Ordinary override key |
+|---|---|---|
+| `speccing` | Initial feature/epic specification | `[prompts.phases.speccing]` |
+| `decompose` | Child-plan generation | `[prompts.phases.decomposing]` |
+| `refining` | Structured specification refinement | `[prompts.phases.refining]` |
+| `reevaluating` | Dependency/blocker reassessment | `[prompts.phases.reevaluating]` |
+| `execute` | Task and parent-final implementation | `[prompts.workers.execute]` |
+| `partial_artifact_recovery` | One bounded recovery/verification pass after a failed changed-workspace dispatch | `[prompts.phases.partial_artifact_recovery]` |
+
+The non-composable prompt surfaces are still configurable individually:
+
+| Runtime role | Ordinary override key |
+|---|---|
+| Default fallback | `[prompts.default]` |
+| Worker roles | `[prompts.workers.research]`, `edit`, `review`, `test`, `plan`, `execute` |
+| Coordinator roles | `[prompts.coordinators.decompose]`, `aggregate` |
+| Automated refinement-quality reviewer | Built into the reviewer contract; it currently uses the reviewer model, not a prompt-pack role. |
+
+The automated refinement-quality reviewer always runs. To require a human
+decision after it accepts, set `[review].requires_approval_by_default = true`
+(or set `requires_approval` on an individual orb); otherwise an accepted spec
+advances directly to `Waiting`.
+
+For any ordinary override, select one source form:
+
+```toml
+[prompts.phases.refining]
+system_file = "prompts/refining.md"
+```
+
 ## Complete example
 
 ```toml

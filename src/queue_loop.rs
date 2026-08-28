@@ -46,7 +46,10 @@ fn completed_refinement_round_at_checkpoint(
         .map(|diagnostic| {
             // A failed round was never applied. Re-run that ordinal rather
             // than treating the diagnostic as completed progress.
-            if diagnostic.termination_reason.as_deref() == Some("worker_failed") {
+            if matches!(
+                diagnostic.termination_reason.as_deref(),
+                Some("worker_failed" | "quality_rejected" | "quality_reviewer_failed")
+            ) {
                 diagnostic.round.saturating_sub(1)
             } else {
                 diagnostic.round
@@ -1385,6 +1388,9 @@ async fn dispatch_one_owned(
     };
     outcome.retries = outcome.retries.saturating_add(completed_retries);
     let mut refinement_round = None;
+    // Kept only for the final candidate: a rejected quality review restores
+    // the last accepted (n - 1) specification and retries the same round.
+    let mut refinement_review_restore = None;
     if target == DispatchTarget::Refining
         && outcome.status == crate::worker::dispatcher::DispatchStatus::Done
     {
@@ -1440,6 +1446,7 @@ async fn dispatch_one_owned(
                 termination_reason: reason.map(str::to_string),
             };
             if reason.is_some() {
+                refinement_review_restore = Some(before);
                 refinement_round = Some(diagnostic);
                 break;
             }
@@ -1518,6 +1525,60 @@ async fn dispatch_one_owned(
                     termination_reason: Some("worker_failed".into()),
                 });
                 break;
+            }
+        }
+    }
+    let mut refinement_quality_rejected = false;
+    if target == DispatchTarget::Refining
+        && outcome.status == crate::worker::dispatcher::DispatchStatus::Done
+    {
+        match crate::phases::second_opinion::run_refinement_reviewer(
+            &orb,
+            &model_config.second_opinion,
+            base_wc,
+        )
+        .await
+        {
+            Ok(report) if report.verdict.is_accept() => {
+                orb.review_report = Some(report);
+            }
+            Ok(report) => {
+                if let Some((description, design, acceptance_criteria)) =
+                    refinement_review_restore.take()
+                {
+                    orb.description = description;
+                    orb.design = design;
+                    orb.acceptance_criteria = acceptance_criteria;
+                    orb.update_content_hash();
+                }
+                orb.review_critique = Some(if report.critique.is_empty() {
+                    "automated refinement-quality review rejected the candidate specification"
+                        .into()
+                } else {
+                    report.critique.clone()
+                });
+                orb.review_report = Some(report);
+                refinement_quality_rejected = true;
+                if let Some(diagnostic) = &mut refinement_round {
+                    diagnostic.termination_reason = Some("quality_rejected".into());
+                }
+            }
+            Err(error) => {
+                if let Some((description, design, acceptance_criteria)) =
+                    refinement_review_restore.take()
+                {
+                    orb.description = description;
+                    orb.design = design;
+                    orb.acceptance_criteria = acceptance_criteria;
+                    orb.update_content_hash();
+                }
+                orb.review_critique = Some(format!(
+                    "automated refinement-quality review did not complete: {error}"
+                ));
+                refinement_quality_rejected = true;
+                if let Some(diagnostic) = &mut refinement_round {
+                    diagnostic.termination_reason = Some("quality_reviewer_failed".into());
+                }
             }
         }
     }
@@ -1708,6 +1769,13 @@ async fn dispatch_one_owned(
     if outcome.status == crate::worker::dispatcher::DispatchStatus::Done
         && target == DispatchTarget::Refining
         && orb.phase == Some(OrbPhase::Review)
+        && refinement_quality_rejected
+    {
+        orb.set_phase(OrbPhase::Refining)
+            .map_err(std::io::Error::other)?;
+    } else if outcome.status == crate::worker::dispatcher::DispatchStatus::Done
+        && target == DispatchTarget::Refining
+        && orb.phase == Some(OrbPhase::Review)
         && !crate::phases::review::needs_review(&orb, model_config)
     {
         orb.set_phase(OrbPhase::Waiting)
@@ -1725,20 +1793,19 @@ async fn dispatch_one_owned(
                         crate::phases::speccing::apply_plan(&mut orb, &plan);
                     }
                 }
-                DispatchTarget::Refining => {
+                DispatchTarget::Refining if !refinement_quality_rejected => {
                     if let Some(plan) = crate::phases::refinement::parse_response(response) {
                         crate::phases::refinement::apply_plan(&mut orb, &plan);
                     }
                 }
+                DispatchTarget::Refining
+                | DispatchTarget::Decomposing
+                | DispatchTarget::Execute => {}
                 DispatchTarget::Reevaluating => {
                     if let Some(plan) = crate::phases::re_evaluation::parse_response(response) {
                         let _ = crate::phases::re_evaluation::apply_plan(&mut orb, &plan);
                     }
                 }
-                // Decompose response holds subtasks — applying them
-                // creates child orbs, which needs OrbStore + DepStore
-                // and is out of scope for this commit.
-                DispatchTarget::Decomposing | DispatchTarget::Execute => {}
             }
         }
     }
@@ -1874,6 +1941,33 @@ mod tests {
             completed_refinement_round_at_checkpoint(&records, "orb-refine", failed_second),
             1,
             "round two must be retried and later round-three evidence ignored"
+        );
+    }
+
+    #[test]
+    fn refinement_quality_rejection_retries_the_same_round() {
+        let checkpoint = chrono::Utc::now();
+        let record: crate::execution::ExecutionRecord = serde_json::from_value(serde_json::json!({
+            "orb_id": "orb-refine",
+            "parent_id": null,
+            "dispatch_kind": "phase.refining",
+            "status": "done",
+            "dispatched_at": checkpoint,
+            "completed_at": checkpoint,
+            "refinement_round": {
+                "round": 3,
+                "max_rounds": 3,
+                "material_changed": true,
+                "model_declared_complete": false,
+                "termination_reason": "quality_rejected",
+            },
+        }))
+        .unwrap();
+
+        assert_eq!(
+            completed_refinement_round_at_checkpoint(&[record], "orb-refine", checkpoint),
+            2,
+            "round three must remain eligible after its candidate is rejected"
         );
     }
 

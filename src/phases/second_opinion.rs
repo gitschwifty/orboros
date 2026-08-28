@@ -218,6 +218,90 @@ pub async fn run_reviewer(
     })
 }
 
+/// Runs the mandatory post-refinement quality reviewer. Unlike the completion
+/// reviewer, it evaluates the assembled task specification itself before any
+/// child work can be released.
+pub async fn run_refinement_reviewer(
+    orb: &Orb,
+    cfg: &SecondOpinionConfig,
+    base_worker_config: &WorkerConfig,
+) -> Result<ReviewReport, ReviewerError> {
+    let system = format!(
+        "You are an independent specification-quality reviewer. Evaluate the \
+current task specification for completeness, internal consistency, concrete \
+deliverables, and verifiable acceptance criteria. Do not approve a merely \
+parseable or empty refinement. Respond with exactly one JSON object, no prose: \
+{{\"verdict\": \"accept\"}} or {{\"verdict\": {{\"revise\": {{\"scope\": \
+\"decomposition\"}}}}, \"critique\": \"...\"}} or {{\"verdict\": \
+\"reject\", \"critique\": \"...\"}}. {addendum}",
+        addendum = crate::worker::process::CONFIDENCE_PROMPT_ADDENDUM,
+    );
+    let mut user = format!(
+        "Title:\n{}\n\nDescription:\n{}\n",
+        orb.title, orb.description
+    );
+    if let Some(design) = &orb.design {
+        let _ = write!(user, "\nDesign:\n{design}\n");
+    }
+    if let Some(criteria) = &orb.acceptance_criteria {
+        let _ = write!(user, "\nAcceptance criteria:\n{criteria}\n");
+    }
+    run_reviewer_with_prompts(orb, cfg, base_worker_config, system, user).await
+}
+
+async fn run_reviewer_with_prompts(
+    orb: &Orb,
+    cfg: &SecondOpinionConfig,
+    base_worker_config: &WorkerConfig,
+    system: String,
+    user: String,
+) -> Result<ReviewReport, ReviewerError> {
+    let model = cfg
+        .reviewer_model
+        .clone()
+        .unwrap_or_else(|| base_worker_config.model.clone());
+
+    let mut wc = base_worker_config.clone();
+    wc.model = model.clone();
+    wc.system_prompt = system;
+    wc.max_iterations = Some(1);
+
+    let mut worker = Worker::spawn(&wc)
+        .await
+        .map_err(|e| ReviewerError::WorkerSpawn(e.to_string()))?;
+    let outcome = worker
+        .send(&format!("review-{}", orb.id), &user)
+        .await
+        .map_err(|e| ReviewerError::WorkerSend(e.to_string()))?;
+    let _ = worker.shutdown().await;
+
+    let body = outcome.response.as_deref().unwrap_or("").trim();
+    if body.is_empty() {
+        return Err(ReviewerError::EmptyResponse);
+    }
+    let verdict = parse_verdict(body)?;
+    let critique = extract_critique(body).unwrap_or_default();
+    let suggested_changes = extract_suggested_changes(body);
+
+    info!(
+        verdict = ?short_verdict(&verdict),
+        critique_len = critique.len(),
+        "second-opinion reviewer produced verdict"
+    );
+    if verdict.is_accept() && !critique.is_empty() {
+        warn!("reviewer accepted but also provided a critique; using verdict");
+    }
+
+    Ok(ReviewReport {
+        verdict,
+        critique,
+        suggested_changes,
+        reviewer_model: model,
+        reviewed_at: Utc::now(),
+        reviewer_orb_id: None,
+    })
+}
+
 fn short_verdict(v: &ReviewVerdict) -> &'static str {
     match v {
         ReviewVerdict::Accept => "accept",
