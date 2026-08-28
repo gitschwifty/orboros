@@ -3,6 +3,7 @@
 private
 .env
 .env.*
+/.orboros/config.local.toml
 /bench
 /bench/
 bench-results

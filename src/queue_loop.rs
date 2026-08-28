@@ -996,7 +996,8 @@ impl QueueLoop {
 }
 
 /// Resolves the explicitly selected external prompt set into the ordinary
-/// runtime prompt config. Only roles declared by the set are replaced.
+/// runtime prompt config. Relative paths use the queue state directory; only
+/// roles declared by the set are replaced.
 fn load_external_prompt_set(
     mut prompt_config: crate::config::PromptConfig,
     base_dir: &Path,

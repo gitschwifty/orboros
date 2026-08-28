@@ -58,7 +58,7 @@ stop_on_model_complete = true
 [prompts]
 # Optional external composable set for normal project runs. This path may
 # point into an ignored/private benchmark corpus, for example:
-# prompt_set = "bench/prompts/composable-v1"
+# prompt_set = "/absolute/path/to/bench/prompts/composable-v1"
 
 [daemon]
 # pid_file = "/absolute/path/to/orboros.pid"

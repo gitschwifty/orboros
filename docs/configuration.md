@@ -61,13 +61,13 @@ loaded `.env` file) as required by the resolved router.
 ## External prompt sets
 
 Set `[prompts].prompt_set` to a directory containing a composable benchmark
-prompt set to use its declared roles during normal queue dispatch. Relative
-paths resolve from the project root, so a project can opt into an ignored,
-private corpus without committing prompt contents:
+prompt set to use its declared roles during normal queue dispatch. Use an
+absolute path in a local ignored config so foreground and supervisor queues
+both find the same private corpus without committing prompt contents:
 
 ```toml
 [prompts]
-prompt_set = "bench/prompts/composable-v1"
+prompt_set = "/absolute/path/to/bench/prompts/composable-v1"
 ```
 
 Declared prompt-set roles override the corresponding runtime role only;

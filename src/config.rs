@@ -530,8 +530,8 @@ fn infer_provider(model: &str) -> Option<String> {
 #[serde(default, deny_unknown_fields)]
 pub struct PromptConfig {
     /// Optional path to an external composable prompt set. Relative paths are
-    /// resolved from the project root, allowing an ignored private benchmark
-    /// corpus to supply runtime prompts without becoming a source dependency.
+    /// resolved from the queue state directory; absolute paths are recommended
+    /// for a private corpus shared across foreground and supervisor runs.
     pub prompt_set: Option<PathBuf>,
     pub default: PromptOverride,
     pub workers: BTreeMap<String, PromptOverride>,
