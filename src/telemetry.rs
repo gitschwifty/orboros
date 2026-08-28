@@ -31,6 +31,10 @@ pub struct AttemptEvent {
     pub cache_write_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_micros: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_turns: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<u32>,
     #[serde(default)]
     pub retries: u32,
 }
@@ -49,6 +53,7 @@ pub struct RunEvent {
 /// Durable end-of-run aggregate. Costs remain microdollars here; presentation
 /// converts them only at the operator boundary.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RunAggregate {
     pub completed_dispatches: u64,
     pub failed_dispatches: u64,
@@ -57,9 +62,12 @@ pub struct RunAggregate {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub cost_micros: u64,
+    pub assistant_turns: u64,
+    pub tool_calls: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct TelemetrySummary {
     pub updated_at: Option<DateTime<Utc>>,
     pub completed_dispatches: u64,
@@ -70,6 +78,8 @@ pub struct TelemetrySummary {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub cost_micros: u64,
+    pub assistant_turns: u64,
+    pub tool_calls: u64,
     pub active_attempts: Vec<String>,
 }
 
@@ -138,6 +148,8 @@ impl TelemetryStore {
             cache_read_tokens: None,
             cache_write_tokens: None,
             cost_micros: None,
+            assistant_turns: None,
+            tool_calls: None,
             retries: 0,
         };
         self.with_lock(|| {
@@ -163,6 +175,8 @@ impl TelemetryStore {
             cache_read_tokens: record.cache_read_tokens,
             cache_write_tokens: record.cache_write_tokens,
             cost_micros: record.cost_micros,
+            assistant_turns: record.assistant_turns,
+            tool_calls: record.tool_calls,
             retries: record.retries,
         };
         self.with_lock(|| {
@@ -229,6 +243,8 @@ impl TelemetryStore {
                     cache_read_tokens: record.cache_read_tokens,
                     cache_write_tokens: record.cache_write_tokens,
                     cost_micros: record.cost_micros,
+                    assistant_turns: record.assistant_turns,
+                    tool_calls: record.tool_calls,
                     retries: record.retries,
                 };
                 serde_json::to_writer(&mut file, &event).map_err(std::io::Error::other)?;
@@ -303,6 +319,12 @@ fn summarize(events: &[AttemptEvent]) -> TelemetrySummary {
         summary.cost_micros = summary
             .cost_micros
             .saturating_add(event.cost_micros.unwrap_or(0));
+        summary.assistant_turns = summary
+            .assistant_turns
+            .saturating_add(u64::from(event.assistant_turns.unwrap_or(0)));
+        summary.tool_calls = summary
+            .tool_calls
+            .saturating_add(u64::from(event.tool_calls.unwrap_or(0)));
         summary.retries = summary.retries.saturating_add(u64::from(event.retries));
         match event.status.as_deref() {
             Some("done") => summary.completed_dispatches += 1,
@@ -337,8 +359,8 @@ mod tests {
             model_latency_ms: None,
             tool_latency_ms: None,
             total_latency_ms: None,
-            assistant_turns: None,
-            tool_calls: None,
+            assistant_turns: Some(2),
+            tool_calls: Some(5),
             prompt_tokens: None,
             completion_tokens: None,
             total_tokens: Some(12),
@@ -358,5 +380,7 @@ mod tests {
         assert_eq!(summary.completed_dispatches, 1);
         assert_eq!(summary.total_tokens, 12);
         assert_eq!(summary.cost_micros, 42);
+        assert_eq!(summary.assistant_turns, 2);
+        assert_eq!(summary.tool_calls, 5);
     }
 }

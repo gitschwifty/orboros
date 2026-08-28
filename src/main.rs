@@ -2045,6 +2045,8 @@ fn print_telemetry_summary(project: &str, summary: &orboros::telemetry::Telemetr
     println!("Total tokens:          {}", summary.total_tokens);
     println!("Cache read tokens:     {}", summary.cache_read_tokens);
     println!("Cache write tokens:    {}", summary.cache_write_tokens);
+    println!("Assistant turns:       {}", summary.assistant_turns);
+    println!("Tool calls:            {}", summary.tool_calls);
     println!(
         "Cost:                  {}",
         orboros::execution::format_cost_usd(Some(summary.cost_micros))

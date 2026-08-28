@@ -219,6 +219,8 @@ fn log_run_summary(projects: &[SupervisedProject], started: chrono::DateTime<chr
     let mut cache_read_tokens = 0_u64;
     let mut cache_write_tokens = 0_u64;
     let mut cost_micros = 0_u64;
+    let mut assistant_turns = 0_u64;
+    let mut tool_calls = 0_u64;
     for project in projects {
         match project.queue.execution_store().read_all() {
             Ok(records) => {
@@ -231,6 +233,10 @@ fn log_run_summary(projects: &[SupervisedProject], started: chrono::DateTime<chr
                     cache_write_tokens =
                         cache_write_tokens.saturating_add(record.cache_write_tokens.unwrap_or(0));
                     cost_micros = cost_micros.saturating_add(record.cost_micros.unwrap_or(0));
+                    assistant_turns = assistant_turns
+                        .saturating_add(u64::from(record.assistant_turns.unwrap_or(0)));
+                    tool_calls =
+                        tool_calls.saturating_add(u64::from(record.tool_calls.unwrap_or(0)));
                     retries = retries.saturating_add(u64::from(record.retries));
                     match record.status.as_str() {
                         "done" => done += 1,
@@ -257,6 +263,8 @@ fn log_run_summary(projects: &[SupervisedProject], started: chrono::DateTime<chr
         output_tokens,
         cache_read_tokens,
         cache_write_tokens,
+        assistant_turns,
+        tool_calls,
         cost_usd = %crate::execution::format_cost_usd(Some(cost_micros)),
         "supervisor run summary"
     );
@@ -286,6 +294,12 @@ fn project_run_aggregate(
         aggregate.cost_micros = aggregate
             .cost_micros
             .saturating_add(record.cost_micros.unwrap_or(0));
+        aggregate.assistant_turns = aggregate
+            .assistant_turns
+            .saturating_add(u64::from(record.assistant_turns.unwrap_or(0)));
+        aggregate.tool_calls = aggregate
+            .tool_calls
+            .saturating_add(u64::from(record.tool_calls.unwrap_or(0)));
         aggregate.retries = aggregate.retries.saturating_add(u64::from(record.retries));
         match record.status.as_str() {
             "done" => aggregate.completed_dispatches += 1,
