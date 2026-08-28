@@ -26,6 +26,7 @@ pub struct ResolvedPrompt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptSource {
     BuiltIn,
+    PromptSet { label: String },
     ConfigInline { key: String },
     ConfigFile { key: String, path: PathBuf },
     CliInline,
@@ -37,6 +38,7 @@ impl PromptSource {
     pub fn label(&self) -> String {
         match self {
             Self::BuiltIn => "built_in".to_string(),
+            Self::PromptSet { label } => label.clone(),
             Self::ConfigInline { key } => format!("config_inline:{key}"),
             Self::ConfigFile { key, path } => {
                 format!("config_file:{key}:{}", path.display())
@@ -197,9 +199,14 @@ impl PromptResolver {
 
         Ok(override_cfg.system.as_ref().map(|system| ResolvedPrompt {
             system_prompt: system.clone(),
-            source: PromptSource::ConfigInline {
-                key: key.to_string(),
-            },
+            source: override_cfg.runtime_source.as_ref().map_or_else(
+                || PromptSource::ConfigInline {
+                    key: key.to_string(),
+                },
+                |label| PromptSource::PromptSet {
+                    label: label.clone(),
+                },
+            ),
         }))
     }
 
@@ -385,6 +392,7 @@ mod tests {
             PromptOverride {
                 system: Some("config edit".into()),
                 system_file: None,
+                ..Default::default()
             },
         );
         let resolver = PromptResolver::new(
@@ -436,17 +444,20 @@ mod tests {
             default: PromptOverride {
                 system: Some("default prompt".into()),
                 system_file: None,
+                ..Default::default()
             },
             workers: [(
                 "edit".into(),
                 PromptOverride {
                     system: Some("edit prompt".into()),
                     system_file: None,
+                    ..Default::default()
                 },
             )]
             .into(),
             coordinators: BTreeMap::new(),
             phases: BTreeMap::new(),
+            ..Default::default()
         };
         let resolver = PromptResolver::new(config, None, None);
 
@@ -471,6 +482,7 @@ mod tests {
                 PromptOverride {
                     system: Some("legacy decompose".into()),
                     system_file: None,
+                    ..Default::default()
                 },
             )]
             .into(),
@@ -479,6 +491,7 @@ mod tests {
                 PromptOverride {
                     system: Some("coordinator decompose".into()),
                     system_file: None,
+                    ..Default::default()
                 },
             )]
             .into(),
@@ -507,6 +520,7 @@ mod tests {
                 PromptOverride {
                     system: Some("legacy aggregate".into()),
                     system_file: None,
+                    ..Default::default()
                 },
             )]
             .into(),
@@ -533,6 +547,7 @@ mod tests {
             default: PromptOverride {
                 system: Some("default prompt".into()),
                 system_file: None,
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -557,6 +572,7 @@ mod tests {
                 PromptOverride {
                     system: None,
                     system_file: Some("prompts/speccing.md".into()),
+                    ..Default::default()
                 },
             )]
             .into(),
@@ -584,6 +600,7 @@ mod tests {
                 PromptOverride {
                     system: None,
                     system_file: Some("prompts/review.md".into()),
+                    ..Default::default()
                 },
             )]
             .into(),

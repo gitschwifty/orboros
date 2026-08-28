@@ -58,6 +58,23 @@ Never put provider credentials in TOML. Set `OPENROUTER_API_KEY`,
 `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` in the process environment (or a
 loaded `.env` file) as required by the resolved router.
 
+## External prompt sets
+
+Set `[prompts].prompt_set` to a directory containing a composable benchmark
+prompt set to use its declared roles during normal queue dispatch. Relative
+paths resolve from the project root, so a project can opt into an ignored,
+private corpus without committing prompt contents:
+
+```toml
+[prompts]
+prompt_set = "bench/prompts/composable-v1"
+```
+
+Declared prompt-set roles override the corresponding runtime role only;
+undeclared roles continue through normal config and built-in fallback. Each
+dispatch records a `prompt_set:<name>:<role>:<assembled-sha256>` source plus
+the effective prompt hash in its execution metadata.
+
 ## Complete example
 
 ```toml

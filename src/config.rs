@@ -529,6 +529,10 @@ fn infer_provider(model: &str) -> Option<String> {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct PromptConfig {
+    /// Optional path to an external composable prompt set. Relative paths are
+    /// resolved from the project root, allowing an ignored private benchmark
+    /// corpus to supply runtime prompts without becoming a source dependency.
+    pub prompt_set: Option<PathBuf>,
     pub default: PromptOverride,
     pub workers: BTreeMap<String, PromptOverride>,
     pub coordinators: BTreeMap<String, PromptOverride>,
@@ -540,6 +544,10 @@ pub struct PromptConfig {
 pub struct PromptOverride {
     pub system: Option<String>,
     pub system_file: Option<PathBuf>,
+    /// Runtime-only provenance assigned by an external prompt set. This is
+    /// deliberately not a TOML field: prompt-set contents stay external.
+    #[serde(skip)]
+    pub runtime_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2081,6 +2089,7 @@ system = "project speccing"
                     PromptOverride {
                         system: Some("edit prompt".into()),
                         system_file: None,
+                        ..Default::default()
                     },
                 )]
                 .into(),

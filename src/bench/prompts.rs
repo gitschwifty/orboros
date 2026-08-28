@@ -86,6 +86,27 @@ impl BenchPromptSet {
     pub fn load(bench_root: &Path, name: &str) -> anyhow::Result<Self> {
         validate_set_name(name)?;
         let root = bench_root.join("prompts").join(name);
+        Self::load_from_dir_with_name(root, name.to_string())
+    }
+
+    /// Loads a prompt set from its exact directory. This is used by normal
+    /// project execution, whose private prompt corpus need not have a public
+    /// benchmark-root layout beyond the selected set directory itself.
+    pub fn load_from_dir(root: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        let root = root.into();
+        let name = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("prompt set path has no directory name: {}", root.display())
+            })?
+            .to_string();
+        validate_set_name(&name)?;
+        Self::load_from_dir_with_name(root, name)
+    }
+
+    fn load_from_dir_with_name(root: PathBuf, name: String) -> anyhow::Result<Self> {
         if !root.is_dir() {
             anyhow::bail!("prompt set `{name}` not found at {}", root.display());
         }
@@ -202,6 +223,10 @@ impl BenchPromptSet {
             let prompt = PromptOverride {
                 system: Some(resolved.content.clone()),
                 system_file: None,
+                runtime_source: Some(format!(
+                    "prompt_set:{}:{}:{}",
+                    self.name, role, resolved.manifest.assembled_sha256
+                )),
             };
             match role.as_str() {
                 "execute" => {

@@ -814,6 +814,7 @@ impl QueueLoop {
             .prompt_config
             .clone()
             .unwrap_or_else(|| orb_config.prompts.clone());
+        let prompt_config = load_external_prompt_set(prompt_config, &self.base_dir)?;
         let prompt_resolver =
             crate::prompt::PromptResolver::from_config(prompt_config, Some(&self.base_dir));
 
@@ -992,6 +993,34 @@ impl QueueLoop {
             tokio::time::sleep(interval).await;
         }
     }
+}
+
+/// Resolves the explicitly selected external prompt set into the ordinary
+/// runtime prompt config. Only roles declared by the set are replaced.
+fn load_external_prompt_set(
+    mut prompt_config: crate::config::PromptConfig,
+    base_dir: &Path,
+) -> std::io::Result<crate::config::PromptConfig> {
+    let Some(path) = prompt_config.prompt_set.clone() else {
+        return Ok(prompt_config);
+    };
+    let path = if path.is_absolute() {
+        path
+    } else {
+        base_dir.join(path)
+    };
+    let set = crate::bench::prompts::BenchPromptSet::load_from_dir(&path).map_err(|error| {
+        std::io::Error::other(format!(
+            "failed to load prompts.prompt_set {}: {error}",
+            path.display()
+        ))
+    })?;
+    let selected = set.prompt_config();
+    // A selected set owns its declared roles; roles it omits retain the
+    // ordinary layered project configuration and built-in fallback.
+    prompt_config.workers.extend(selected.workers);
+    prompt_config.phases.extend(selected.phases);
+    Ok(prompt_config)
 }
 
 fn is_terminal(orb: &Orb) -> bool {
@@ -1786,6 +1815,40 @@ mod tests {
         let orb_store = OrbStore::new(base.join("orbs.jsonl"));
         let dep_store = DepStore::new(base.join("deps.jsonl"));
         (tmp, orb_store, dep_store, base)
+    }
+
+    #[test]
+    fn external_prompt_set_overrides_declared_role_with_private_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let set = temp.path().join("bench/prompts/composable-v1");
+        std::fs::create_dir_all(set.join("roles")).unwrap();
+        std::fs::write(
+            set.join("composition.toml"),
+            "[roles.execute]\nfragments = [\"roles/execute.md\"]\n",
+        )
+        .unwrap();
+        std::fs::write(set.join("roles/execute.md"), "private execute prompt").unwrap();
+        let config = crate::config::PromptConfig {
+            prompt_set: Some("bench/prompts/composable-v1".into()),
+            ..Default::default()
+        };
+
+        let config = load_external_prompt_set(config, temp.path()).unwrap();
+        let resolved = crate::prompt::PromptResolver::from_config(config, Some(temp.path()))
+            .resolve_system_prompt(
+                crate::prompt::PromptKind::Worker("execute"),
+                "built in execute prompt",
+            )
+            .unwrap();
+
+        assert_eq!(resolved.system_prompt, "private execute prompt");
+        assert_eq!(
+            resolved.source.label(),
+            format!(
+                "prompt_set:composable-v1:execute:{}",
+                crate::prompt::prompt_hash("private execute prompt")
+            )
+        );
     }
 
     #[test]
