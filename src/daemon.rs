@@ -212,6 +212,7 @@ fn log_run_summary(projects: &[SupervisedProject], started: chrono::DateTime<chr
     let mut done = 0_u64;
     let mut failed = 0_u64;
     let mut retries = 0_u64;
+    let mut active_orbs = 0_u64;
     let mut input_tokens = 0_u64;
     let mut output_tokens = 0_u64;
     let mut cache_read_tokens = 0_u64;
@@ -241,11 +242,20 @@ fn log_run_summary(projects: &[SupervisedProject], started: chrono::DateTime<chr
                 tracing::warn!(project = %project.name, %error, "could not read execution summary");
             }
         }
+        match project.queue.active_orb_count() {
+            Ok(count) => {
+                active_orbs = active_orbs.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+            }
+            Err(error) => {
+                tracing::warn!(project = %project.name, %error, "could not read active-orb summary");
+            }
+        }
     }
     tracing::info!(
         elapsed_secs = (chrono::Utc::now() - started).num_seconds(),
         completed = done,
         failed,
+        active_orbs,
         retries,
         input_tokens,
         output_tokens,

@@ -52,7 +52,7 @@ pub fn cmd_sessions_list<W: Write>(
             "{:<28} {:<8} {:<22} {:<12} {}",
             meta.init.id,
             status_label(meta.status),
-            meta.init.created_at.format("%Y-%m-%d %H:%M:%S"),
+            crate::time::format_local(meta.init.created_at),
             meta.byte_size,
             meta.init.model,
         )?;

@@ -1689,7 +1689,7 @@ pub fn cmd_bench_list_runs_filtered(
         println!(
             "{run_id:<12}  {started:<19}  {variant:<22}  {suite:<12}  {tier:<4}  {model:<model_width$}  {passed:>4} {failed:>4} {errored:>3}  {cost:<11}  {guidance}",
             run_id = run_display_label(&run.run_id),
-            started = run.started_at.format("%Y-%m-%d %H:%M:%S"),
+            started = crate::time::format_local(run.started_at),
             variant = run.variant.as_deref().unwrap_or("-"),
             suite = run
                 .suite_manifest
@@ -2476,7 +2476,7 @@ fn print_run_summary(r: &BenchRun) {
     println!(
         "run={id}  started={when}  tier={tier}  status={status}  variant={variant}",
         id = r.run_id,
-        when = r.started_at.to_rfc3339(),
+        when = crate::time::format_local(r.started_at),
         tier = run_tier_label(r),
         status = run_status_label(r),
         variant = r.variant.as_deref().unwrap_or("-"),

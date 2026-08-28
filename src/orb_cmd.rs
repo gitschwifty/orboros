@@ -175,7 +175,7 @@ pub fn cmd_orb_rollback_list(store: &OrbStore, id: &str) -> anyhow::Result<()> {
         println!(
             "{index}: phase={phase}{status}{refinement} safe_restore={} updated_at={}",
             snapshot_is_safe_to_restore(orb),
-            orb.updated_at
+            crate::time::format_local(orb.updated_at)
         );
     }
     Ok(())
@@ -436,10 +436,10 @@ pub fn cmd_orb_show(store: &OrbStore, id: &str) -> anyhow::Result<()> {
             if orb.orb_type.uses_phase() {
                 println!("Parent final work: {}", orb.has_parent_final_work);
             }
-            println!("Created:     {}", orb.created_at);
-            println!("Updated:     {}", orb.updated_at);
+            println!("Created:     {}", crate::time::format_local(orb.created_at));
+            println!("Updated:     {}", crate::time::format_local(orb.updated_at));
             if let Some(closed) = orb.closed_at {
-                println!("Closed:      {closed}");
+                println!("Closed:      {}", crate::time::format_local(closed));
             }
             if let Some(ref result) = orb.result {
                 println!("Result:      {result}");

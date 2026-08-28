@@ -282,7 +282,7 @@ pub fn cmd_hooks_log(
         let orb = inv.orb_id.as_deref().unwrap_or("-");
         println!(
             "{ts}  [{outcome:<9}] {hook:<30} event={event} orb={orb} exit={exit} ms={ms}",
-            ts = inv.started_at.format("%Y-%m-%d %H:%M:%S"),
+            ts = crate::time::format_local(inv.started_at),
             outcome = entry.outcome_label,
             hook = inv.hook_name,
             event = inv.event,

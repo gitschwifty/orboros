@@ -819,12 +819,14 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
+                .with_timer(orboros::time::LocalTimestamp)
                 .with_target(false)
                 .with_filter(terminal_filter),
         )
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(orboros::bench::log::BenchLogWriter)
+                .with_timer(orboros::time::LocalTimestamp)
                 .with_ansi(false)
                 .with_target(false)
                 .with_filter(bench_filter),
@@ -832,6 +834,7 @@ fn main() -> anyhow::Result<()> {
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(orboros::bench::log::GeneralLogWriter)
+                .with_timer(orboros::time::LocalTimestamp)
                 .with_ansi(false)
                 .with_target(false)
                 .with_filter(file_filter),

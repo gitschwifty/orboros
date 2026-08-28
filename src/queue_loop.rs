@@ -273,6 +273,30 @@ impl QueueLoop {
         self.execution_store.clone()
     }
 
+    /// Live operational count of non-terminal orbs that are currently active
+    /// or in a worker-dispatchable phase. Durable attempt accounting remains
+    /// in the execution ledger once a dispatch returns.
+    pub fn active_orb_count(&self) -> std::io::Result<usize> {
+        self.orb_store.load_all().map(|orbs| {
+            orbs.iter()
+                .filter(|orb| !is_terminal(orb))
+                .filter(|orb| {
+                    orb.status == Some(OrbStatus::Active)
+                        || matches!(
+                            orb.phase,
+                            Some(
+                                OrbPhase::Speccing
+                                    | OrbPhase::Decomposing
+                                    | OrbPhase::Refining
+                                    | OrbPhase::Reevaluating
+                                    | OrbPhase::Executing
+                            )
+                        )
+                })
+                .count()
+        })
+    }
+
     /// Performs a single iteration of the queue loop.
     ///
     /// 1. Detects pipeline-phase orbs (Pending epics/features) and creates pipeline dirs.

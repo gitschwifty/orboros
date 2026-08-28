@@ -391,6 +391,18 @@ async fn dispatch_orb_with_retry_limit(
         };
         attempts.push(DispatchAttempt::from_outcome(&outcome));
         if let Some(retry_kind) = retry_kind.filter(|_| attempt < retry_limit) {
+            let retry_kind_label = match &retry_kind {
+                RetryKind::Transient => "transient",
+                RetryKind::Terminal(_) => "terminal",
+            };
+            let failure_code = outcome
+                .failure
+                .as_ref()
+                .map_or("-", |failure| failure.code.as_str());
+            let error = outcome
+                .error
+                .as_deref()
+                .unwrap_or("worker returned no error detail");
             if let RetryKind::Terminal(mut diagnostic) = retry_kind {
                 // The next loop iteration assigns a new worker ID and spawns
                 // a new process. Fill its identity from that final outcome.
@@ -398,7 +410,15 @@ async fn dispatch_orb_with_retry_limit(
                 terminal_retry = Some(diagnostic);
             }
             attempt = 1;
-            warn!(orb = %orb.id, terminal = terminal_retry.is_some(), "retrying whole worker dispatch from a fresh worker");
+            warn!(
+                orb = %orb.id,
+                retry_attempt = 2,
+                retry_kind = retry_kind_label,
+                terminal = terminal_retry.is_some(),
+                failure_code,
+                error,
+                "retrying whole worker dispatch from a fresh worker"
+            );
             continue;
         }
         break outcome;
