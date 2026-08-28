@@ -251,7 +251,7 @@ fn log_run_summary(projects: &[SupervisedProject], started: chrono::DateTime<chr
         output_tokens,
         cache_read_tokens,
         cache_write_tokens,
-        cost_micros,
+        cost_usd = %crate::execution::format_cost_usd(Some(cost_micros)),
         "supervisor run summary"
     );
 }

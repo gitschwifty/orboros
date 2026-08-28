@@ -15,6 +15,16 @@ use crate::worker::dispatcher::{
     DispatchAttempt, DispatchOutcome, DispatchStatus, TerminalRetryDiagnostic,
 };
 
+/// Renders provider cost for operator-facing output while the durable ledger
+/// continues to retain exact microdollar values for aggregation.
+#[must_use]
+pub fn format_cost_usd(cost_micros: Option<u64>) -> String {
+    cost_micros.map_or_else(
+        || "-".into(),
+        |micros| format!("${}.{:06}", micros / 1_000_000, micros % 1_000_000),
+    )
+}
+
 /// Character-level attribution for Orboros-owned prompt construction.
 ///
 /// This deliberately measures only text Orboros injects or constructs. It
@@ -240,6 +250,13 @@ mod attempt_tests {
 
     use super::*;
     use crate::worker::dispatcher::{DispatchAttempt, DispatchOutcome, DispatchStatus};
+
+    #[test]
+    fn cost_display_uses_usd_without_losing_micro_precision() {
+        assert_eq!(format_cost_usd(Some(472)), "$0.000472");
+        assert_eq!(format_cost_usd(Some(1_250_000)), "$1.250000");
+        assert_eq!(format_cost_usd(None), "-");
+    }
 
     #[test]
     fn execution_record_retains_every_worker_attempt() {
