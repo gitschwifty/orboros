@@ -169,6 +169,7 @@ pub struct QueueLoop {
     prompt_store: Option<crate::execution::PromptStore>,
     worker_evidence_dir: PathBuf,
     project_key: Option<String>,
+    telemetry_store: Option<crate::telemetry::TelemetryStore>,
 }
 
 impl QueueLoop {
@@ -196,6 +197,7 @@ impl QueueLoop {
             prompt_store: None,
             worker_evidence_dir,
             project_key: None,
+            telemetry_store: None,
         }
     }
 
@@ -210,6 +212,17 @@ impl QueueLoop {
     #[must_use]
     pub fn with_project_key(mut self, project_key: impl Into<String>) -> Self {
         self.project_key = Some(project_key.into());
+        self
+    }
+
+    /// Writes user-local, project-scoped execution telemetry outside the
+    /// repository state directory.
+    #[must_use]
+    pub fn with_telemetry_store(
+        mut self,
+        telemetry_store: crate::telemetry::TelemetryStore,
+    ) -> Self {
+        self.telemetry_store = Some(telemetry_store);
         self
     }
 
@@ -853,6 +866,7 @@ impl QueueLoop {
             let prompt_store = self.prompt_store.clone();
             let worker_evidence_dir = self.worker_evidence_dir.clone();
             let project_key = self.project_key.clone();
+            let telemetry_store = self.telemetry_store.clone();
             let running = Arc::clone(&running);
             let in_flight_dispatches = Arc::clone(&self.in_flight_dispatches);
             join_set.spawn(async move {
@@ -892,6 +906,7 @@ impl QueueLoop {
                     prompt_store,
                     worker_evidence_dir,
                     project_key,
+                    telemetry_store,
                     running,
                 )
                 .await
@@ -1304,6 +1319,7 @@ async fn dispatch_one_owned(
     prompt_store: Option<crate::execution::PromptStore>,
     worker_evidence_dir: PathBuf,
     project_key: Option<String>,
+    telemetry_store: Option<crate::telemetry::TelemetryStore>,
     running: Arc<AtomicBool>,
 ) -> std::io::Result<bool> {
     use crate::worker::dispatcher::{
@@ -1381,6 +1397,12 @@ async fn dispatch_one_owned(
         tools = ?wc.tools,
         "dispatching ready orb",
     );
+    let telemetry_attempt_id = telemetry_store.as_ref().and_then(|store| {
+        store
+            .record_attempt_started(&orb.id.to_string(), &prompt_category)
+            .map_err(|error| tracing::warn!(orb = %orb.id, %error, "could not record telemetry attempt start"))
+            .ok()
+    });
 
     let workspace_before = match wc.cwd.as_deref() {
         Some(workdir) => workspace_fingerprint(workdir).await.ok(),
@@ -1421,6 +1443,13 @@ async fn dispatch_one_owned(
             reason: "completed_dispatch_failed".into(),
         });
         execution_store.append(&retry_record)?;
+        if let Some(store) = &telemetry_store {
+            if let Err(error) =
+                store.record_attempt_finished(&uuid::Uuid::new_v4().to_string(), &retry_record)
+            {
+                tracing::warn!(orb = %orb.id, %error, "could not record telemetry retry outcome");
+            }
+        }
         let backoff = completed_dispatch_retry_backoff(completed_retries);
         if !running.load(Ordering::SeqCst) {
             break outcome;
@@ -1552,6 +1581,13 @@ async fn dispatch_one_owned(
                     reason: "completed_dispatch_failed".into(),
                 });
                 execution_store.append(&retry_record)?;
+                if let Some(store) = &telemetry_store {
+                    if let Err(error) = store
+                        .record_attempt_finished(&uuid::Uuid::new_v4().to_string(), &retry_record)
+                    {
+                        tracing::warn!(orb = %orb.id, %error, "could not record telemetry refinement retry outcome");
+                    }
+                }
                 let backoff = completed_dispatch_retry_backoff(round_retries);
                 if !running.load(Ordering::SeqCst) {
                     break round_outcome;
@@ -1738,6 +1774,11 @@ async fn dispatch_one_owned(
             });
     }
     execution_store.append(&execution_record)?;
+    if let (Some(store), Some(attempt_id)) = (&telemetry_store, telemetry_attempt_id.as_deref()) {
+        if let Err(error) = store.record_attempt_finished(attempt_id, &execution_record) {
+            tracing::warn!(orb = %orb.id, %error, "could not record telemetry attempt completion");
+        }
+    }
 
     if recovery_eligible {
         let recovery_prompt = prompt_resolver

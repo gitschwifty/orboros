@@ -135,6 +135,11 @@ enum Commands {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Inspect or rebuild user-local project execution telemetry.
+    Telemetry {
+        #[command(subcommand)]
+        action: TelemetryAction,
+    },
     /// Manage orbs (create, show, list, update, delete, deps, review).
     Orb {
         #[command(subcommand)]
@@ -205,6 +210,22 @@ enum ConfigAction {
     },
     /// Print effective configuration values and their layered sources.
     Show,
+}
+
+#[derive(Subcommand)]
+enum TelemetryAction {
+    /// Show the compact current totals and active attempts for a registered project.
+    Show {
+        /// Registered project name. Defaults to the current registered project.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Rebuild the telemetry projection and attempt ledger from executions.jsonl.
+    Rebuild {
+        /// Registered project name. Defaults to the current registered project.
+        #[arg(long)]
+        project: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -927,6 +948,11 @@ fn main() -> anyhow::Result<()> {
                 )
             }
         }
+        Commands::Telemetry { action } => cmd_telemetry(
+            action,
+            shared_project.as_ref(),
+            effective_state.project_dir.as_deref(),
+        ),
         Commands::Orb { action } => {
             let shared_writer = shared_project.as_ref().map(|project| {
                 std::sync::Arc::new(orboros::supervisor::SupervisorStoreWriter::new(
@@ -1469,10 +1495,23 @@ fn foreground_queue_with_project(
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| state_dir.to_path_buf());
     let mut queue = QueueLoop::new(orb_store, dep_store, state_dir.to_path_buf());
-    if let Some(project) = shared_project {
-        let home = dirs::home_dir().expect("shared-state configuration requires a home directory");
-        queue =
-            queue.with_worker_evidence_dir(project.shared_project_dir(&home).join("transcripts"));
+    let telemetry_project = shared_project.cloned().or_else(|| {
+        let home = dirs::home_dir()?;
+        let project_dir = project_dir?;
+        config::list_projects(&home)
+            .ok()?
+            .into_iter()
+            .find(|entry| entry.config_root() == Some(project_dir))
+    });
+    if let Some(project) = telemetry_project {
+        let home =
+            dirs::home_dir().expect("registered project telemetry requires a home directory");
+        queue = queue
+            .with_worker_evidence_dir(project.shared_project_dir(&home).join("transcripts"))
+            .with_project_key(project.name.clone())
+            .with_telemetry_store(orboros::telemetry::TelemetryStore::new(
+                project.shared_project_dir(&home).join("telemetry"),
+            ));
     }
     if let Some(sink) = orboros::hooks::HookSink::from_state_dir(state_dir, &project_cwd)
         .unwrap_or_else(|e| {
@@ -1856,7 +1895,10 @@ fn cmd_supervisor_start(
         let transcript_dir = entry.shared_project_dir(home).join("transcripts");
         let mut queue = QueueLoop::new(orb_store, dep_store, project_state_dir.clone())
             .with_worker_evidence_dir(transcript_dir)
-            .with_project_key(entry.name.clone());
+            .with_project_key(entry.name.clone())
+            .with_telemetry_store(orboros::telemetry::TelemetryStore::new(
+                entry.shared_project_dir(home).join("telemetry"),
+            ));
         let project_cwd = entry
             .runnable_path()
             .unwrap_or_else(|| project_state_dir.parent().unwrap_or(&project_state_dir));
@@ -1882,10 +1924,14 @@ fn cmd_supervisor_start(
                 None
             }
         };
+        let telemetry = orboros::telemetry::TelemetryStore::new(
+            entry.shared_project_dir(home).join("telemetry"),
+        );
         projects.push(SupervisedProject {
             name: entry.name,
             queue,
             dispatch,
+            telemetry: Some(telemetry),
         });
     }
     println!(
@@ -1917,6 +1963,92 @@ fn cmd_supervisor_start(
         std::fs::remove_file(&socket_path)?;
     }
     result
+}
+
+fn cmd_telemetry(
+    action: TelemetryAction,
+    current_project: Option<&config::ProjectEntry>,
+    project_dir: Option<&Path>,
+) -> anyhow::Result<()> {
+    let home =
+        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
+    let selected = match &action {
+        TelemetryAction::Show { project } | TelemetryAction::Rebuild { project } => {
+            project.as_deref()
+        }
+    };
+    let project = match selected {
+        Some(name) => config::find_project(&home, name)?
+            .ok_or_else(|| anyhow::anyhow!("registered project {name:?} was not found"))?,
+        None => current_project
+            .cloned()
+            .or_else(|| {
+                project_dir.and_then(|dir| {
+                    config::list_projects(&home)
+                        .ok()?
+                        .into_iter()
+                        .find(|candidate| candidate.runnable_path().as_deref() == Some(dir))
+                })
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("telemetry needs a registered project; pass --project <name>")
+            })?,
+    };
+    let telemetry = orboros::telemetry::TelemetryStore::new(
+        project.shared_project_dir(&home).join("telemetry"),
+    );
+    match action {
+        TelemetryAction::Show { .. } => {
+            print_telemetry_summary(&project.name, &telemetry.read_summary()?)
+        }
+        TelemetryAction::Rebuild { .. } => {
+            let shared_execution = project.shared_state_dir(&home).join("executions.jsonl");
+            let legacy_execution = project
+                .runnable_path()
+                .map(|path| path.join(".orbs/executions.jsonl"));
+            let execution_path = if shared_execution.exists() {
+                shared_execution
+            } else {
+                legacy_execution.ok_or_else(|| {
+                    anyhow::anyhow!("project {} has no runnable worktree", project.name)
+                })?
+            };
+            let records =
+                orboros::execution::ExecutionStore::new(execution_path.clone()).read_all()?;
+            let summary = telemetry.rebuild_from_execution_records(&records)?;
+            println!(
+                "Rebuilt telemetry for {} from {} execution record(s) in {}.",
+                project.name,
+                records.len(),
+                execution_path.display()
+            );
+            print_telemetry_summary(&project.name, &summary);
+        }
+    }
+    Ok(())
+}
+
+fn print_telemetry_summary(project: &str, summary: &orboros::telemetry::TelemetrySummary) {
+    println!("Project:              {project}");
+    println!(
+        "Updated:              {}",
+        summary
+            .updated_at
+            .map(orboros::time::format_local)
+            .unwrap_or_else(|| "-".into())
+    );
+    println!("Completed dispatches:  {}", summary.completed_dispatches);
+    println!("Failed dispatches:     {}", summary.failed_dispatches);
+    println!("Cancelled dispatches:  {}", summary.cancelled_dispatches);
+    println!("Active attempts:       {}", summary.active_attempts.len());
+    println!("Retries:               {}", summary.retries);
+    println!("Total tokens:          {}", summary.total_tokens);
+    println!("Cache read tokens:     {}", summary.cache_read_tokens);
+    println!("Cache write tokens:    {}", summary.cache_write_tokens);
+    println!(
+        "Cost:                  {}",
+        orboros::execution::format_cost_usd(Some(summary.cost_micros))
+    );
 }
 
 fn cmd_daemon_stop(daemon_config: &DaemonConfig) -> anyhow::Result<()> {

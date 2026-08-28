@@ -249,6 +249,22 @@ orboros daemon --stop
 |--------|---------|-------------|
 | `--stop` | false | Stop running daemon |
 | `--status` | false | Show daemon status |
+
+### `telemetry`
+
+Project telemetry is stored under the registered project's user-local
+`~/.orboros/projects/<project-key>/telemetry/` directory, never in the
+repository worktree. The compact summary uses exact microdollar accounting;
+operator output renders USD.
+
+```bash
+orboros telemetry show --project dockyard
+orboros telemetry rebuild --project dockyard
+```
+
+`rebuild` recreates the durable telemetry projection from the project's
+existing `executions.jsonl` evidence. It is appropriate after introducing the
+feature to an existing project or if a summary must be recovered.
 | `--pid-file <PATH>` | `~/.orboros/orboros.pid` | PID file location |
 | `--log-file <PATH>` | — | Log file path |
 | `--tick-interval <MS>` | 1000 | Queue loop tick interval |

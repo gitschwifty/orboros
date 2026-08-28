@@ -206,6 +206,7 @@ pub struct SupervisedProject {
     pub name: String,
     pub queue: crate::queue_loop::QueueLoop,
     pub dispatch: Option<DispatchSettings>,
+    pub telemetry: Option<crate::telemetry::TelemetryStore>,
 }
 
 fn log_run_summary(projects: &[SupervisedProject], started: chrono::DateTime<chrono::Utc>) {
@@ -259,6 +260,40 @@ fn log_run_summary(projects: &[SupervisedProject], started: chrono::DateTime<chr
         cost_usd = %crate::execution::format_cost_usd(Some(cost_micros)),
         "supervisor run summary"
     );
+}
+
+fn project_run_aggregate(
+    project: &SupervisedProject,
+    started: chrono::DateTime<chrono::Utc>,
+) -> crate::telemetry::RunAggregate {
+    let mut aggregate = crate::telemetry::RunAggregate::default();
+    let Ok(records) = project.queue.execution_store().read_all() else {
+        return aggregate;
+    };
+    for record in records
+        .into_iter()
+        .filter(|record| record.dispatched_at >= started)
+    {
+        aggregate.total_tokens = aggregate
+            .total_tokens
+            .saturating_add(record.total_tokens.unwrap_or(0));
+        aggregate.cache_read_tokens = aggregate
+            .cache_read_tokens
+            .saturating_add(record.cache_read_tokens.unwrap_or(0));
+        aggregate.cache_write_tokens = aggregate
+            .cache_write_tokens
+            .saturating_add(record.cache_write_tokens.unwrap_or(0));
+        aggregate.cost_micros = aggregate
+            .cost_micros
+            .saturating_add(record.cost_micros.unwrap_or(0));
+        aggregate.retries = aggregate.retries.saturating_add(u64::from(record.retries));
+        match record.status.as_str() {
+            "done" => aggregate.completed_dispatches += 1,
+            "error" | "failed" => aggregate.failed_dispatches += 1,
+            _ => {}
+        }
+    }
+    aggregate
 }
 
 async fn tick_project(
@@ -354,6 +389,14 @@ pub async fn run_supervisor_with_control_socket(
     );
     let mut shutdown_rx = setup_signal_handlers();
     let run_started_at = chrono::Utc::now();
+    let run_id = uuid::Uuid::new_v4().to_string();
+    for project in &projects {
+        if let Some(telemetry) = &project.telemetry {
+            if let Err(error) = telemetry.record_run_started(&run_id) {
+                tracing::warn!(project = %project.name, %error, "could not record supervisor run start");
+            }
+        }
+    }
     let summary_projects = projects.clone();
     let summary_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_mins(1));
@@ -411,6 +454,7 @@ pub async fn run_supervisor_with_control_socket(
                             name: name.clone(),
                             queue: queue.clone(),
                             dispatch: dispatch.get(name)?.clone(),
+                            telemetry: None,
                         })
                     }).collect();
                     tick_supervised_projects_with_global(&attached, global_semaphore.clone()).await;
@@ -426,6 +470,14 @@ pub async fn run_supervisor_with_control_socket(
         server.abort();
     }
     summary_task.abort();
+    for project in &projects {
+        if let Some(telemetry) = &project.telemetry {
+            let aggregate = project_run_aggregate(project, run_started_at);
+            if let Err(error) = telemetry.record_run_finished(&run_id, run_started_at, aggregate) {
+                tracing::warn!(project = %project.name, %error, "could not record supervisor run completion");
+            }
+        }
+    }
     tracing::info!("supervisor daemon stopped");
     Ok(())
 }
@@ -578,6 +630,7 @@ mod tests {
                 dir.to_path_buf(),
             ),
             dispatch: None,
+            telemetry: None,
         };
         let projects = vec![project("first", &first), project("second", &second)];
 

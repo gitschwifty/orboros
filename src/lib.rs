@@ -39,6 +39,7 @@ pub mod second_opinion_trigger;
 pub mod slop;
 pub mod startup_check;
 pub mod supervisor;
+pub mod telemetry;
 pub mod time;
 pub mod tracing_ctx;
 pub mod worker;

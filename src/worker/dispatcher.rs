@@ -427,13 +427,6 @@ async fn dispatch_orb_with_retry_limit(
                 terminal_retry = Some(diagnostic);
             }
             attempt = 1;
-            warn!(
-                orb = %orb.id,
-                retry_attempt = 2,
-                retry_kind = retry_kind_label,
-                terminal = terminal_retry.is_some(),
-                "retrying whole worker dispatch from a fresh worker"
-            );
             tracing::error!(
                 orb = %orb.id,
                 retry_attempt = 2,
@@ -441,6 +434,13 @@ async fn dispatch_orb_with_retry_limit(
                 failure_code,
                 error,
                 "worker dispatch attempt failed; retrying"
+            );
+            warn!(
+                orb = %orb.id,
+                retry_attempt = 2,
+                retry_kind = retry_kind_label,
+                terminal = terminal_retry.is_some(),
+                "retrying whole worker dispatch from a fresh worker"
             );
             continue;
         }
@@ -477,10 +477,21 @@ async fn dispatch_orb_with_retry_limit(
         outcome.status,
         DispatchStatus::Error | DispatchStatus::Failed
     ) {
+        let failure_code = outcome
+            .failure
+            .as_ref()
+            .map_or("-", |failure| failure.code.as_str());
+        let termination_reason = outcome
+            .failure
+            .as_ref()
+            .map_or("-", |failure| failure.termination_reason.as_str());
         tracing::error!(
             orb = %orb.id,
             title = %orb.title,
             phase = ?orb.phase.unwrap_or(orbs::orb::OrbPhase::Pending),
+            status = ?outcome.status,
+            failure_code,
+            termination_reason,
             error = %outcome.error.as_deref().unwrap_or("worker returned no error detail"),
             "dispatch failed"
         );
