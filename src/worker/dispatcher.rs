@@ -9,6 +9,7 @@
 //! spawn/send/shutdown machinery and the lifecycle hook firing
 //! (`pre-worker-spawn` / `post-worker-complete` / `post-worker-fail`).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use chrono::Utc;
@@ -237,7 +238,20 @@ pub async fn dispatch_orb(
     worker_config: &WorkerConfig,
     hooks: Option<&HookSink>,
 ) -> anyhow::Result<DispatchOutcome> {
-    dispatch_orb_with_retry_limit(orb, prompt, worker_config, hooks, 1).await
+    dispatch_orb_with_retry_limit(orb, prompt, worker_config, hooks, 1, None).await
+}
+
+/// Dispatches an orb while allowing the supervisor to prevent a fresh-worker
+/// retry once it has begun draining. The current worker attempt is always
+/// allowed to finish and persist its outcome.
+pub async fn dispatch_orb_while_running(
+    orb: &Orb,
+    prompt: &str,
+    worker_config: &WorkerConfig,
+    hooks: Option<&HookSink>,
+    running: &AtomicBool,
+) -> anyhow::Result<DispatchOutcome> {
+    dispatch_orb_with_retry_limit(orb, prompt, worker_config, hooks, 1, Some(running)).await
 }
 
 /// Dispatches exactly once, including no automatic retry after a retryable
@@ -249,7 +263,7 @@ pub async fn dispatch_orb_once(
     worker_config: &WorkerConfig,
     hooks: Option<&HookSink>,
 ) -> anyhow::Result<DispatchOutcome> {
-    dispatch_orb_with_retry_limit(orb, prompt, worker_config, hooks, 0).await
+    dispatch_orb_with_retry_limit(orb, prompt, worker_config, hooks, 0, None).await
 }
 
 async fn dispatch_orb_with_retry_limit(
@@ -258,6 +272,7 @@ async fn dispatch_orb_with_retry_limit(
     worker_config: &WorkerConfig,
     hooks: Option<&HookSink>,
     retry_limit: u32,
+    running: Option<&AtomicBool>,
 ) -> anyhow::Result<DispatchOutcome> {
     // 1. pre-worker-spawn — gating. Exit 2 from any matching hook
     //    short-circuits before we spawn anything. We're already in
@@ -390,7 +405,9 @@ async fn dispatch_orb_with_retry_limit(
             }
         };
         attempts.push(DispatchAttempt::from_outcome(&outcome));
-        if let Some(retry_kind) = retry_kind.filter(|_| attempt < retry_limit) {
+        if let Some(retry_kind) = retry_kind.filter(|_| {
+            attempt < retry_limit && running.is_none_or(|flag| flag.load(Ordering::SeqCst))
+        }) {
             let retry_kind_label = match &retry_kind {
                 RetryKind::Transient => "transient",
                 RetryKind::Terminal(_) => "terminal",

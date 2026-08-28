@@ -46,6 +46,20 @@ fn completed_dispatch_retry_backoff(retries_completed: u32) -> Duration {
         .min(COMPLETED_DISPATCH_RETRY_MAX)
 }
 
+/// Wait for retry backoff without holding shutdown hostage. The short polling
+/// interval matters only while draining; normal retry timing is unchanged.
+async fn retry_backoff_while_running(running: &AtomicBool, backoff: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + backoff;
+    while running.load(Ordering::SeqCst) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
+    }
+    false
+}
+
 /// Determines the last completed refinement round visible from an orb
 /// checkpoint. Restored snapshots retain their original timestamp, which
 /// makes the append-only execution ledger a bounded, history-aware view.
@@ -878,6 +892,7 @@ impl QueueLoop {
                     prompt_store,
                     worker_evidence_dir,
                     project_key,
+                    running,
                 )
                 .await
             });
@@ -1289,9 +1304,11 @@ async fn dispatch_one_owned(
     prompt_store: Option<crate::execution::PromptStore>,
     worker_evidence_dir: PathBuf,
     project_key: Option<String>,
+    running: Arc<AtomicBool>,
 ) -> std::io::Result<bool> {
     use crate::worker::dispatcher::{
-        apply_dispatch_outcome_with_review, dispatch_orb, worker_config_for_with_model_config,
+        apply_dispatch_outcome_with_review, dispatch_orb_while_running,
+        worker_config_for_with_model_config,
     };
 
     let (built_in_system, user) = match target {
@@ -1376,7 +1393,7 @@ async fn dispatch_one_owned(
     let mut completed_retries = 0_u32;
     let mut outer_attempt = 1_u32;
     let mut outcome = loop {
-        let outcome = dispatch_orb(&orb, &user, &wc, hooks.as_deref())
+        let outcome = dispatch_orb_while_running(&orb, &user, &wc, hooks.as_deref(), &running)
             .await
             .map_err(std::io::Error::other)?;
         let failed = matches!(
@@ -1386,6 +1403,7 @@ async fn dispatch_one_owned(
         );
         if !failed
             || !completed_dispatch_retry_allowed(model_config.workers.retries, completed_retries)
+            || !running.load(Ordering::SeqCst)
         {
             break outcome;
         }
@@ -1404,6 +1422,9 @@ async fn dispatch_one_owned(
         });
         execution_store.append(&retry_record)?;
         let backoff = completed_dispatch_retry_backoff(completed_retries);
+        if !running.load(Ordering::SeqCst) {
+            break outcome;
+        }
         completed_retries = completed_retries.saturating_add(1);
         outer_attempt = outer_attempt.saturating_add(1);
         configure_worker_runtime(&mut wc, &log_root, &orb.id.to_string(), outer_attempt)?;
@@ -1413,7 +1434,9 @@ async fn dispatch_one_owned(
             format!("{completed_retries}/{}", model_config.workers.retries)
         };
         tracing::warn!(orb = %orb.id, retry = %retry_progress, backoff_ms = backoff.as_millis(), "retrying completed failed orb dispatch");
-        tokio::time::sleep(backoff).await;
+        if !retry_backoff_while_running(&running, backoff).await {
+            break outcome;
+        }
     };
     outcome.retries = outcome.retries.saturating_add(completed_retries);
     let mut refinement_round = None;
@@ -1497,9 +1520,10 @@ async fn dispatch_one_owned(
             user = crate::prompt_context::append_task_context(&next_user, &task_context.text);
             let mut round_retries = 0_u32;
             outcome = loop {
-                let round_outcome = dispatch_orb(&orb, &user, &wc, hooks.as_deref())
-                    .await
-                    .map_err(std::io::Error::other)?;
+                let round_outcome =
+                    dispatch_orb_while_running(&orb, &user, &wc, hooks.as_deref(), &running)
+                        .await
+                        .map_err(std::io::Error::other)?;
                 let failed = matches!(
                     round_outcome.status,
                     crate::worker::dispatcher::DispatchStatus::Error
@@ -1510,6 +1534,7 @@ async fn dispatch_one_owned(
                         model_config.workers.retries,
                         round_retries,
                     )
+                    || !running.load(Ordering::SeqCst)
                 {
                     break round_outcome;
                 }
@@ -1528,6 +1553,9 @@ async fn dispatch_one_owned(
                 });
                 execution_store.append(&retry_record)?;
                 let backoff = completed_dispatch_retry_backoff(round_retries);
+                if !running.load(Ordering::SeqCst) {
+                    break round_outcome;
+                }
                 round_retries = round_retries.saturating_add(1);
                 configure_worker_runtime(
                     &mut wc,
@@ -1542,7 +1570,9 @@ async fn dispatch_one_owned(
                     backoff_ms = backoff.as_millis(),
                     "retrying completed failed refinement round"
                 );
-                tokio::time::sleep(backoff).await;
+                if !retry_backoff_while_running(&running, backoff).await {
+                    break round_outcome;
+                }
             };
             outcome.retries = outcome.retries.saturating_add(round_retries);
             if outcome.status != crate::worker::dispatcher::DispatchStatus::Done {
@@ -1661,14 +1691,15 @@ async fn dispatch_one_owned(
             .find(|candidate| &candidate.id == parent_id)
             .map(|parent| parent.description.as_str())
     });
-    let recovery_eligible = partial_artifact_recovery_is_eligible(
-        &orb,
-        target,
-        &outcome,
-        parent_description.is_some_and(|description| !description.trim().is_empty()),
-        workspace_before.as_deref(),
-        workspace_after.as_deref(),
-    );
+    let recovery_eligible = running.load(Ordering::SeqCst)
+        && partial_artifact_recovery_is_eligible(
+            &orb,
+            target,
+            &outcome,
+            parent_description.is_some_and(|description| !description.trim().is_empty()),
+            workspace_before.as_deref(),
+            workspace_after.as_deref(),
+        );
 
     let mut execution_record = crate::execution::ExecutionRecord::from_outcome(
         &orb,
@@ -1942,6 +1973,15 @@ mod tests {
         assert!(completed_dispatch_retry_allowed(2, 1));
         assert!(!completed_dispatch_retry_allowed(2, 2));
         assert!(completed_dispatch_retry_allowed(-1, 10_000));
+    }
+
+    #[tokio::test]
+    async fn retry_backoff_does_not_wait_after_shutdown_begins() {
+        let running = AtomicBool::new(false);
+        assert!(
+            !retry_backoff_while_running(&running, Duration::from_secs(1)).await,
+            "a stopped queue must not wait to begin a retry"
+        );
     }
 
     #[test]
