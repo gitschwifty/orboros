@@ -405,7 +405,7 @@ impl QueueLoop {
             if !ready_ids.contains(&orb.id) {
                 continue;
             }
-            if blocked_by_parent_review(orb, orbs) {
+            if blocked_by_parent_review(orb, orbs) || has_failed_child(orb, orbs) {
                 continue;
             }
             if orb.orb_type.uses_phase() {
@@ -448,27 +448,12 @@ impl QueueLoop {
             let Some(children) = children_by_parent.get(&orb.id) else {
                 continue;
             };
-            if let Some(failed_child) = children
+            if children
                 .iter()
-                .find(|child| child.effective_status() == TaskStatus::Failed)
+                .any(|child| child.effective_status() == TaskStatus::Failed)
             {
-                let mut updated = orb.clone();
-                let reason = failed_child.result.as_deref().unwrap_or("child orb failed");
-                updated.result = Some(format!(
-                    "required child {} failed: {reason}",
-                    failed_child.id
-                ));
-                if orb.orb_type.uses_phase() {
-                    updated
-                        .set_phase(OrbPhase::Failed)
-                        .map_err(std::io::Error::other)?;
-                } else {
-                    updated
-                        .set_status(OrbStatus::Failed)
-                        .map_err(std::io::Error::other)?;
-                }
-                self.orb_store.update(&updated)?;
-                count += 1;
+                // Child failure is a derived scheduling blocker, not a
+                // failure of the parent's accepted planning checkpoint.
                 continue;
             }
             let all_children_done = children
@@ -572,7 +557,7 @@ impl QueueLoop {
             if !ready_ids.contains(&orb.id) {
                 continue;
             }
-            if blocked_by_parent_review(orb, orbs) {
+            if blocked_by_parent_review(orb, orbs) || has_failed_child(orb, orbs) {
                 continue;
             }
 
@@ -623,27 +608,12 @@ impl QueueLoop {
                 continue;
             };
 
-            if let Some(failed_child) = children
+            if children
                 .iter()
-                .find(|child| child.effective_status() == TaskStatus::Failed)
+                .any(|child| child.effective_status() == TaskStatus::Failed)
             {
-                let mut updated = orb.clone();
-                let reason = failed_child.result.as_deref().unwrap_or("child orb failed");
-                updated.result = Some(format!(
-                    "required child {} failed: {reason}",
-                    failed_child.id
-                ));
-                if orb.orb_type.uses_phase() {
-                    updated
-                        .set_phase(OrbPhase::Failed)
-                        .map_err(std::io::Error::other)?;
-                } else {
-                    updated
-                        .set_status(OrbStatus::Failed)
-                        .map_err(std::io::Error::other)?;
-                }
-                self.orb_store.update(&updated)?;
-                count += 1;
+                // Keep refinement/planning evidence on the parent intact;
+                // resetting the child alone releases this derived blocker.
                 continue;
             }
 
@@ -1072,6 +1042,16 @@ fn index_children_by_parent(orbs: &[Orb]) -> HashMap<&OrbId, Vec<&Orb>> {
 fn has_children(orb: &Orb, orbs: &[Orb]) -> bool {
     orbs.iter()
         .any(|candidate| candidate.parent_id.as_ref() == Some(&orb.id))
+}
+
+/// A required child failure blocks the parent without changing the parent's
+/// durable phase/status. This makes the block disappear automatically once
+/// that child is reset and completes successfully.
+fn has_failed_child(orb: &Orb, orbs: &[Orb]) -> bool {
+    orbs.iter().any(|candidate| {
+        candidate.parent_id.as_ref() == Some(&orb.id)
+            && candidate.effective_status() == TaskStatus::Failed
+    })
 }
 
 // ── Dispatch helpers (task 60) ───────────────────────────────────
@@ -2241,6 +2221,69 @@ mod tests {
         assert_eq!(result.roots_completed, 0);
         let updated = orb_store.load_by_id(&parent.id).unwrap().unwrap();
         assert_eq!(updated.phase, Some(OrbPhase::Executing));
+    }
+
+    #[test]
+    fn failed_child_blocks_parent_without_erasing_refinement_checkpoint() {
+        let (_tmp, orb_store, dep_store, base) = setup();
+        let mut parent =
+            Orb::new("Parent epic", "accepted refined specification").with_type(OrbType::Epic);
+        parent.phase = Some(OrbPhase::Waiting);
+        parent.result = Some("accepted refinement response".into());
+        parent.execution = Some(orbs::orb::ExecutionMeta {
+            worker_model: Some("refinement-model".into()),
+            ..Default::default()
+        });
+        orb_store.append(&parent).unwrap();
+
+        let mut child = Orb::new("Failed child", "retry only this work")
+            .with_parent(parent.id.clone(), Some(parent.id.clone()));
+        child.status = Some(OrbStatus::Failed);
+        child.result = Some("worker setup failed".into());
+        orb_store.append(&child).unwrap();
+
+        let ql = QueueLoop::new(orb_store.clone(), dep_store, base);
+        let result = ql.tick().unwrap();
+
+        assert_eq!(result.orbs_executed, 0);
+        assert_eq!(result.roots_completed, 0);
+        let updated = orb_store.load_by_id(&parent.id).unwrap().unwrap();
+        assert_eq!(updated.phase, Some(OrbPhase::Waiting));
+        assert_eq!(updated.result, parent.result);
+        assert_eq!(
+            updated
+                .execution
+                .as_ref()
+                .and_then(|meta| meta.worker_model.as_deref()),
+            Some("refinement-model")
+        );
+    }
+
+    #[test]
+    fn resetting_only_failed_child_releases_parent_without_refinement_reset() {
+        let (_tmp, orb_store, dep_store, base) = setup();
+        let mut parent =
+            Orb::new("Parent epic", "accepted refined specification").with_type(OrbType::Epic);
+        parent.phase = Some(OrbPhase::Waiting);
+        parent.result = Some("accepted refinement response".into());
+        orb_store.append(&parent).unwrap();
+
+        let mut child = Orb::new("Failed child", "retry only this work")
+            .with_parent(parent.id.clone(), Some(parent.id.clone()));
+        child.status = Some(OrbStatus::Failed);
+        orb_store.append(&child).unwrap();
+
+        crate::orb_cmd::cmd_orb_reset(&orb_store, &child.id.to_string()).unwrap();
+        let reset_child = orb_store.load_by_id(&child.id).unwrap().unwrap();
+        assert_eq!(reset_child.status, Some(OrbStatus::Pending));
+
+        let ql = QueueLoop::new(orb_store.clone(), dep_store, base);
+        ql.tick().unwrap();
+        let updated_parent = orb_store.load_by_id(&parent.id).unwrap().unwrap();
+        let updated_child = orb_store.load_by_id(&child.id).unwrap().unwrap();
+        assert_eq!(updated_parent.phase, Some(OrbPhase::ExecutingChildren));
+        assert_eq!(updated_child.status, Some(OrbStatus::Active));
+        assert_eq!(updated_parent.result, parent.result);
     }
 
     #[test]
