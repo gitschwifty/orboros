@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +18,21 @@ const PARTIAL_ARTIFACT_RECOVERY_SYSTEM_PROMPT: &str =
     include_str!("../assets/prompts/recover-partial-artifact.md");
 const COMPLETED_DISPATCH_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const COMPLETED_DISPATCH_RETRY_MAX: Duration = Duration::from_secs(30);
+
+struct InFlightDispatchGuard(Arc<AtomicUsize>);
+
+impl InFlightDispatchGuard {
+    fn begin(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for InFlightDispatchGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 fn completed_dispatch_retry_allowed(configured_retries: i32, retries_completed: u32) -> bool {
     configured_retries == -1
@@ -129,6 +144,7 @@ pub struct QueueLoop {
     dep_store: DepStore,
     base_dir: PathBuf,
     running: Arc<AtomicBool>,
+    in_flight_dispatches: Arc<AtomicUsize>,
     paused: Arc<AtomicBool>,
     hooks: Option<Arc<crate::hooks::HookSink>>,
     review_config: Option<crate::config::ReviewConfig>,
@@ -155,6 +171,7 @@ impl QueueLoop {
             dep_store,
             base_dir,
             running: Arc::new(AtomicBool::new(true)),
+            in_flight_dispatches: Arc::new(AtomicUsize::new(0)),
             paused: Arc::new(AtomicBool::new(false)),
             hooks: None,
             review_config: None,
@@ -273,28 +290,10 @@ impl QueueLoop {
         self.execution_store.clone()
     }
 
-    /// Live operational count of non-terminal orbs that are currently active
-    /// or in a worker-dispatchable phase. Durable attempt accounting remains
-    /// in the execution ledger once a dispatch returns.
-    pub fn active_orb_count(&self) -> std::io::Result<usize> {
-        self.orb_store.load_all().map(|orbs| {
-            orbs.iter()
-                .filter(|orb| !is_terminal(orb))
-                .filter(|orb| {
-                    orb.status == Some(OrbStatus::Active)
-                        || matches!(
-                            orb.phase,
-                            Some(
-                                OrbPhase::Speccing
-                                    | OrbPhase::Decomposing
-                                    | OrbPhase::Refining
-                                    | OrbPhase::Reevaluating
-                                    | OrbPhase::Executing
-                            )
-                        )
-                })
-                .count()
-        })
+    /// Exact number of worker dispatches currently admitted and running.
+    #[must_use]
+    pub fn in_flight_dispatch_count(&self) -> usize {
+        self.in_flight_dispatches.load(Ordering::SeqCst)
     }
 
     /// Performs a single iteration of the queue loop.
@@ -841,6 +840,7 @@ impl QueueLoop {
             let worker_evidence_dir = self.worker_evidence_dir.clone();
             let project_key = self.project_key.clone();
             let running = Arc::clone(&running);
+            let in_flight_dispatches = Arc::clone(&self.in_flight_dispatches);
             join_set.spawn(async move {
                 if !running.load(Ordering::SeqCst) {
                     return Ok(false);
@@ -858,6 +858,7 @@ impl QueueLoop {
                 if !running.load(Ordering::SeqCst) {
                     return Ok(false);
                 }
+                let _in_flight = InFlightDispatchGuard::begin(in_flight_dispatches);
                 let context = DispatchContext {
                     orbs: &context_orbs,
                     edges: &context_edges,
