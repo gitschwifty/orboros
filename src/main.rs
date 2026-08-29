@@ -973,7 +973,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Telemetry { action } => cmd_telemetry(
-            action,
+            &action,
             shared_project.as_ref(),
             effective_state.project_dir.as_deref(),
         ),
@@ -2105,7 +2105,7 @@ fn cmd_supervisor_start(
 }
 
 fn cmd_telemetry(
-    action: TelemetryAction,
+    action: &TelemetryAction,
     current_project: Option<&config::ProjectEntry>,
     project_dir: Option<&Path>,
 ) -> anyhow::Result<()> {
@@ -2126,7 +2126,7 @@ fn cmd_telemetry(
                     config::list_projects(&home)
                         .ok()?
                         .into_iter()
-                        .find(|candidate| candidate.runnable_path().as_deref() == Some(dir))
+                        .find(|candidate| candidate.runnable_path() == Some(dir))
                 })
             })
             .ok_or_else(|| {
@@ -2138,7 +2138,7 @@ fn cmd_telemetry(
     );
     match action {
         TelemetryAction::Show { .. } => {
-            print_telemetry_summary(&project.name, &telemetry.read_summary()?)
+            print_telemetry_summary(&project.name, &telemetry.read_summary()?);
         }
         TelemetryAction::Rebuild { .. } => {
             let project_execution = project.execution_log_path(&home);
@@ -2176,8 +2176,7 @@ fn print_telemetry_summary(project: &str, summary: &orboros::telemetry::Telemetr
         "Updated:              {}",
         summary
             .updated_at
-            .map(orboros::time::format_local)
-            .unwrap_or_else(|| "-".into())
+            .map_or_else(|| "-".into(), orboros::time::format_local)
     );
     println!("Completed dispatches:  {}", summary.completed_dispatches);
     println!("Failed dispatches:     {}", summary.failed_dispatches);

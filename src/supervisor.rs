@@ -376,6 +376,7 @@ impl LocalMutationLease {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(&path)?;
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             let error = io::Error::last_os_error();

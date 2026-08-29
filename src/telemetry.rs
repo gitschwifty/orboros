@@ -115,6 +115,7 @@ impl TelemetryStore {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(self.root.join(".lock"))?;
         if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(std::io::Error::last_os_error());
@@ -258,7 +259,7 @@ impl TelemetryStore {
     }
 
     pub fn read_summary(&self) -> std::io::Result<TelemetrySummary> {
-        match std::fs::read(&self.summary_path()) {
+        match std::fs::read(self.summary_path()) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(std::io::Error::other),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 Ok(TelemetrySummary::default())
@@ -268,7 +269,7 @@ impl TelemetryStore {
     }
 
     fn write_summary_locked(&self) -> std::io::Result<()> {
-        let summary = summarize(&read_jsonl::<AttemptEvent>(&self.attempts_path())?);
+        let summary = summarize(&read_jsonl::<AttemptEvent>(&self.attempts_path()));
         let temporary = self.root.join("summary.json.tmp");
         let mut file = File::create(&temporary)?;
         serde_json::to_writer_pretty(&mut file, &summary).map_err(std::io::Error::other)?;
@@ -279,15 +280,15 @@ impl TelemetryStore {
     }
 }
 
-fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> std::io::Result<Vec<T>> {
+fn read_jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Vec<T> {
     let Ok(file) = File::open(path) else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
-    Ok(BufReader::new(file)
+    BufReader::new(file)
         .lines()
-        .filter_map(Result::ok)
+        .map_while(Result::ok)
         .filter_map(|line| serde_json::from_str(&line).ok())
-        .collect())
+        .collect()
 }
 
 fn summarize(events: &[AttemptEvent]) -> TelemetrySummary {
