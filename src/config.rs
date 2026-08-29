@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 use crate::routing::profile::{validate_profiles, ToolProfile};
@@ -89,7 +89,63 @@ pub struct LoggingConfig {
     pub retention_days: Option<u32>,
     /// Retain project log evidence indefinitely by default. A future retention
     /// command will use this as an opt-in aggregate byte limit.
-    pub max_bytes: Option<u64>,
+    pub max_size: Option<LogSize>,
+}
+
+/// A byte count accepted as a bare number or with a `K`, `M`, or `G` suffix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LogSize(pub u64);
+
+impl<'de> Deserialize<'de> for LogSize {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Input {
+            Bytes(u64),
+            Human(String),
+        }
+        match Input::deserialize(deserializer)? {
+            Input::Bytes(bytes) => Ok(Self(bytes)),
+            Input::Human(value) => parse_log_size(&value)
+                .map(Self)
+                .map_err(serde::de::Error::custom),
+        }
+    }
+}
+
+impl Serialize for LogSize {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u64(self.0)
+    }
+}
+
+fn parse_log_size(value: &str) -> Result<u64, String> {
+    let value = value.trim();
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (number, suffix) = value.split_at(split);
+    if number.is_empty() || suffix.len() > 1 {
+        return Err("log size must be bytes or a number followed by K, M, or G".into());
+    }
+    let multiplier = match suffix.to_ascii_uppercase().as_str() {
+        "" => 1,
+        "K" => 1024,
+        "M" => 1024 * 1024,
+        "G" => 1024 * 1024 * 1024,
+        _ => return Err("log size suffix must be K, M, or G".into()),
+    };
+    number
+        .parse::<u64>()
+        .map_err(|_| "log size must begin with an unsigned integer".to_string())?
+        .checked_mul(multiplier)
+        .ok_or_else(|| "log size is too large".to_string())
 }
 
 /// Retry policy for worker dispatches. Values count retries after the first
@@ -1336,6 +1392,16 @@ mod tests {
     }
 
     #[test]
+    fn log_size_accepts_bytes_and_binary_suffixes() {
+        assert_eq!(parse_log_size("1024").unwrap(), 1_024);
+        assert_eq!(parse_log_size("1024K").unwrap(), 1_048_576);
+        assert_eq!(parse_log_size("2m").unwrap(), 2 * 1024 * 1024);
+        assert_eq!(parse_log_size("1G").unwrap(), 1024 * 1024 * 1024);
+        assert!(parse_log_size("12MB").is_err());
+        assert!(parse_log_size("K").is_err());
+    }
+
+    #[test]
     fn worker_retries_validation_accepts_disabled_finite_and_unlimited() {
         for retries in [0, 3, -1] {
             assert!(WorkerSettingsConfig { retries }.validate().is_ok());
@@ -2133,7 +2199,7 @@ system = "project speccing"
                 level: Some("orboros=debug".into()),
                 file: Some("/tmp/orboros-general.log".into()),
                 retention_days: Some(30),
-                max_bytes: Some(1_024),
+                max_size: Some(LogSize(1_024)),
             },
             workers: WorkerSettingsConfig { retries: -1 },
             heddle: HeddleSettingsConfig {

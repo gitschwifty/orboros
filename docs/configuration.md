@@ -284,9 +284,11 @@ packaged template defines `read_only`, `research`, `test`, `edit`, and
 - `[logging]`: optional `level` tracing filter (for example
   `orboros=debug,tokio=warn`) and `file` for foreground command logs. The
   global `--log-level` and `--log-file` flags override these settings.
-  `retention_days` and `max_bytes` reserve opt-in age and size limits for
+  `retention_days` and `max_size` reserve opt-in age and size limits for
   project evidence; both are unset by default, so logs are retained
-  indefinitely until a maintenance policy is deliberately enabled.
+  indefinitely until a maintenance policy is deliberately enabled. `max_size`
+  accepts a bare byte count (`1024`) or a quoted `K`, `M`, or `G` suffix
+  (`"1024K"`, `"1024M"`).
 - `[daemon]`: optional `pid_file`, `log_file`, `log_max_size`, and
   `tick_interval_ms` process settings. `global_max_concurrency` optionally
   caps all workers across a multi-project supervisor; each project retains its
