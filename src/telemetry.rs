@@ -375,6 +375,7 @@ mod tests {
             terminal_retry: None,
             partial_artifact_recovery: None,
             refinement_round: None,
+            refinement_attempt: None,
             attempts: Vec::new(),
         }];
         let summary = store.rebuild_from_execution_records(&records).unwrap();

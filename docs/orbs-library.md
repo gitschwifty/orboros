@@ -52,6 +52,18 @@ orb.tombstone(Some("duplicate of orb-abc".into()));
 assert!(orb.is_tombstoned());
 ```
 
+### Retry and refinement lifecycle
+
+`[workers].retries` applies to one completed worker unit: a task execution,
+phase dispatch, or individual refinement round. It is not an orb-lifetime
+budget. A provider/worker failure may also receive the dispatcher's bounded
+fresh-worker retry. A malformed Refining response first receives one separate
+format-repair worker attempt; that repair does not consume `workers.retries`.
+If it is still invalid, the same round enters its normal configured retry
+budget. Every attempt has a distinct worker ID, transcript, runtime state
+directory, and durable execution record. Reset and rollback append a new
+retryable projection; they never erase prior orb snapshots or attempt evidence.
+
 ### Content Hashing
 
 Used for change detection (e.g. refinement termination):

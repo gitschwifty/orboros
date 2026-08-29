@@ -113,6 +113,12 @@ pub struct ExecutionRecord {
     /// Per-round evidence for a configured Refining loop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refinement_round: Option<RefinementRoundDiagnostic>,
+    /// Provenance for one worker dispatch within a Refining round. This is
+    /// deliberately attached to every dispatch record rather than inferred
+    /// from the mutable orb snapshot, so rejected output and repairs remain
+    /// queryable after reset or rollback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refinement_attempt: Option<RefinementAttemptDiagnostic>,
     /// Every worker attempt, including fresh retries that did not produce a
     /// final successful result. Missing on historical records.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -171,6 +177,22 @@ pub struct RefinementRoundDiagnostic {
     pub model_declared_complete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub termination_reason: Option<String>,
+}
+
+/// Stable lineage for a worker dispatch belonging to a Refining round.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefinementAttemptDiagnostic {
+    /// The logical refinement round, starting at one.
+    pub round: u32,
+    /// The normal round attempt ordinal. Format repair is attached to the
+    /// normal attempt it repairs and does not advance this counter.
+    pub attempt: u32,
+    /// `initial`, `completed_round_retry`, or
+    /// `after_invalid_refinement_output` for the repair dispatch.
+    pub reason: String,
+    /// The normal attempt that caused this dispatch, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_attempt: Option<u32>,
 }
 
 /// Attribution for the one bounded recovery pass permitted after a failed
@@ -238,6 +260,7 @@ impl ExecutionRecord {
             terminal_retry: outcome.terminal_retry.clone(),
             partial_artifact_recovery: None,
             refinement_round: None,
+            refinement_attempt: None,
             attempts: outcome.attempts.clone(),
         }
     }
