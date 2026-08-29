@@ -209,6 +209,13 @@ impl QueueLoop {
         self.worker_evidence_dir = worker_evidence_dir;
         self
     }
+
+    /// Moves durable dispatch-attempt records into a project log home.
+    #[must_use]
+    pub fn with_execution_log_path(mut self, execution_path: PathBuf) -> Self {
+        self.execution_store = crate::execution::ExecutionStore::new(execution_path);
+        self
+    }
     #[must_use]
     pub fn with_project_key(mut self, project_key: impl Into<String>) -> Self {
         self.project_key = Some(project_key.into());
@@ -2152,6 +2159,16 @@ mod tests {
             .with_worker_evidence_dir(evidence_dir.clone());
 
         assert_eq!(queue.worker_evidence_dir, evidence_dir);
+    }
+
+    #[test]
+    fn custom_execution_log_path_overrides_state_local_default() {
+        let (_tmp, orb_store, dep_store, base) = setup();
+        let execution_path = base.join("shared-project").join("logs/executions.jsonl");
+        let queue = QueueLoop::new(orb_store, dep_store, base)
+            .with_execution_log_path(execution_path.clone());
+
+        assert_eq!(queue.execution_store.path(), execution_path);
     }
 
     #[tokio::test]

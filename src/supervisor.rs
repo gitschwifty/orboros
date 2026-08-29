@@ -814,17 +814,15 @@ impl LocalSupervisor {
             control_socket_path(&self.home),
             project_name.into(),
         ));
-        let transcript_dir = authority
-            .project()
-            .shared_project_dir(&self.home)
-            .join("transcripts");
+        let log_dir = authority.project().log_dir(&self.home);
         let queue = crate::queue_loop::QueueLoop::new(
             orbs::orb_store::OrbStore::new(state_dir.join("orbs.jsonl"))
                 .with_write_sink(writer.clone()),
             orbs::dep_store::DepStore::new(state_dir.join("deps.jsonl")).with_write_sink(writer),
             state_dir,
         )
-        .with_worker_evidence_dir(transcript_dir)
+        .with_worker_evidence_dir(log_dir.join("heddle"))
+        .with_execution_log_path(authority.project().execution_log_path(&self.home))
         .with_project_key(project_name);
         self.queues.insert(project_name.into(), queue);
         let dispatch = crate::worker::dispatcher::default_worker_config(

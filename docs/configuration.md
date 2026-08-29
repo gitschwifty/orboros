@@ -292,10 +292,10 @@ packaged template defines `read_only`, `research`, `test`, `edit`, and
   dependency writes then go through the local authority rather than the
   worktree `.orbs` files. Project `max_concurrency` controls that
   project's dispatch cap; explicit daemon CLI flags override these settings.
-  Without a configured file, a multi-project supervisor appends to
+  Without a configured file, the multi-project supervisor appends to
   `~/.orboros/supervisor.log`; a daemon targeted to one project appends
-  to `~/.orboros/projects/<project>/daemon.log`. Foreground project
-  commands default to the sibling `cli.log` path.
+  to that project's `logs/daemon.log`. Foreground project commands default
+  to the sibling `logs/cli.log` path.
 - `[refinement]`: `max_rounds` controls the bounded number of structured
   Refining workers (default `1`); `stop_on_no_material_change` stops when a
   round leaves description/design/acceptance criteria unchanged, and
@@ -309,16 +309,24 @@ packaged template defines `read_only`, `research`, `test`, `edit`, and
 ### Worker evidence
 
 Every queue-dispatched Heddle worker receives an isolated runtime placement.
-For a registered project, its state and transcript are written beneath the
-stable user-local project home at
-`~/.orboros/projects/<project-key>/transcripts/<orb-id>/attempt-<n>/`.
+For a registered project, all operational evidence lives beneath the stable
+user-local project log home:
+
+```
+~/.orboros/projects/<project-key>/logs/
+  daemon.log                 # targeted daemon output
+  cli.log                    # foreground command output
+  executions.jsonl           # one durable record per outer worker attempt
+  heddle/<orb-id>/attempt-<n>/
+    worker-<worker-id>.jsonl # Heddle transcript
+    state/                   # Heddle isolated runtime state
+```
+
 This preserves worker evidence across worktrees and across local versus shared
-orb state. The compact per-dispatch index remains `executions.jsonl` beside
-the active orb state (`.orbs/` by default, or the shared `state/` directory
-when `[daemon] shared_state = true`). Use an orb ID together with the
-`attempt-<n>` directory or worker ID in the transcript filename to locate the
-corresponding evidence. Benchmark runs keep the same layout under their
-isolated case state directory.
+orb state. Use an orb ID, `attempt-<n>`, or worker ID to locate the matching
+record and transcript. An explicit unregistered state root uses the equivalent
+`<state-root>/logs/` layout. Benchmark runs remain isolated under their case
+state directory and are not written into a registered project's log home.
 
 Hooks intentionally use a separate schema and files: `~/.orboros/hooks.toml`
 followed by `<project>/.orboros/hooks.toml` (with `<state-dir>/hooks.toml` as

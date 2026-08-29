@@ -1096,6 +1096,20 @@ impl ProjectEntry {
     pub fn shared_state_dir(&self, home: &Path) -> PathBuf {
         self.shared_project_dir(home).join("state")
     }
+
+    /// Returns the stable project-local home for operational logs and worker
+    /// evidence. This is deliberately distinct from authoritative state: both
+    /// shared and standalone registered projects use the same log location.
+    #[must_use]
+    pub fn log_dir(&self, home: &Path) -> PathBuf {
+        self.shared_project_dir(home).join("logs")
+    }
+
+    /// Durable queue-dispatch attempt ledger for this registered project.
+    #[must_use]
+    pub fn execution_log_path(&self, home: &Path) -> PathBuf {
+        self.log_dir(home).join("executions.jsonl")
+    }
 }
 
 /// A registered project with a usable `.orbs` state directory.
@@ -2168,6 +2182,14 @@ system = "project speccing"
         assert_eq!(
             project.shared_state_dir(Path::new("/tmp/home")),
             Path::new("/tmp/home/.orboros/projects/feature_a_b-13250f2ab119/state")
+        );
+        assert_eq!(
+            project.log_dir(Path::new("/tmp/home")),
+            Path::new("/tmp/home/.orboros/projects/feature_a_b-13250f2ab119/logs")
+        );
+        assert_eq!(
+            project.execution_log_path(Path::new("/tmp/home")),
+            Path::new("/tmp/home/.orboros/projects/feature_a_b-13250f2ab119/logs/executions.jsonl")
         );
     }
 

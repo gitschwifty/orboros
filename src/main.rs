@@ -622,48 +622,22 @@ fn resolve_effective_state_dir(raw: &str) -> EffectiveStateDir {
     }
 }
 
-fn safe_log_component(value: &str) -> String {
-    let component = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    if component.is_empty() {
-        "project".into()
-    } else {
-        component
-    }
-}
-
 fn project_log_file(
     project_dir: Option<&Path>,
+    state_dir: &Path,
     file_name: &str,
-) -> anyhow::Result<Option<PathBuf>> {
-    let Some(project_dir) = project_dir else {
-        return Ok(None);
-    };
+) -> anyhow::Result<PathBuf> {
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
-    let registered_name = config::list_projects(&home)?
-        .into_iter()
-        .find(|entry| entry.runnable_path() == Some(project_dir))
-        .map(|entry| entry.name);
-    let fallback_name = project_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("project");
-    let name = registered_name.as_deref().unwrap_or(fallback_name);
-    Ok(Some(
-        home.join(".orboros")
-            .join("projects")
-            .join(safe_log_component(name))
-            .join(file_name),
-    ))
+    if let Some(project_dir) = project_dir {
+        if let Some(entry) = config::list_projects(&home)?
+            .into_iter()
+            .find(|entry| entry.runnable_path() == Some(project_dir))
+        {
+            return Ok(entry.log_dir(&home).join(file_name));
+        }
+    }
+    Ok(state_dir.join("logs").join(file_name))
 }
 
 /// Resolves the registered project whose runtime state is explicitly shared.
@@ -817,19 +791,25 @@ fn main() -> anyhow::Result<()> {
             if let Some(project_name) = project {
                 let home = dirs::home_dir()
                     .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
-                Some(
-                    home.join(".orboros")
-                        .join("projects")
-                        .join(safe_log_component(project_name))
-                        .join("daemon.log"),
-                )
+                config::list_projects(&home)?
+                    .into_iter()
+                    .find(|entry| entry.name == *project_name)
+                    .map(|entry| entry.log_dir(&home).join("daemon.log"))
             } else if cli.state_dir == DEFAULT_STATE_DIR {
                 Some(supervisor_log_file()?)
             } else {
-                project_log_file(effective_state.project_dir.as_deref(), "daemon.log")?
+                Some(project_log_file(
+                    effective_state.project_dir.as_deref(),
+                    &state_dir,
+                    "daemon.log",
+                )?)
             }
         }
-        _ => project_log_file(effective_state.project_dir.as_deref(), "cli.log")?,
+        _ => Some(project_log_file(
+            effective_state.project_dir.as_deref(),
+            &state_dir,
+            "cli.log",
+        )?),
     };
     let general_log_file = cli.log_file.as_deref().map(resolve_state_dir).or_else(|| {
         configured_daemon_log_file
@@ -1542,11 +1522,17 @@ fn foreground_queue_with_project(
         let home =
             dirs::home_dir().expect("registered project telemetry requires a home directory");
         queue = queue
-            .with_worker_evidence_dir(project.shared_project_dir(&home).join("transcripts"))
+            .with_worker_evidence_dir(project.log_dir(&home).join("heddle"))
+            .with_execution_log_path(project.execution_log_path(&home))
             .with_project_key(project.name.clone())
             .with_telemetry_store(orboros::telemetry::TelemetryStore::new(
                 project.shared_project_dir(&home).join("telemetry"),
             ));
+    } else {
+        let log_dir = state_dir.join("logs");
+        queue = queue
+            .with_worker_evidence_dir(log_dir.join("heddle"))
+            .with_execution_log_path(log_dir.join("executions.jsonl"));
     }
     if let Some(sink) = orboros::hooks::HookSink::from_state_dir(state_dir, &project_cwd)
         .unwrap_or_else(|e| {
@@ -1776,8 +1762,11 @@ fn cmd_daemon_start(
 
     let orb_store = orbs::orb_store::OrbStore::new(state_dir.join("orbs.jsonl"));
     let dep_store = orbs::dep_store::DepStore::new(state_dir.join("deps.jsonl"));
+    let log_dir = state_dir.join("logs");
     let mut queue =
-        orboros::queue_loop::QueueLoop::new(orb_store, dep_store, state_dir.to_path_buf());
+        orboros::queue_loop::QueueLoop::new(orb_store, dep_store, state_dir.to_path_buf())
+            .with_worker_evidence_dir(log_dir.join("heddle"))
+            .with_execution_log_path(log_dir.join("executions.jsonl"));
 
     // Attach HookSink so the daemon fires lifecycle hooks (closes
     // task 56 follow-up: daemon-side QueueLoop::with_hooks plumbing).
@@ -1927,9 +1916,10 @@ fn cmd_supervisor_start(
             },
         );
         has_shared_state |= shared_state;
-        let transcript_dir = entry.shared_project_dir(home).join("transcripts");
+        let log_dir = entry.log_dir(home);
         let mut queue = QueueLoop::new(orb_store, dep_store, project_state_dir.clone())
-            .with_worker_evidence_dir(transcript_dir)
+            .with_worker_evidence_dir(log_dir.join("heddle"))
+            .with_execution_log_path(entry.execution_log_path(home))
             .with_project_key(entry.name.clone())
             .with_telemetry_store(orboros::telemetry::TelemetryStore::new(
                 entry.shared_project_dir(home).join("telemetry"),
@@ -2049,11 +2039,14 @@ fn cmd_telemetry(
             print_telemetry_summary(&project.name, &telemetry.read_summary()?)
         }
         TelemetryAction::Rebuild { .. } => {
+            let project_execution = project.execution_log_path(&home);
             let shared_execution = project.shared_state_dir(&home).join("executions.jsonl");
             let legacy_execution = project
                 .runnable_path()
                 .map(|path| path.join(".orbs/executions.jsonl"));
-            let execution_path = if shared_execution.exists() {
+            let execution_path = if project_execution.exists() {
+                project_execution
+            } else if shared_execution.exists() {
                 shared_execution
             } else {
                 legacy_execution.ok_or_else(|| {
