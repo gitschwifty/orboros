@@ -523,6 +523,25 @@ enum OrbAction {
     },
 }
 
+impl OrbAction {
+    /// Read-only commands can run concurrently. Every other orb command holds
+    /// the local mutation lease unless the project is daemon-owned, in which
+    /// case writes go through the authoritative supervisor socket instead.
+    fn mutates_state(&self) -> bool {
+        !matches!(
+            self,
+            Self::Show { .. } | Self::List { .. } | Self::Deps { .. } | Self::RollbackList { .. }
+        )
+    }
+}
+
+fn command_mutates_orb_state(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Run { .. } | Commands::Execute { .. } | Commands::Plan { .. }
+    ) || matches!(command, Commands::Orb { action } if action.mutates_state())
+}
+
 #[derive(Subcommand)]
 enum DepAction {
     /// Add a dependency edge.
@@ -863,6 +882,14 @@ fn main() -> anyhow::Result<()> {
         .init();
     std::fs::create_dir_all(&state_dir)?;
 
+    // Standalone state has no daemon to serialize whole CLI operations. Hold
+    // the lease around every command that can change orb state, including
+    // foreground queue commands whose read/modify/write work spans many calls.
+    let _local_mutation_lease = (shared_project.is_none()
+        && command_mutates_orb_state(&cli.command))
+    .then(|| orboros::supervisor::LocalMutationLease::try_acquire(&state_dir))
+    .transpose()?;
+
     match cli.command {
         Commands::Run {
             task,
@@ -954,6 +981,14 @@ fn main() -> anyhow::Result<()> {
             effective_state.project_dir.as_deref(),
         ),
         Commands::Orb { action } => {
+            if !action.mutates_state() {
+                let source = if shared_project.is_some() {
+                    "shared-state projection"
+                } else {
+                    "local projection"
+                };
+                eprintln!("State source: {source}");
+            }
             let shared_writer = shared_project.as_ref().map(|project| {
                 std::sync::Arc::new(orboros::supervisor::SupervisorStoreWriter::new(
                     orboros::supervisor::control_socket_path(
@@ -1927,8 +1962,20 @@ fn cmd_supervisor_start(
         let telemetry = orboros::telemetry::TelemetryStore::new(
             entry.shared_project_dir(home).join("telemetry"),
         );
+        let project_root = entry.runnable_path().map(Path::to_path_buf);
+        tracing::info!(
+            project = %entry.name,
+            project_root = %project_root.as_deref().map_or_else(|| Path::new("-"), |path| path).display(),
+            state_dir = %project_state_dir.display(),
+            shared_state,
+            dispatch_enabled = dispatch.is_some(),
+            max_concurrency = project_max_concurrency,
+            "supervisor project attached"
+        );
         projects.push(SupervisedProject {
             name: entry.name,
+            project_root,
+            state_dir: project_state_dir,
             queue,
             dispatch,
             telemetry: Some(telemetry),
@@ -2076,9 +2123,11 @@ fn cmd_daemon_stop(daemon_config: &DaemonConfig) -> anyhow::Result<()> {
 }
 
 fn cmd_daemon_status(daemon_config: &DaemonConfig, home: Option<&Path>) -> anyhow::Result<()> {
-    let project_count = home
-        .and_then(|home| config::registered_project_state_dirs(home).ok())
-        .map_or(0, |(projects, _)| projects.len());
+    let (projects, skipped) = home.map_or_else(
+        || Ok((Vec::new(), Vec::new())),
+        config::registered_project_state_dirs,
+    )?;
+    let project_count = projects.len();
     if orboros::daemon::is_running(daemon_config) {
         let pid = orboros::daemon::read_pid_file(daemon_config)?;
         println!(
@@ -2092,6 +2141,43 @@ fn cmd_daemon_status(daemon_config: &DaemonConfig, home: Option<&Path>) -> anyho
         );
     } else {
         println!("Daemon is not running. {project_count} registered project(s) available.");
+    }
+    if !projects.is_empty() {
+        println!("Registered queues:");
+        for project in projects {
+            let entry = project.entry;
+            let configured = config::load_config(entry.config_root())?;
+            let state_dir = if configured.daemon.shared_state {
+                entry.shared_state_dir(home.expect("projects require a home directory"))
+            } else {
+                project.state_dir
+            };
+            let root = entry
+                .runnable_path()
+                .map_or_else(|| "<unavailable>".into(), |path| path.display().to_string());
+            let availability = if state_dir.is_dir() {
+                "available"
+            } else {
+                "unavailable"
+            };
+            let mode = if configured.daemon.shared_state {
+                "shared"
+            } else {
+                "local"
+            };
+            println!(
+                "  {}: {availability}; mode={mode}; root={root}; state={}; local_limit={}",
+                entry.name,
+                state_dir.display(),
+                configured.max_concurrency
+            );
+        }
+    }
+    for project in skipped {
+        println!(
+            "  {}: unavailable (no initialized project state)",
+            project.name
+        );
     }
     Ok(())
 }

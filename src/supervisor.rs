@@ -355,6 +355,57 @@ pub struct ProjectStateLease {
     metadata: ProjectLeaseMetadata,
 }
 
+/// A short-lived exclusive lease for a standalone CLI mutation.
+///
+/// Shared-state projects always submit mutations to the daemon's authoritative
+/// writer. This lease covers the remaining local-store case: it is held across
+/// a whole mutating `orb` command so two CLI processes cannot interleave their
+/// read/modify/write sequences or append competing JSONL projections.
+#[derive(Debug)]
+pub struct LocalMutationLease {
+    file: File,
+    path: PathBuf,
+}
+
+impl LocalMutationLease {
+    /// Acquires the standalone mutation lease without waiting.
+    pub fn try_acquire(state_dir: &Path) -> io::Result<Self> {
+        std::fs::create_dir_all(state_dir)?;
+        let path = state_dir.join("cli-mutation.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "project state is being modified by another CLI ({}) — retry when it finishes",
+                        path.display()
+                    ),
+                ));
+            }
+            return Err(error);
+        }
+        Ok(Self { file, path })
+    }
+
+    /// Returns the lock path for diagnostics and tests.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for LocalMutationLease {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 /// One project attached to the user-level Orboros supervisor.
 ///
 /// The authority is intentionally separate from worker scheduling: it can own
@@ -546,7 +597,20 @@ impl SupervisorStoreWriter {
     }
 
     fn request(&self, request: &SupervisorRequest) -> io::Result<SupervisorResponse> {
-        let mut stream = StdUnixStream::connect(&self.socket_path)?;
+        let mut stream = StdUnixStream::connect(&self.socket_path).map_err(|error| {
+            if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "shared state for project {} requires its running daemon; start `orboros daemon` or wait for it to finish draining ({})",
+                        self.project_name,
+                        self.socket_path.display()
+                    ),
+                )
+            } else {
+                error
+            }
+        })?;
         let row = serde_json::to_vec(&request).map_err(io::Error::other)?;
         stream.write_all(&row)?;
         stream.write_all(b"\n")?;
@@ -649,6 +713,12 @@ impl LocalSupervisor {
         let authority =
             ProjectStateAuthority::attach(&self.home, project.clone(), self.next_epoch)?;
         self.next_epoch += 1;
+        tracing::info!(
+            project = %project.name,
+            project_root = %project.runnable_path().map_or_else(|| Path::new("-").display().to_string(), |path| path.display().to_string()),
+            state_dir = %authority.state_dir().display(),
+            "shared supervisor project attached"
+        );
         self.projects.insert(project.name, authority);
         Ok(AttachOutcome::Attached)
     }
@@ -659,7 +729,15 @@ impl LocalSupervisor {
             queue.stop();
         }
         self.dispatch.remove(project_name);
-        self.projects.remove(project_name)
+        let detached = self.projects.remove(project_name);
+        if let Some(authority) = &detached {
+            tracing::info!(
+                project = project_name,
+                state_dir = %authority.state_dir().display(),
+                "shared supervisor project detached"
+            );
+        }
+        detached
     }
 
     /// Returns an attached project authority by registered project name.
@@ -1166,6 +1244,17 @@ mod tests {
     }
 
     #[test]
+    fn local_mutation_lease_rejects_a_concurrent_cli_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = LocalMutationLease::try_acquire(directory.path()).unwrap();
+        let error = LocalMutationLease::try_acquire(directory.path()).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("another CLI"));
+        assert!(first.path().ends_with("cli-mutation.lock"));
+    }
+
+    #[test]
     fn project_authority_owns_the_registered_projects_local_state_home() {
         let home = tempfile::tempdir().unwrap();
         let authority = ProjectStateAuthority::attach(home.path(), project("alpha"), 7).unwrap();
@@ -1389,6 +1478,7 @@ mod tests {
             error.kind(),
             io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
         ));
+        assert!(error.to_string().contains("requires its running daemon"));
         assert!(!home.path().join("orbs.jsonl").exists());
     }
 

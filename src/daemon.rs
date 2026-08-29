@@ -204,6 +204,10 @@ pub struct DispatchSettings {
 #[derive(Clone)]
 pub struct SupervisedProject {
     pub name: String,
+    /// Registered runnable root when the supervisor knows it.
+    pub project_root: Option<PathBuf>,
+    /// State projection currently owned by this queue.
+    pub state_dir: PathBuf,
     pub queue: crate::queue_loop::QueueLoop,
     pub dispatch: Option<DispatchSettings>,
     pub telemetry: Option<crate::telemetry::TelemetryStore>,
@@ -315,9 +319,16 @@ async fn tick_project(
     global_semaphore: Option<std::sync::Arc<tokio::sync::Semaphore>>,
 ) {
     let project_name = project.name.as_str();
+    let project_root = project
+        .project_root
+        .as_deref()
+        .map_or("-", |path| path.to_str().unwrap_or("<non-utf8>"));
+    let state_dir = project.state_dir.to_string_lossy();
     match project.queue.tick_async().await {
         Ok(result) if !result.is_idle() => tracing::debug!(
             project = project_name,
+            project_root,
+            state_dir = %state_dir,
             pipelines = result.pipelines_started,
             executed = result.orbs_executed,
             completed = result.roots_completed,
@@ -344,6 +355,8 @@ async fn tick_project(
             Ok(0) => {}
             Ok(dispatched) => tracing::debug!(
                 project = project_name,
+                project_root,
+                state_dir = %state_dir,
                 dispatched,
                 "workers completed this tick"
             ),
@@ -466,6 +479,8 @@ pub async fn run_supervisor_with_control_socket(
                     let attached: Vec<_> = queues.iter().filter_map(|(name, queue)| {
                         Some(SupervisedProject {
                             name: name.clone(),
+                            project_root: None,
+                            state_dir: PathBuf::new(),
                             queue: queue.clone(),
                             dispatch: dispatch.get(name)?.clone(),
                             telemetry: None,
@@ -638,6 +653,8 @@ mod tests {
         let second = tmp.path().join("second");
         let project = |name: &str, dir: &std::path::Path| SupervisedProject {
             name: name.into(),
+            project_root: None,
+            state_dir: dir.to_path_buf(),
             queue: crate::queue_loop::QueueLoop::new(
                 OrbStore::new(dir.join("orbs.jsonl")),
                 DepStore::new(dir.join("deps.jsonl")),

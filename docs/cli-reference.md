@@ -108,6 +108,15 @@ orboros plan "API redesign" --shallow
 
 Orb management subcommands.
 
+Mutating `orb` commands acquire a short-lived exclusive lease when using a
+standalone local state directory. If another CLI mutation is already in
+progress, retry after it finishes. For shared-state projects, mutations always
+go through the running supervisor daemon; Orboros does not fall back to direct
+JSONL writes when that daemon is unavailable or draining.
+
+Read-only `orb` commands print whether their result came from the standalone
+local projection or the shared-state projection.
+
 #### `orb create <TITLE>`
 
 ```bash
@@ -268,6 +277,10 @@ feature to an existing project or if a summary must be recovered.
 | `--pid-file <PATH>` | `~/.orboros/orboros.pid` | PID file location |
 | `--log-file <PATH>` | — | Log file path |
 | `--tick-interval <MS>` | 1000 | Queue loop tick interval |
+
+`orboros daemon --status` lists each registered queue with its availability,
+state mode, project root, state directory, and effective local concurrency
+limit. Supervisor log events carry the same project/root/state attribution.
 | `--project <NAME>` | — | Supervise one registered project |
 
 ---
