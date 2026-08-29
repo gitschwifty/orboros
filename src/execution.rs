@@ -98,6 +98,11 @@ pub struct ExecutionRecord {
     /// original dispatch remains an unmodified account of what it returned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decomposition_repair: Option<DecompositionRepairDiagnostic>,
+    /// Evidence for bounded repair and fresh retry of a structured runtime
+    /// phase response. This is the queue-path counterpart to benchmark
+    /// recovery and applies to Speccing, Decomposing, and Reevaluating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_output_recovery: Option<PhaseOutputRecoveryDiagnostic>,
     /// Phase-attempt provenance for a bounded clean retry. Kept separate from
     /// worker-level terminal retries, which are attempts within one dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -168,11 +173,35 @@ pub struct PhaseRetryDiagnostic {
     pub reason: String,
 }
 
+/// Durable provenance for a malformed structured phase response and its
+/// bounded recovery. Raw response bodies remain only in worker transcripts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhaseOutputRecoveryDiagnostic {
+    pub phase: String,
+    pub initial_validation_error: String,
+    pub repair_attempted: bool,
+    pub repair_succeeded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair_error: Option<String>,
+    pub fresh_retry_attempted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_retry_succeeded: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_retry_error: Option<String>,
+}
+
 /// Durable termination evidence for one Refining phase round.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RefinementRoundDiagnostic {
     pub round: u32,
     pub max_rounds: u32,
+    /// Full-loop automated quality-review ordinal, including the initial
+    /// review. This is distinct from the worker retries within a round.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quality_review_attempt: Option<u32>,
+    /// Configured cap for automated quality-review attempts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_quality_review_attempts: Option<u32>,
     pub material_changed: bool,
     pub model_declared_complete: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -256,6 +285,7 @@ impl ExecutionRecord {
             retries: outcome.retries,
             prompt_context,
             decomposition_repair: None,
+            phase_output_recovery: None,
             phase_retry: None,
             terminal_retry: outcome.terminal_retry.clone(),
             partial_artifact_recovery: None,

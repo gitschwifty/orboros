@@ -371,6 +371,7 @@ mod tests {
             retries: 1,
             prompt_context: None,
             decomposition_repair: None,
+            phase_output_recovery: None,
             phase_retry: None,
             terminal_retry: None,
             partial_artifact_recovery: None,

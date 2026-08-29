@@ -189,6 +189,11 @@ pub struct HeddleSettingsConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct RefinementSettingsConfig {
     pub max_rounds: u32,
+    /// Maximum full-loop quality-review attempts, including the first review.
+    /// A rejected or unavailable review retries the final refinement round
+    /// from its pre-round checkpoint while attempts remain; exhaustion routes
+    /// the orb to human Review rather than spending unboundedly.
+    pub max_review_attempts: u32,
     pub stop_on_no_material_change: bool,
     pub stop_on_model_complete: bool,
 }
@@ -197,6 +202,7 @@ impl Default for RefinementSettingsConfig {
     fn default() -> Self {
         Self {
             max_rounds: 1,
+            max_review_attempts: 3,
             stop_on_no_material_change: true,
             stop_on_model_complete: true,
         }
@@ -207,6 +213,9 @@ impl RefinementSettingsConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.max_rounds == 0 {
             return Err("refinement.max_rounds must be at least 1".into());
+        }
+        if self.max_review_attempts == 0 {
+            return Err("refinement.max_review_attempts must be at least 1".into());
         }
         Ok(())
     }
@@ -2207,6 +2216,7 @@ system = "project speccing"
             },
             refinement: RefinementSettingsConfig {
                 max_rounds: 3,
+                max_review_attempts: 3,
                 stop_on_no_material_change: true,
                 stop_on_model_complete: false,
             },
