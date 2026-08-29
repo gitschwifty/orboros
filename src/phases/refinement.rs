@@ -196,8 +196,8 @@ return all-null and a brief note explaining why."
     (system, user)
 }
 
-/// Parses the worker's response into a `RefinementPlan`. Accepts
-/// strict JSON or a fenced JSON block.
+/// Parses the worker's response into a `RefinementPlan`. Accepts strict JSON,
+/// fenced JSON, or a balanced JSON object embedded in surrounding prose.
 #[must_use]
 pub fn parse_response(text: &str) -> Option<RefinementPlan> {
     crate::phases::prompt_util::parse_response_json::<RefinementPlan>(text)
@@ -461,6 +461,14 @@ mod tests {
         assert!(plan.description.is_none());
         assert!(plan.design.is_none());
         assert!(plan.acceptance_criteria.is_none());
+    }
+
+    #[test]
+    fn parse_response_recovers_json_wrapped_in_prose() {
+        let text = "I made one targeted change:\n\n{\"description\": \"new desc\", \"notes\": \"clarified scope\", \"complete\": true}\n\nCONFIDENCE: 0.91";
+        let plan = parse_response(text).expect("prose-wrapped JSON should be accepted");
+        assert_eq!(plan.description.as_deref(), Some("new desc"));
+        assert!(plan.complete);
     }
 
     #[test]

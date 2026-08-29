@@ -1643,6 +1643,27 @@ mod tests {
         assert_eq!(restored.phase, Some(OrbPhase::Refining));
         assert!(restored.execution.is_none());
         assert!(restored.closed_at.is_none());
+        assert_eq!(orb_snapshots(&store, &id).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn rollback_appends_a_retryable_projection_without_erasing_snapshots() {
+        let (_dir, store) = temp_orb_store();
+        let mut orb = Orb::new("Parent", "first").with_type(OrbType::Epic);
+        orb.phase = Some(OrbPhase::Refining);
+        let id = orb.id.to_string();
+        store.append(&orb).unwrap();
+        orb.description = "second".into();
+        store.update(&orb).unwrap();
+
+        cmd_orb_rollback(&store, &id, 1).unwrap();
+
+        let snapshots = orb_snapshots(&store, &id).unwrap();
+        assert_eq!(snapshots.len(), 3);
+        assert_eq!(snapshots[0].description, "first");
+        assert_eq!(snapshots[1].description, "second");
+        assert_eq!(snapshots[2].description, "first");
+        assert!(snapshots[2].execution.is_none());
     }
 
     #[test]

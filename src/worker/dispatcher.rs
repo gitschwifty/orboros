@@ -9,6 +9,7 @@
 //! spawn/send/shutdown machinery and the lifecycle hook firing
 //! (`pre-worker-spawn` / `post-worker-complete` / `post-worker-fail`).
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -327,7 +328,7 @@ async fn dispatch_orb_with_retry_limit(
         };
         let mut attempt_config = worker_config.clone();
         if attempt > 0 {
-            attempt_config.worker_id = Some(uuid::Uuid::new_v4().to_string());
+            prepare_fresh_worker_attempt(&mut attempt_config)?;
         }
         let (outcome, retry_kind) = match Worker::spawn(&attempt_config).await {
             Ok(mut worker) => match worker.send(&send_id, &attempt_prompt).await {
@@ -511,6 +512,46 @@ async fn dispatch_orb_with_retry_limit(
     }
 
     Ok(outcome)
+}
+
+/// Gives every spawned process a distinct identity and isolated evidence
+/// placement. Dispatcher retries are fresh workers, not continuations, so
+/// reusing either a transcript or runtime state directory would destroy the
+/// very evidence needed to diagnose a retry.
+fn prepare_fresh_worker_attempt(worker_config: &mut WorkerConfig) -> std::io::Result<()> {
+    let worker_id = uuid::Uuid::new_v4().to_string();
+    worker_config.worker_id = Some(worker_id.clone());
+    let Some(runtime) = worker_config.runtime.as_mut() else {
+        return Ok(());
+    };
+    if let Some(transcript_path) = &runtime.transcript_path {
+        let transcript_path = PathBuf::from(transcript_path);
+        let parent = transcript_path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "worker transcript path has no parent",
+            )
+        })?;
+        runtime.transcript_path = Some(
+            parent
+                .join(format!("worker-{worker_id}.jsonl"))
+                .display()
+                .to_string(),
+        );
+    }
+    if let Some(state_root) = &runtime.state_root {
+        let state_root = PathBuf::from(state_root);
+        let attempt_root = state_root.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "worker state root has no parent",
+            )
+        })?;
+        let worker_state = attempt_root.join("workers").join(&worker_id).join("state");
+        std::fs::create_dir_all(&worker_state)?;
+        runtime.state_root = Some(worker_state.display().to_string());
+    }
+    Ok(())
 }
 
 fn build_outcome(

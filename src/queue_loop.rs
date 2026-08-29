@@ -1512,6 +1512,17 @@ async fn dispatch_one_owned(
                 break;
             };
             let Some(plan) = crate::phases::refinement::parse_response(response) else {
+                let transcript = outcome
+                    .runtime
+                    .as_ref()
+                    .map_or("unavailable", |runtime| runtime.transcript_path.as_str());
+                tracing::error!(
+                    orb = %orb.id,
+                    phase = "refining",
+                    response_bytes = response.len(),
+                    transcript,
+                    "refinement output rejected: expected a JSON object with optional description, design, acceptance_criteria, notes, and complete fields"
+                );
                 outcome.status = crate::worker::dispatcher::DispatchStatus::Failed;
                 outcome.error = Some("refinement response was not a valid plan".into());
                 break;
