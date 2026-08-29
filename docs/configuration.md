@@ -284,6 +284,9 @@ packaged template defines `read_only`, `research`, `test`, `edit`, and
 - `[logging]`: optional `level` tracing filter (for example
   `orboros=debug,tokio=warn`) and `file` for foreground command logs. The
   global `--log-level` and `--log-file` flags override these settings.
+  `retention_days` and `max_bytes` reserve opt-in age and size limits for
+  project evidence; both are unset by default, so logs are retained
+  indefinitely until a maintenance policy is deliberately enabled.
 - `[daemon]`: optional `pid_file`, `log_file`, `log_max_size`, and
   `tick_interval_ms` process settings. `global_max_concurrency` optionally
   caps all workers across a multi-project supervisor; each project retains its
@@ -317,14 +320,17 @@ user-local project log home:
   daemon.log                 # targeted daemon output
   cli.log                    # foreground command output
   executions.jsonl           # one durable record per outer worker attempt
-  heddle/<orb-id>/attempt-<n>/
+  heddle/<orb-id>/<phase>/attempt-<n>/
     worker-<worker-id>.jsonl # Heddle transcript
     state/                   # Heddle isolated runtime state
 ```
 
 This preserves worker evidence across worktrees and across local versus shared
-orb state. Use an orb ID, `attempt-<n>`, or worker ID to locate the matching
-record and transcript. An explicit unregistered state root uses the equivalent
+orb state. Use an orb ID, phase, `attempt-<n>`, or worker ID to locate the matching
+record and transcript. `orboros orb logs <orb-id>` lists the durable attempts
+and transcripts; when there is exactly one transcript it prints it directly.
+For retries or multiple phases, use `--attempt <n>` to print the selected
+transcript. An explicit unregistered state root uses the equivalent
 `<state-root>/logs/` layout. Benchmark runs remain isolated under their case
 state directory and are not written into a registered project's log home.
 

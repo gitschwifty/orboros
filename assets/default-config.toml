@@ -39,6 +39,10 @@ desktop_enabled = false
 [logging]
 # level = "orboros=info,heddle=warn"
 # file = "/absolute/path/to/orboros.log"
+# Evidence is retained indefinitely unless a future maintenance command is
+# explicitly configured to apply one or both limits.
+# retention_days = 30
+# max_bytes = 1073741824
 
 [workers]
 # Retry attempts after the first failure. 0 disables retries; -1 retries

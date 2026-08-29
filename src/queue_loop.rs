@@ -1390,7 +1390,13 @@ async fn dispatch_one_owned(
     let mut wc = worker_config_for_with_model_config(&orb, &target_base_wc, &system, model_config)
         .map_err(std::io::Error::other)?;
     let log_root = worker_evidence_dir;
-    configure_worker_runtime(&mut wc, &log_root, &orb.id.to_string(), 1)?;
+    configure_worker_runtime(
+        &mut wc,
+        &log_root,
+        &orb.id.to_string(),
+        target.tool_policy_key(),
+        1,
+    )?;
     let effective_system_prompt =
         crate::worker::process::effective_system_prompt(&wc.system_prompt, &wc.tools);
     prompt_context.effective_system_prompt_chars =
@@ -1463,7 +1469,13 @@ async fn dispatch_one_owned(
         }
         completed_retries = completed_retries.saturating_add(1);
         outer_attempt = outer_attempt.saturating_add(1);
-        configure_worker_runtime(&mut wc, &log_root, &orb.id.to_string(), outer_attempt)?;
+        configure_worker_runtime(
+            &mut wc,
+            &log_root,
+            &orb.id.to_string(),
+            target.tool_policy_key(),
+            outer_attempt,
+        )?;
         let retry_progress = if model_config.workers.retries == -1 {
             format!("{completed_retries}/unlimited")
         } else {
@@ -1551,7 +1563,13 @@ async fn dispatch_one_owned(
             execution_store.append(&round_record)?;
             round = round.saturating_add(1);
             wc.worker_id = Some(uuid::Uuid::new_v4().to_string());
-            configure_worker_runtime(&mut wc, &log_root, &orb.id.to_string(), round)?;
+            configure_worker_runtime(
+                &mut wc,
+                &log_root,
+                &orb.id.to_string(),
+                target.tool_policy_key(),
+                round,
+            )?;
             let (_, next_user) = crate::phases::refinement::build_prompt(&orb);
             user = crate::prompt_context::append_task_context(&next_user, &task_context.text);
             let mut round_retries = 0_u32;
@@ -1604,6 +1622,7 @@ async fn dispatch_one_owned(
                     &mut wc,
                     &log_root,
                     &orb.id.to_string(),
+                    target.tool_policy_key(),
                     round.saturating_mul(1_000).saturating_add(round_retries),
                 )?;
                 tracing::warn!(
@@ -1935,6 +1954,7 @@ fn configure_worker_runtime(
     worker_config: &mut crate::worker::process::WorkerConfig,
     log_root: &Path,
     orb_id: &str,
+    phase: &str,
     outer_attempt: u32,
 ) -> std::io::Result<()> {
     let config_path = worker_config
@@ -1948,6 +1968,7 @@ fn configure_worker_runtime(
     worker_config.worker_id = Some(worker_id.clone());
     let attempt_dir = log_root
         .join(orb_id)
+        .join(phase)
         .join(format!("attempt-{outer_attempt}"));
     std::fs::create_dir_all(&attempt_dir)?;
     worker_config.runtime = Some(crate::ipc::types::RuntimePlacementConfig {
@@ -2141,13 +2162,13 @@ mod tests {
             }),
             routing: None,
         };
-        configure_worker_runtime(&mut config, dir.path(), "orb-a", 2).unwrap();
+        configure_worker_runtime(&mut config, dir.path(), "orb-a", "execute", 2).unwrap();
         let runtime = config.runtime.unwrap();
         assert_eq!(runtime.mode, Some(crate::ipc::types::RuntimeMode::Isolated));
         assert!(runtime
             .transcript_path
             .unwrap()
-            .ends_with("orb-a/attempt-2/worker-worker-1.jsonl"));
+            .ends_with("orb-a/execute/attempt-2/worker-worker-1.jsonl"));
         assert_eq!(runtime.config_path.as_deref(), Some("/tmp/heddle.toml"));
     }
 

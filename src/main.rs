@@ -414,6 +414,15 @@ enum OrbAction {
         /// Orb ID (e.g. orb-k4f).
         id: String,
     },
+    /// List durable attempts and Heddle transcripts for an orb.
+    Logs {
+        /// Orb ID (e.g. orb-k4f).
+        id: String,
+        /// Show one selected outer-attempt transcript. Without this, a sole
+        /// transcript is shown automatically; multiple attempts are listed.
+        #[arg(long)]
+        attempt: Option<u32>,
+    },
     /// List orbs with optional filters.
     List {
         /// Filter by type (task, epic, feature, bug, chore, docs).
@@ -530,7 +539,11 @@ impl OrbAction {
     fn mutates_state(&self) -> bool {
         !matches!(
             self,
-            Self::Show { .. } | Self::List { .. } | Self::Deps { .. } | Self::RollbackList { .. }
+            Self::Show { .. }
+                | Self::Logs { .. }
+                | Self::List { .. }
+                | Self::Deps { .. }
+                | Self::RollbackList { .. }
         )
     }
 }
@@ -627,6 +640,10 @@ fn project_log_file(
     state_dir: &Path,
     file_name: &str,
 ) -> anyhow::Result<PathBuf> {
+    Ok(project_log_home(project_dir, state_dir)?.join(file_name))
+}
+
+fn project_log_home(project_dir: Option<&Path>, state_dir: &Path) -> anyhow::Result<PathBuf> {
     let home =
         dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
     if let Some(project_dir) = project_dir {
@@ -634,10 +651,10 @@ fn project_log_file(
             .into_iter()
             .find(|entry| entry.runnable_path() == Some(project_dir))
         {
-            return Ok(entry.log_dir(&home).join(file_name));
+            return Ok(entry.log_dir(&home));
         }
     }
-    Ok(state_dir.join("logs").join(file_name))
+    Ok(state_dir.join("logs"))
 }
 
 /// Resolves the registered project whose runtime state is explicitly shared.
@@ -1019,6 +1036,11 @@ fn main() -> anyhow::Result<()> {
                     Ok(())
                 }
                 OrbAction::Show { id } => orb_cmd::cmd_orb_show(&orb_store, &id),
+                OrbAction::Logs { id, attempt } => cmd_orb_logs(
+                    &id,
+                    attempt,
+                    &project_log_home(effective_state.project_dir.as_deref(), &state_dir)?,
+                ),
                 OrbAction::List {
                     orb_type,
                     status,
@@ -1561,6 +1583,86 @@ fn print_drain_result(result: &DrainResult) {
     } else {
         println!("Orb {} not found.", result.target_id);
     }
+}
+
+fn cmd_orb_logs(orb_id: &str, attempt: Option<u32>, log_home: &Path) -> anyhow::Result<()> {
+    let records = orboros::execution::ExecutionStore::new(log_home.join("executions.jsonl"))
+        .read_all()?
+        .into_iter()
+        .filter(|record| record.orb_id == orb_id)
+        .collect::<Vec<_>>();
+    let evidence_root = log_home.join("heddle").join(orb_id);
+    let mut transcripts = Vec::new();
+    if evidence_root.is_dir() {
+        for phase in std::fs::read_dir(&evidence_root)? {
+            let phase = phase?;
+            if !phase.file_type()?.is_dir() {
+                continue;
+            }
+            let phase_name = phase.file_name().to_string_lossy().into_owned();
+            for entry in std::fs::read_dir(phase.path())? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let Some(ordinal) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("attempt-"))
+                    .and_then(|number| number.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                if attempt.is_none_or(|selected| selected == ordinal) {
+                    for transcript in std::fs::read_dir(entry.path())? {
+                        let transcript = transcript?;
+                        if transcript.file_type()?.is_file()
+                            && transcript
+                                .path()
+                                .extension()
+                                .is_some_and(|ext| ext == "jsonl")
+                        {
+                            transcripts.push((phase_name.clone(), ordinal, transcript.path()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    transcripts.sort();
+
+    println!("Log home: {}", log_home.display());
+    println!("Execution records: {}", records.len());
+    for record in records {
+        let outer_attempt = record.phase_retry.as_ref().map_or(1, |retry| retry.attempt);
+        println!(
+            "  attempt {outer_attempt}: {} {} ({})",
+            record.dispatch_kind,
+            record.status,
+            orboros::time::format_local(record.completed_at),
+        );
+    }
+    if transcripts.is_empty() {
+        println!("No Heddle transcripts found for {orb_id}.");
+        return Ok(());
+    }
+    if transcripts.len() == 1 {
+        let (phase, ordinal, transcript) = &transcripts[0];
+        println!(
+            "\nTranscript ({phase}, attempt {ordinal}): {}",
+            transcript.display()
+        );
+        print!("{}", std::fs::read_to_string(transcript)?);
+        return Ok(());
+    }
+    println!("Heddle transcripts:");
+    for (phase, ordinal, transcript) in &transcripts {
+        println!("  {phase}, attempt {ordinal}: {}", transcript.display());
+    }
+    if attempt.is_none() {
+        println!("Use `orboros orb logs {orb_id} --attempt <N>` to show one transcript.");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

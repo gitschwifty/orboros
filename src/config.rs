@@ -84,6 +84,12 @@ pub struct LoggingConfig {
     pub level: Option<String>,
     /// Append foreground command logs to this path.
     pub file: Option<String>,
+    /// Retain project log evidence indefinitely by default. A future retention
+    /// command will use this as an opt-in age limit (in whole days).
+    pub retention_days: Option<u32>,
+    /// Retain project log evidence indefinitely by default. A future retention
+    /// command will use this as an opt-in aggregate byte limit.
+    pub max_bytes: Option<u64>,
 }
 
 /// Retry policy for worker dispatches. Values count retries after the first
@@ -2126,6 +2132,8 @@ system = "project speccing"
             logging: LoggingConfig {
                 level: Some("orboros=debug".into()),
                 file: Some("/tmp/orboros-general.log".into()),
+                retention_days: Some(30),
+                max_bytes: Some(1_024),
             },
             workers: WorkerSettingsConfig { retries: -1 },
             heddle: HeddleSettingsConfig {
