@@ -47,6 +47,37 @@ done
     path
 }
 
+/// A mock Heddle worker that honors the runtime transcript destination supplied
+/// by Orboros during `init`. This makes project log-home placement testable
+/// without a real provider or Heddle runtime.
+fn write_runtime_evidence_worker_script(dir: &Path, name: &str) -> PathBuf {
+    let runtime_path = dir.join(format!("{name}.runtime-path"));
+    let path = dir.join(name);
+    let body = format!(
+        r#"#!/bin/bash
+RUNTIME_PATH='{runtime_path}'
+while IFS= read -r line; do
+  type=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['type'])" 2>/dev/null)
+  id=$(echo "$line" | python3 -c "import sys,json; print(json.loads(sys.stdin.read())['id'])" 2>/dev/null)
+  case "$type" in
+    init)
+      python3 -c "import json,os,sys; req=json.loads(sys.stdin.read()); path=req['config']['runtime']['transcript_path']; os.makedirs(os.path.dirname(path), exist_ok=True); open(path, 'w').write('mock transcript\\n'); open('{runtime_path}', 'w').write(path)" <<< "$line"
+      echo "{{\"type\":\"init_ok\",\"id\":\"$id\",\"session_id\":\"s\",\"protocol_version\":\"0.3.0\"}}"
+      ;;
+    send)
+      python3 -c "import json,sys; req=json.loads(sys.stdin.read()); path=open('{runtime_path}').read(); print(json.dumps({{'type':'result','id':req['id'],'status':'ok','response':'recorded','tool_calls_made':[],'iterations':1,'runtime':{{'mode':'isolated','transcript_path':path}}}}))" <<< "$line"
+      ;;
+    shutdown) echo "{{\"type\":\"shutdown_ok\",\"id\":\"$id\"}}"; exit 0 ;;
+  esac
+done
+"#,
+        runtime_path = runtime_path.display(),
+    );
+    fs::write(&path, body).unwrap();
+    make_executable(&path);
+    path
+}
+
 fn write_echo_prompt_worker_script(dir: &Path, name: &str) -> PathBuf {
     let path = dir.join(name);
     let body = r#"#!/bin/bash
@@ -115,6 +146,53 @@ async fn dispatch_ready_orbs_populates_result_and_confidence() {
     assert_eq!(execution.prompt_category.as_deref(), Some("worker.execute"));
     assert_eq!(execution.system_prompt_source.as_deref(), Some("built_in"));
     assert!(execution.system_prompt_hash.is_some());
+}
+
+#[tokio::test]
+async fn project_log_homes_keep_worker_and_execution_evidence_isolated() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = write_runtime_evidence_worker_script(dir.path(), "runtime-evidence.sh");
+    let worker = worker_config(&script);
+
+    let mut projects = Vec::new();
+    for name in ["alpha", "beta"] {
+        let state_dir = dir.path().join(format!("{name}-state"));
+        let log_home = dir.path().join(format!("{name}-logs"));
+        fs::create_dir_all(&state_dir).unwrap();
+        let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
+        let dep_store = DepStore::new(state_dir.join("deps.jsonl"));
+        let orb = active_task_orb(name);
+        orb_store.append(&orb).unwrap();
+        let queue = QueueLoop::new(orb_store, dep_store, state_dir)
+            .with_worker_evidence_dir(log_home.join("heddle"))
+            .with_execution_log_path(log_home.join("executions.jsonl"));
+
+        assert_eq!(queue.dispatch_ready_orbs(&worker, 1).await.unwrap(), 1);
+        projects.push((orb.id.to_string(), log_home));
+    }
+
+    for (index, (orb_id, log_home)) in projects.iter().enumerate() {
+        let records = orboros::execution::ExecutionStore::new(log_home.join("executions.jsonl"))
+            .read_all()
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].orb_id, *orb_id);
+        assert_eq!(records[0].attempts.len(), 1);
+        let attempt = &records[0].attempts[0];
+        let worker_id = attempt.worker_id.as_deref().unwrap();
+        let runtime = attempt.runtime.as_ref().unwrap();
+        let transcript = PathBuf::from(&runtime.transcript_path);
+        assert!(transcript.starts_with(log_home.join("heddle")));
+        assert!(transcript.ends_with(format!("worker-{worker_id}.jsonl")));
+        assert_eq!(
+            fs::read_to_string(&transcript).unwrap(),
+            "mock transcript\n"
+        );
+
+        let (_, other_log_home) = &projects[1 - index];
+        assert!(!transcript.starts_with(other_log_home));
+        assert!(!other_log_home.join("heddle").join(orb_id).exists());
+    }
 }
 
 #[tokio::test]
