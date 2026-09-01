@@ -23,6 +23,7 @@ pub mod bench;
 pub mod config;
 pub mod convo;
 pub mod coordinator;
+pub mod credentials;
 pub mod daemon;
 pub mod execution;
 pub mod hooks;

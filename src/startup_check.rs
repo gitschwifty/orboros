@@ -177,8 +177,8 @@ fn warn_if_unknown_route(route: &str, route_kind: &'static str) {
 }
 
 /// Checks that the env var expected by the model's provider is set
-/// (either from the process env or via dotenvy which is loaded at
-/// startup).
+/// (from the explicit process environment or the user-local credential
+/// resolver, which runs before worker-spawning commands).
 ///
 /// # Errors
 ///
@@ -211,10 +211,16 @@ fn check_credentials_for_provider(provider: &str) -> anyhow::Result<()> {
     match classify_provider(provider) {
         ProviderCheck::Known { env_var } => {
             if std::env::var(env_var).map_or(true, |s| s.trim().is_empty()) {
-                anyhow::bail!(
-                    "missing credentials for {provider}: set {env_var} \
-                     (looked at .env and process env)"
-                );
+                let credential_sources = if cfg!(target_os = "macos") {
+                    format!(
+                        "set {env_var}, add the macOS Keychain item when applicable, or use the owner-only ~/.orboros/credentials.env fallback"
+                    )
+                } else {
+                    format!(
+                        "set {env_var} or use the owner-only ~/.orboros/credentials.env fallback"
+                    )
+                };
+                anyhow::bail!("missing credentials for {provider}: {credential_sources}");
             }
             Ok(())
         }

@@ -54,9 +54,39 @@ preserves a project's deliberate inheritance from global configuration. To
 regenerate the complete packaged template, use `config init --force` only after
 reviewing or backing up the current file.
 
-Never put provider credentials in TOML. Set `OPENROUTER_API_KEY`,
-`ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` in the process environment (or a
-loaded `.env` file) as required by the resolved router.
+Never put provider credentials in TOML. For a worker-spawning command,
+Orboros resolves credentials in this order:
+
+1. An explicitly supplied process environment variable, such as
+   `OPENROUTER_API_KEY`. This remains the recommended CI and launch-wrapper
+   mechanism.
+2. On macOS, the current user's Keychain item for OpenRouter, using generic
+   password service `orboros.openrouter` and account `$USER`.
+3. The user-local fallback `~/.orboros/credentials.env`, only when it is a
+   regular non-symlink file with owner-only permissions (`chmod 600`).
+
+Automatic `.env` discovery in the current directory or an ancestor is not
+used. This avoids accidentally inheriting a credential from a repository or
+parent directory.
+
+To use the macOS fallback, add a generic password item in **Keychain Access**
+with service/name `orboros.openrouter`, account equal to your macOS username,
+and the OpenRouter API key as its password. Orboros reads it only when
+`OPENROUTER_API_KEY` is absent. It never prints the value.
+
+For a headless local fallback, create the file explicitly:
+
+```bash
+mkdir -p ~/.orboros
+chmod 700 ~/.orboros
+${EDITOR:-vi} ~/.orboros/credentials.env
+chmod 600 ~/.orboros/credentials.env
+```
+
+Use one `NAME=VALUE` line per provider, for example
+`OPENROUTER_API_KEY=...`. The file is user-local; do not place it in a project
+directory or commit it. Linux keyring integration is tracked separately; the
+environment and permission-checked file mechanisms remain portable.
 
 ## External prompt sets
 

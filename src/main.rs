@@ -777,10 +777,12 @@ fn make_worker_config(binary: &str, model: &str, system_prompt: &str) -> WorkerC
     clippy::too_many_lines
 )]
 fn main() -> anyhow::Result<()> {
-    // Load .env from current dir or ancestors (silently ignore if missing)
-    let _ = dotenvy::dotenv();
-
     let cli = Cli::parse();
+    let credential_sources = if command_may_spawn_worker(&cli.command) {
+        orboros::credentials::load_process_credentials()?
+    } else {
+        Vec::new()
+    };
     if let Some(config_path) = &cli.config {
         std::env::set_var("ORBOROS_CONFIG_PATH", config_path);
     }
@@ -880,6 +882,7 @@ fn main() -> anyhow::Result<()> {
                 .with_filter(file_filter),
         )
         .init();
+    orboros::credentials::log_credential_sources(&credential_sources);
     std::fs::create_dir_all(&state_dir)?;
 
     // Standalone state has no daemon to serialize whole CLI operations. Hold
@@ -1190,6 +1193,24 @@ fn main() -> anyhow::Result<()> {
             cli.skip_prereq_check,
         ),
     }
+}
+
+fn command_may_spawn_worker(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Run { queue: false, .. }
+            | Commands::Execute { .. }
+            | Commands::Chat { .. }
+            | Commands::Daemon {
+                stop: false,
+                status: false,
+                ..
+            }
+            | Commands::Bench {
+                action: BenchAction::Run { .. },
+                ..
+            }
+    )
 }
 
 fn apply_daemon_settings(

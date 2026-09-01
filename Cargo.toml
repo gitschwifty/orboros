@@ -19,7 +19,6 @@ toml = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "6"
 libc = "0.2"
-dotenvy = "0.15"
 tokio-util = { version = "0.7", features = ["rt"] }
 rustyline = "14"
 is-terminal = "0.4"

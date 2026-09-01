@@ -1,6 +1,7 @@
-# Orboros execution policy. Secrets belong in the environment, never here.
+# Orboros execution policy. Credential values never belong here.
 # Precedence: built-in defaults < ~/.orboros/config.toml < this file < explicit CLI flags.
-# Set provider credentials such as OPENROUTER_API_KEY in the environment, not this file.
+# Use environment variables, macOS Keychain (OpenRouter), or the owner-only
+# ~/.orboros/credentials.env fallback; see docs/configuration.md.
 config_version = 1
 default_model = "openrouter/free"
 max_concurrency = 4
