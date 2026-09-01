@@ -268,6 +268,14 @@ orboros daemon --stop
 |--------|---------|-------------|
 | `--stop` | false | Stop running daemon |
 | `--status` | false | Show daemon status |
+| `--pid-file <PATH>` | `~/.orboros/orboros.pid` | PID file location |
+| `--log-file <PATH>` | — | Log file path |
+| `--tick-interval <MS>` | 1000 | Queue loop tick interval |
+| `--project <NAME>` | — | Supervise one registered project |
+
+`orboros daemon --status` lists each registered queue with its availability,
+state mode, project root, state directory, and effective local concurrency
+limit. Supervisor log events carry the same project/root/state attribution.
 
 ### `telemetry`
 
@@ -284,14 +292,87 @@ orboros telemetry rebuild --project dockyard
 `rebuild` recreates the durable telemetry projection from the project's
 existing `executions.jsonl` evidence. It is appropriate after introducing the
 feature to an existing project or if a summary must be recovered.
-| `--pid-file <PATH>` | `~/.orboros/orboros.pid` | PID file location |
-| `--log-file <PATH>` | — | Log file path |
-| `--tick-interval <MS>` | 1000 | Queue loop tick interval |
 
-`orboros daemon --status` lists each registered queue with its availability,
-state mode, project root, state directory, and effective local concurrency
-limit. Supervisor log events carry the same project/root/state attribution.
-| `--project <NAME>` | — | Supervise one registered project |
+### `chat` and `sessions`
+
+Start an interactive worker-backed conversation with `chat`. It requires the
+normal worker and credential preflight; the transcript is stored under the
+selected state directory's `sessions/` directory. Link it to an existing orb
+when the conversation is part of that work item.
+
+```bash
+orboros chat --link-orb orb-k4f
+orboros sessions list --status idle
+orboros sessions show session-abc12345
+```
+
+Use `sessions show` to replay durable transcript events; it does not start a
+worker. Use `chat --chat-model <MODEL>` to override the normal chat model for
+one session.
+
+### `hooks`
+
+Hooks are configured separately in `~/.orboros/hooks.toml` and
+`.orboros/hooks.toml`, never in general configuration. Validate and inspect
+them before allowing a hook to run against live work:
+
+```bash
+orboros hooks check
+orboros hooks list
+orboros hooks run notify --orb orb-k4f --dry-run
+orboros hooks log --orb orb-k4f
+```
+
+`--dry-run` records what would run but does not spawn the hook command. Hook
+invocations are durable evidence; use `hooks log` for recovery or debugging.
+
+### `review-queue`
+
+List parent orbs whose second-opinion verdict is `Revise` and requires an
+operator decision:
+
+```bash
+orboros review-queue
+orboros orb show orb-k4f
+orboros orb review orb-k4f revise
+```
+
+Inspect the orb before applying a decision. `orb review` is the state-changing
+step; `review-queue` is read-only.
+
+### Orb evidence and recovery
+
+```bash
+orboros orb logs orb-k4f
+orboros orb logs orb-k4f --attempt 2
+orboros orb reset orb-k4f
+orboros orb rollback-list orb-k4f
+orboros orb rollback orb-k4f --count 1
+```
+
+`orb logs` lists every durable outer attempt and its Heddle transcript. Reset
+only a failed orb; it appends retryable state without deleting evidence.
+`rollback-list` shows append-only checkpoints, and `rollback` restores a prior
+snapshot while retaining the history that made recovery possible.
+
+### `bench`
+
+Benchmarks keep results under the benchmark root rather than the project log
+home. Parent options must come before the benchmark subcommand:
+
+```bash
+orboros bench --bench-root ../orboros-bench list
+orboros bench --bench-root ../orboros-bench run --tier t1 --jobs 2
+orboros bench --bench-root ../orboros-bench list-runs
+orboros bench --bench-root ../orboros-bench show <RUN_ID>
+orboros bench --bench-root ../orboros-bench report <RUN_ID>
+orboros bench --bench-root ../orboros-bench compare <RUN_A> <RUN_B>
+orboros bench --bench-root ../orboros-bench archive <RUN_ID>
+```
+
+Use `details`, `prompts`, `calibration`, `report-history`, and `storage` for
+deeper inspection. `archive` is recoverable: it moves a completed run beneath
+the local benchmark archive and preserves its lookup metadata.
 
 ---
 
