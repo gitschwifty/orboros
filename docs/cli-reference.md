@@ -97,6 +97,16 @@ orboros plan --file spec.md
 orboros plan "API redesign" --shallow
 ```
 
+`plan` creates an epic plus a local, line-based child scaffold in the selected
+state store. A normal plan leaves refinement queued; `--shallow` explicitly
+skips refinement and releases the scaffolded children for execution. Neither
+mode runs a worker while creating the plan. The completion summary names the
+state source and gives the next command. Inspect an existing plan with:
+
+```bash
+orboros plan --status orb-abc
+```
+
 | Option | Description |
 |--------|-------------|
 | `--file <PATH>` | Read task from markdown file |

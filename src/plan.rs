@@ -19,7 +19,7 @@ pub struct PlanConfig {
     pub file: Option<PathBuf>,
 }
 
-/// Builds the records for a shallow plan without opening a store.
+/// Builds the records for a locally scaffolded plan without opening a store.
 ///
 /// Shared-state callers submit the returned records as one supervisor
 /// operation; unlike the historical pipeline implementation this cannot leave
@@ -27,6 +27,7 @@ pub struct PlanConfig {
 pub fn build_shared_plan(
     title: &str,
     description: &str,
+    shallow: bool,
 ) -> anyhow::Result<(Orb, Vec<Orb>, Vec<DepEdge>)> {
     let mut epic = Orb::new(title, description).with_type(OrbType::Epic);
     epic.set_phase(OrbPhase::Speccing)
@@ -80,9 +81,166 @@ pub fn build_shared_plan(
         }
         children.push(child);
     }
-    epic.set_phase(OrbPhase::Refining)
-        .map_err(|e| anyhow::anyhow!("refining transition rejected: {e}"))?;
+    if shallow {
+        // `--shallow` is an explicit operator choice to accept the local,
+        // line-based scaffold without a refinement worker or review gate. The
+        // normal queue may now schedule its child tasks.
+        epic.set_phase(OrbPhase::Refining)
+            .map_err(|e| anyhow::anyhow!("refining transition rejected: {e}"))?;
+        epic.set_phase(OrbPhase::Review)
+            .map_err(|e| anyhow::anyhow!("review transition rejected: {e}"))?;
+        epic.set_phase(OrbPhase::Waiting)
+            .map_err(|e| anyhow::anyhow!("waiting transition rejected: {e}"))?;
+    } else {
+        // A normal plan has only constructed a local child scaffold. Refining
+        // is deliberately left queued for a worker; it has not completed.
+        epic.set_phase(OrbPhase::Refining)
+            .map_err(|e| anyhow::anyhow!("refining transition rejected: {e}"))?;
+    }
     Ok((epic, children, edges))
+}
+
+/// Persists a plan scaffold into the canonical state store.
+///
+/// The queue, `orb` commands, and daemon all use these stores. Keeping plan
+/// creation here avoids the former split where `plan` wrote only a private
+/// pipeline directory that ordinary CLI commands could not inspect.
+pub fn persist_plan(
+    epic: &Orb,
+    children: &[Orb],
+    edges: &[DepEdge],
+    store: &OrbStore,
+    dep_store: &DepStore,
+) -> anyhow::Result<()> {
+    store
+        .append(epic)
+        .map_err(|e| anyhow::anyhow!("failed to append plan epic: {e}"))?;
+    for child in children {
+        store
+            .append(child)
+            .map_err(|e| anyhow::anyhow!("failed to append plan child: {e}"))?;
+    }
+    for edge in edges {
+        dep_store
+            .add_edge(edge.clone())
+            .map_err(|e| anyhow::anyhow!("failed to append plan dependency: {e}"))?;
+    }
+    Ok(())
+}
+
+/// Prints the lifecycle and next action for a newly created plan.
+pub fn print_plan_summary(
+    store: &OrbStore,
+    dep_store: &DepStore,
+    epic: &Orb,
+    state_dir: &Path,
+    shared_state: bool,
+    shallow: bool,
+) {
+    print_plan_tree(store, dep_store, epic);
+    let mode = if shallow {
+        "shallow scaffold (refinement skipped by --shallow)"
+    } else {
+        "normal scaffold (refinement queued)"
+    };
+    println!("\nPlan created");
+    println!("  Epic:       {}", epic.id);
+    println!(
+        "  Children:   {}",
+        store.load_children(&epic.id).map_or(0, |v| v.len())
+    );
+    println!(
+        "  Lifecycle:  {:?} — {mode}",
+        epic.phase.unwrap_or(OrbPhase::Pending)
+    );
+    println!(
+        "  State:      {} ({})",
+        state_dir.display(),
+        if shared_state {
+            "shared-state projection"
+        } else {
+            "local projection"
+        }
+    );
+    println!("  Inspect:    orboros plan --status {}", epic.id);
+    println!("  Next:       orboros execute {} --wait", epic.id);
+}
+
+/// Prints a compact, inspectable plan lifecycle view.
+pub fn print_plan_status(store: &OrbStore, dep_store: &DepStore, id: &str) -> anyhow::Result<()> {
+    use orbs::id::OrbId;
+
+    let epic = store
+        .load_by_id(&OrbId::from_raw(id))?
+        .ok_or_else(|| anyhow::anyhow!("plan orb not found: {id}"))?;
+    anyhow::ensure!(
+        epic.orb_type.uses_phase(),
+        "orb {id} is not a plan-capable epic or feature"
+    );
+    let all_orbs = store.load_all()?;
+    let children = store.load_children(&epic.id)?;
+    let ready = dep_store.ready(&all_orbs).unwrap_or_default();
+    let phase = epic.phase.unwrap_or(OrbPhase::Pending);
+    let child_done = children
+        .iter()
+        .filter(|child| child.effective_status() == orbs::task::TaskStatus::Done)
+        .count();
+    let child_failed = children
+        .iter()
+        .filter(|child| child.effective_status() == orbs::task::TaskStatus::Failed)
+        .count();
+    let child_ready = children
+        .iter()
+        .filter(|child| ready.contains(&child.id))
+        .count();
+
+    println!("Plan:       {} ({})", epic.title, epic.id);
+    println!("Phase:      {phase:?}");
+    println!(
+        "Children:   {} total; {child_done} done; {child_failed} failed; {child_ready} ready",
+        children.len()
+    );
+    println!(
+        "Dispatch:   {}",
+        if epic.execution.is_some() {
+            "in flight (execution marker present)"
+        } else {
+            "no execution marker"
+        }
+    );
+    let next = match phase {
+        OrbPhase::Speccing
+        | OrbPhase::Decomposing
+        | OrbPhase::Refining
+        | OrbPhase::Reevaluating
+            if epic.execution.is_none() =>
+        {
+            format!("eligible for {} dispatch", phase_name(phase))
+        }
+        OrbPhase::Review => "awaiting review decision".to_string(),
+        OrbPhase::Waiting if child_failed > 0 => {
+            "blocked: reset or recover the failed child before continuing".to_string()
+        }
+        OrbPhase::Waiting if child_done == children.len() && !children.is_empty() => {
+            "children complete; queue will advance parent final work or completion".to_string()
+        }
+        OrbPhase::Waiting => "children are ready for queue execution".to_string(),
+        OrbPhase::Done => "complete".to_string(),
+        OrbPhase::Failed => "failed; inspect attempts, then reset the relevant orb".to_string(),
+        _ => "not currently queue-dispatchable; inspect lifecycle state".to_string(),
+    };
+    println!("Next action: {next}");
+    Ok(())
+}
+
+fn phase_name(phase: OrbPhase) -> &'static str {
+    match phase {
+        OrbPhase::Speccing => "speccing",
+        OrbPhase::Decomposing => "decomposition",
+        OrbPhase::Refining => "refinement",
+        OrbPhase::Reevaluating => "re-evaluation",
+        _ => "worker",
+    }
 }
 
 /// Parses plan text in the same format accepted by `--file`.
@@ -107,7 +265,7 @@ pub fn create_plan(
     title: &str,
     description: &str,
     base_dir: &Path,
-    _config: &PlanConfig,
+    config: &PlanConfig,
 ) -> anyhow::Result<(Orb, PipelineDir)> {
     // Create the epic orb
     let mut epic = Orb::new(title, description).with_type(OrbType::Epic);
@@ -142,9 +300,17 @@ pub fn create_plan(
     // Snapshot the decomposition state
     snapshot_decomposition(&pipeline)?;
 
-    // Transition to Refining (or Done if shallow)
+    // Normal plans queue a refinement worker. Shallow plans intentionally
+    // accept the locally scaffolded child graph and release the children
+    // without a refinement worker or review gate.
     epic.set_phase(OrbPhase::Refining)
         .map_err(|e| anyhow::anyhow!("refining transition rejected: {e}"))?;
+    if config.shallow {
+        epic.set_phase(OrbPhase::Review)
+            .map_err(|e| anyhow::anyhow!("review transition rejected: {e}"))?;
+        epic.set_phase(OrbPhase::Waiting)
+            .map_err(|e| anyhow::anyhow!("waiting transition rejected: {e}"))?;
+    }
     store
         .update(&epic)
         .map_err(|e| anyhow::anyhow!("failed to update epic phase: {e}"))?;
@@ -282,6 +448,54 @@ mod tests {
         tempfile::tempdir().unwrap()
     }
 
+    #[test]
+    fn shared_normal_plan_queues_refinement() {
+        let (epic, children, edges) = build_shared_plan("Feature", "First\nSecond", false).unwrap();
+
+        assert_eq!(epic.phase, Some(OrbPhase::Refining));
+        assert_eq!(children.len(), 2);
+        assert_eq!(
+            edges
+                .iter()
+                .filter(|edge| edge.edge_type == EdgeType::Parent)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn shared_shallow_plan_skips_refinement_and_releases_children() {
+        let (epic, children, edges) = build_shared_plan("Feature", "First\nSecond", true).unwrap();
+
+        assert_eq!(epic.phase, Some(OrbPhase::Waiting));
+        assert_eq!(children.len(), 2);
+        assert_eq!(
+            edges
+                .iter()
+                .filter(|edge| edge.edge_type == EdgeType::Parent)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn persist_plan_writes_canonical_orbs_and_dependencies() {
+        let tmp = tmp_base_dir();
+        let store = OrbStore::new(tmp.path().join("orbs.jsonl"));
+        let dep_store = DepStore::new(tmp.path().join("deps.jsonl"));
+        let (epic, children, edges) = build_shared_plan("Feature", "First\nSecond", false).unwrap();
+
+        persist_plan(&epic, &children, &edges, &store, &dep_store).unwrap();
+
+        assert_eq!(
+            store.load_by_id(&epic.id).unwrap().unwrap().phase,
+            Some(OrbPhase::Refining)
+        );
+        assert_eq!(store.load_children(&epic.id).unwrap().len(), 2);
+        assert_eq!(dep_store.all_edges().unwrap().len(), edges.len());
+        print_plan_status(&store, &dep_store, epic.id.as_str()).unwrap();
+    }
+
     // ── create_plan tests ────────────────────────────────────
 
     #[test]
@@ -310,6 +524,24 @@ mod tests {
             create_plan("Feature X", "Step one\nStep two", tmp.path(), &config).unwrap();
 
         assert_eq!(epic.phase, Some(OrbPhase::Refining));
+    }
+
+    #[test]
+    fn create_plan_shallow_skips_refinement_and_waits_for_children() {
+        let tmp = tmp_base_dir();
+        let config = PlanConfig {
+            shallow: true,
+            file: None,
+        };
+
+        let (epic, pipeline) =
+            create_plan("Feature X", "Step one\nStep two", tmp.path(), &config).unwrap();
+
+        assert_eq!(epic.phase, Some(OrbPhase::Waiting));
+        assert_eq!(
+            pipeline.orb_store().load_children(&epic.id).unwrap().len(),
+            2
+        );
     }
 
     #[test]

@@ -1368,7 +1368,9 @@ async fn recover_structured_phase_output(
             validate_structured_phase_response(target, response, model_config).is_ok()
         });
     diagnostic.fresh_retry_succeeded = Some(retry_valid);
-    if !retry_valid {
+    if retry_valid {
+        tracing::info!(orb = %orb.id, phase = target.tool_policy_key(), phase_attempt = 2, retry_reason = "after_invalid_output", "fresh structured phase retry completed");
+    } else {
         diagnostic.fresh_retry_error = retry_outcome
             .error
             .clone()
@@ -1387,8 +1389,6 @@ async fn recover_structured_phase_output(
             diagnostic.fresh_retry_error.as_deref().unwrap_or("unknown"),
         ));
         tracing::error!(orb = %orb.id, phase = target.tool_policy_key(), "structured phase recovery exhausted");
-    } else {
-        tracing::info!(orb = %orb.id, phase = target.tool_policy_key(), phase_attempt = 2, retry_reason = "after_invalid_output", "fresh structured phase retry completed");
     }
     Ok(StructuredRecovery {
         outcome: retry_outcome,

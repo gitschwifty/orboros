@@ -14,7 +14,7 @@ use orbs::orb_store::OrbStore;
 use orboros::config;
 use orboros::daemon::DaemonConfig;
 use orboros::orb_cmd;
-use orboros::plan::{self, PlanConfig};
+use orboros::plan;
 use orboros::queue_loop::{DrainResult, QueueLoop};
 use orboros::routing::profile::builtin_tools;
 use orboros::worker::process::WorkerConfig;
@@ -99,7 +99,7 @@ enum Commands {
         #[arg(long, default_value_t = 100)]
         interval_ms: u64,
     },
-    /// Create a plan by decomposing a description into an epic with subtasks.
+    /// Create or inspect a plan lifecycle.
     Plan {
         /// The task description (or use --file to read from a markdown file).
         description: Option<String>,
@@ -109,6 +109,9 @@ enum Commands {
         /// Only run shallow decomposition (no refinement).
         #[arg(long)]
         shallow: bool,
+        /// Show an existing plan's lifecycle, dispatch eligibility, and next action.
+        #[arg(long, value_name = "ORB_ID")]
+        status: Option<String>,
     },
     /// Initialize a new project in the current directory.
     Init,
@@ -928,11 +931,13 @@ fn main() -> anyhow::Result<()> {
             description,
             file,
             shallow,
+            status,
         } => cmd_plan(
             &state_dir,
             description.as_deref(),
             file.as_deref(),
             shallow,
+            status.as_deref(),
             shared_project.as_ref(),
         ),
         Commands::Init => cmd_init(),
@@ -1761,8 +1766,26 @@ fn cmd_plan(
     description: Option<&str>,
     file: Option<&std::path::Path>,
     shallow: bool,
+    status: Option<&str>,
     shared_project: Option<&config::ProjectEntry>,
 ) -> anyhow::Result<()> {
+    if let Some(id) = status {
+        anyhow::ensure!(
+            description.is_none() && file.is_none() && !shallow,
+            "--status cannot be combined with a description, --file, or --shallow"
+        );
+        let store = OrbStore::new(state_dir.join("orbs.jsonl"));
+        let deps = DepStore::new(state_dir.join("deps.jsonl"));
+        println!(
+            "State source: {}",
+            if shared_project.is_some() {
+                "shared-state projection"
+            } else {
+                "local projection"
+            }
+        );
+        return plan::print_plan_status(&store, &deps, id);
+    }
     if let Some(project) = shared_project {
         let content = match (description, file) {
             (_, Some(path)) => std::fs::read_to_string(path)
@@ -1777,7 +1800,7 @@ fn cmd_plan(
         } else {
             (content.clone(), content)
         };
-        let (epic, children, edges) = plan::build_shared_plan(&title, &body)?;
+        let (epic, children, edges) = plan::build_shared_plan(&title, &body, shallow)?;
         let mut mutations = Vec::with_capacity(1 + children.len() + edges.len());
         mutations.push(orboros::supervisor::SharedStateMutation::UpsertOrb { orb: epic.clone() });
         mutations.extend(
@@ -1801,16 +1824,14 @@ fn cmd_plan(
             .map_err(|e| anyhow::anyhow!("failed to submit shared plan: {e}"))?;
         let store = OrbStore::new(state_dir.join("orbs.jsonl"));
         let deps = DepStore::new(state_dir.join("deps.jsonl"));
-        plan::print_plan_tree(&store, &deps, &epic);
+        plan::print_plan_summary(&store, &deps, &epic, state_dir, true, shallow);
         return Ok(());
     }
-    let config = PlanConfig {
-        shallow,
-        file: file.map(PathBuf::from),
-    };
-
-    let (epic, pipeline) = if let Some(file_path) = file {
-        plan::create_plan_from_file(file_path, state_dir, &config)?
+    let (title, body) = if let Some(file_path) = file {
+        let content = std::fs::read_to_string(file_path).map_err(|e| {
+            anyhow::anyhow!("failed to read plan file {}: {e}", file_path.display())
+        })?;
+        plan::parse_plan_text(&content)?
     } else if let Some(desc) = description {
         // Use first line as title if multi-line, otherwise use full text as both
         let (title, body) = if let Some((first, rest)) = desc.split_once('\n') {
@@ -1818,15 +1839,15 @@ fn cmd_plan(
         } else {
             (desc.to_string(), desc.to_string())
         };
-        plan::create_plan(&title, &body, state_dir, &config)?
+        (title, body)
     } else {
         anyhow::bail!("Provide a description or use --file <path>");
     };
-
-    let store = pipeline.orb_store();
-    let dep_store = orbs::dep_store::DepStore::new(pipeline.deps_path());
-
-    plan::print_plan_tree(&store, &dep_store, &epic);
+    let (epic, children, edges) = plan::build_shared_plan(&title, &body, shallow)?;
+    let store = OrbStore::new(state_dir.join("orbs.jsonl"));
+    let dep_store = DepStore::new(state_dir.join("deps.jsonl"));
+    plan::persist_plan(&epic, &children, &edges, &store, &dep_store)?;
+    plan::print_plan_summary(&store, &dep_store, &epic, state_dir, false, shallow);
 
     Ok(())
 }
