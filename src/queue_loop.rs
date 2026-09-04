@@ -21,6 +21,30 @@ const STRUCTURED_PHASE_REPAIR_SYSTEM_PROMPT: &str = "You repair a malformed stru
 const COMPLETED_DISPATCH_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const COMPLETED_DISPATCH_RETRY_MAX: Duration = Duration::from_secs(30);
 
+/// Marks the narrow class of worker-init failures that make the headless IPC
+/// contract unusable for the whole supervisor. All other dispatch errors are
+/// isolated to the orb that encountered them.
+#[derive(Debug)]
+struct FatalHeadlessIpcFailure(anyhow::Error);
+
+impl std::fmt::Display for FatalHeadlessIpcFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for FatalHeadlessIpcFailure {}
+
+fn fatal_headless_ipc_error(error: anyhow::Error) -> std::io::Error {
+    std::io::Error::other(FatalHeadlessIpcFailure(error))
+}
+
+fn is_fatal_headless_ipc_error(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.is::<FatalHeadlessIpcFailure>())
+}
+
 struct InFlightDispatchGuard(Arc<AtomicUsize>);
 
 impl InFlightDispatchGuard {
@@ -971,11 +995,14 @@ impl QueueLoop {
             match joined {
                 Ok(Ok(true)) => completed = completed.saturating_add(1),
                 Ok(Ok(false)) => {} // dispatched but didn't end Done
-                Ok(Err(error)) => {
+                Ok(Err(error)) if is_fatal_headless_ipc_error(&error) => {
                     self.stop();
                     join_set.abort_all();
                     while join_set.join_next().await.is_some() {}
                     return Err(error);
+                }
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "per-orb dispatch setup failed; continuing queue");
                 }
                 Err(e) => tracing::warn!(error = %e, "dispatch task panicked"),
             }
@@ -1651,7 +1678,16 @@ async fn dispatch_one_owned(
     let mut outcome = loop {
         let outcome = dispatch_orb_while_running(&orb, &user, &wc, hooks.as_deref(), &running)
             .await
-            .map_err(std::io::Error::other)?;
+            .map_err(|error| {
+                if error
+                    .downcast_ref::<crate::ipc::error::IpcError>()
+                    .is_some_and(crate::ipc::error::IpcError::is_fatal_init_failure)
+                {
+                    fatal_headless_ipc_error(error)
+                } else {
+                    std::io::Error::other(error)
+                }
+            })?;
         let failed = matches!(
             outcome.status,
             crate::worker::dispatcher::DispatchStatus::Error
@@ -2436,6 +2472,20 @@ mod tests {
     use super::*;
     use orbs::dep::{DepEdge, EdgeType};
     use orbs::orb::OrbType;
+
+    #[test]
+    fn only_tagged_init_failures_stop_the_supervisor_queue() {
+        let fatal = fatal_headless_ipc_error(anyhow::anyhow!(
+            crate::ipc::error::IpcError::ProtocolVersionMismatch {
+                expected: "1.0".into(),
+                actual: "2.0".into(),
+            }
+        ));
+        assert!(is_fatal_headless_ipc_error(&fatal));
+
+        let ordinary = std::io::Error::other("could not create retry evidence directory");
+        assert!(!is_fatal_headless_ipc_error(&ordinary));
+    }
 
     /// Helper: sets up a temp dir with `orb_store`, `dep_store`, and `base_dir`.
     fn setup() -> (tempfile::TempDir, OrbStore, DepStore, PathBuf) {

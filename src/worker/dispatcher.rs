@@ -328,7 +328,28 @@ async fn dispatch_orb_with_retry_limit(
         };
         let mut attempt_config = worker_config.clone();
         if attempt > 0 {
-            prepare_fresh_worker_attempt(&mut attempt_config)?;
+            if let Err(error) = prepare_fresh_worker_attempt(&mut attempt_config) {
+                tracing::error!(
+                    orb = %orb.id,
+                    retry_attempt = attempt + 1,
+                    worker_id = ?attempt_config.worker_id,
+                    transcript_path = ?attempt_config.runtime.as_ref().and_then(|runtime| runtime.transcript_path.as_deref()),
+                    state_root = ?attempt_config.runtime.as_ref().and_then(|runtime| runtime.state_root.as_deref()),
+                    %error,
+                    "could not prepare fresh worker retry evidence"
+                );
+                let outcome = build_failure(
+                    &attempt_config,
+                    dispatched_at,
+                    Utc::now(),
+                    None,
+                    None,
+                    None,
+                    format!("could not prepare fresh worker retry: {error}"),
+                );
+                attempts.push(DispatchAttempt::from_outcome(&outcome));
+                break outcome;
+            }
         }
         let (outcome, retry_kind) = match Worker::spawn(&attempt_config).await {
             Ok(mut worker) => match worker.send(&send_id, &attempt_prompt).await {
