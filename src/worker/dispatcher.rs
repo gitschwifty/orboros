@@ -389,6 +389,9 @@ async fn dispatch_orb_with_retry_limit(
                 }
             },
             Err(e) => {
+                if e.is_fatal_init_failure() {
+                    return Err(anyhow::Error::new(e));
+                }
                 let retryable = crate::worker::fsm::FailureClass::from(&e).restart_policy()
                     == crate::worker::fsm::RestartPolicy::RetryOnce;
                 (
@@ -406,6 +409,13 @@ async fn dispatch_orb_with_retry_limit(
             }
         };
         attempts.push(DispatchAttempt::from_outcome(&outcome));
+        // Give the supervisor's shutdown watcher a chance to stop admission
+        // before deciding whether this retry can create another worker.
+        // Under Ctrl-C this prevents a worker exit racing ahead of the
+        // supervisor loop from being treated as a normal transient failure.
+        if retry_kind.is_some() && running.is_some() {
+            tokio::task::yield_now().await;
+        }
         if let Some(retry_kind) = retry_kind.filter(|_| {
             attempt < retry_limit && running.is_none_or(|flag| flag.load(Ordering::SeqCst))
         }) {
@@ -486,16 +496,28 @@ async fn dispatch_orb_with_retry_limit(
             .failure
             .as_ref()
             .map_or("-", |failure| failure.termination_reason.as_str());
-        tracing::error!(
-            orb = %orb.id,
-            title = %orb.title,
-            phase = ?orb.phase.unwrap_or(orbs::orb::OrbPhase::Pending),
-            status = ?outcome.status,
-            failure_code,
-            termination_reason,
-            error = %outcome.error.as_deref().unwrap_or("worker returned no error detail"),
-            "dispatch failed"
-        );
+        if let Some(error) = distinct_failure_error(outcome.error.as_deref(), termination_reason) {
+            tracing::error!(
+                orb = %orb.id,
+                title = %orb.title,
+                phase = ?orb.phase.unwrap_or(orbs::orb::OrbPhase::Pending),
+                status = ?outcome.status,
+                failure_code,
+                termination_reason,
+                error,
+                "dispatch failed"
+            );
+        } else {
+            tracing::error!(
+                orb = %orb.id,
+                title = %orb.title,
+                phase = ?orb.phase.unwrap_or(orbs::orb::OrbPhase::Pending),
+                status = ?outcome.status,
+                failure_code,
+                termination_reason,
+                "dispatch failed"
+            );
+        }
     }
 
     // 3. post-worker-* — async / fire-and-forget. The event picked
@@ -570,6 +592,7 @@ fn build_outcome(
         ResultStatus::Error => DispatchStatus::Error,
     };
     let error = send.error.as_ref().map(|e| e.message.clone());
+    let usage = send.effective_usage();
     DispatchOutcome {
         status,
         retries: 0,
@@ -585,15 +608,15 @@ fn build_outcome(
         total_latency_ms: send.total_latency_ms,
         assistant_turns: Some(send.iterations),
         tool_calls: Some(u32::try_from(send.tool_calls_made.len()).unwrap_or(u32::MAX)),
-        prompt_tokens: send.usage.as_ref().map(|u| u.prompt_tokens),
-        completion_tokens: send.usage.as_ref().map(|u| u.completion_tokens),
-        total_tokens: send.usage.as_ref().map(|u| u.total_tokens),
-        cost_micros: send.usage.as_ref().and_then(|u| u.cost_micros),
-        cost_currency: send.usage.as_ref().and_then(|u| u.cost_currency.clone()),
-        cached_tokens: send.usage.as_ref().and_then(|u| u.cached_tokens),
-        cache_write_tokens: send.usage.as_ref().and_then(|u| u.cache_write_tokens),
-        reasoning_tokens: send.usage.as_ref().and_then(|u| u.reasoning_tokens),
-        generation_id: send.usage.as_ref().and_then(|u| u.generation_id.clone()),
+        prompt_tokens: usage.as_ref().map(|u| u.prompt_tokens),
+        completion_tokens: usage.as_ref().map(|u| u.completion_tokens),
+        total_tokens: usage.as_ref().map(|u| u.total_tokens),
+        cost_micros: usage.as_ref().and_then(|u| u.cost_micros),
+        cost_currency: usage.as_ref().and_then(|u| u.cost_currency.clone()),
+        cached_tokens: usage.as_ref().and_then(|u| u.cached_tokens),
+        cache_write_tokens: usage.as_ref().and_then(|u| u.cache_write_tokens),
+        reasoning_tokens: usage.as_ref().and_then(|u| u.reasoning_tokens),
+        generation_id: usage.as_ref().and_then(|u| u.generation_id.clone()),
         dispatched_at,
         completed_at,
         prompt_category: None,
@@ -834,12 +857,12 @@ pub fn default_worker_config(
     let cfg = crate::config::load_config_with_home(home, project_dir)?;
     let model = cfg
         .model_resolver()
-        .resolve(crate::config::ModelRole::Worker("execute"))?
-        .model;
+        .resolve(crate::config::ModelRole::Worker("execute"))?;
     let binary = cfg
         .worker_binary
+        .clone()
         .ok_or_else(|| anyhow::anyhow!("worker_binary is unset in OrbConfig"))?;
-    Ok(WorkerConfig {
+    let mut worker = WorkerConfig {
         command: binary,
         args: vec![],
         // A supervisor may manage projects from a different process cwd.
@@ -847,7 +870,7 @@ pub fn default_worker_config(
         // it inherit the daemon's launch directory.
         cwd: project_dir.map(std::path::Path::to_path_buf),
         env: vec![],
-        model,
+        model: model.model.clone(),
         system_prompt: String::new(),
         tools: builtin_tools("execute")
             .iter()
@@ -859,17 +882,48 @@ pub fn default_worker_config(
         shutdown_timeout: None,
         task_id: None,
         worker_id: None,
-        runtime: cfg.heddle.config_path.map(|config_path| {
-            crate::ipc::types::RuntimePlacementConfig {
+        runtime: None,
+        routing: None,
+        credential_source: None,
+    };
+    apply_resolved_model(&mut worker, &cfg, &model);
+    Ok(worker)
+}
+
+/// Applies a resolved model's endpoint metadata and Heddle router configuration
+/// to a worker. `provider` describes the requested upstream model vendor;
+/// `router` describes the Heddle client/gateway that will serve it.
+pub fn apply_resolved_model(
+    worker: &mut WorkerConfig,
+    config: &crate::config::OrbConfig,
+    model: &crate::config::ResolvedModel,
+) {
+    worker.model.clone_from(&model.model);
+    worker.routing = Some(RoutingMetadata {
+        gateway: model.router.clone(),
+        upstream_provider: model.provider.clone(),
+        ..RoutingMetadata::default()
+    });
+    worker.credential_source = config
+        .heddle
+        .credential_source_for_router(model.router.as_deref());
+
+    let config_path = config
+        .heddle
+        .config_path_for_router(model.router.as_deref());
+    match (&mut worker.runtime, config_path) {
+        (Some(runtime), config_path) => runtime.config_path = config_path,
+        (None, Some(config_path)) => {
+            worker.runtime = Some(crate::ipc::types::RuntimePlacementConfig {
                 mode: None,
                 state_root: None,
                 transcript_path: None,
                 config_path: Some(config_path),
                 inherit_ambient_config: None,
-            }
-        }),
-        routing: None,
-    })
+            });
+        }
+        (None, None) => {}
+    }
 }
 
 /// Overlays orb-specific fields onto a base `WorkerConfig`:
@@ -913,7 +967,7 @@ pub fn worker_config_for_with_model_config(
         let resolved = model_config
             .model_resolver()
             .resolve_selector(selector, "orb.preferred_model".to_string())?;
-        wc.model = resolved.model;
+        apply_resolved_model(&mut wc, model_config, &resolved);
     }
     wc.task_id = Some(orb.id.to_string());
     wc.worker_id = Some(uuid::Uuid::new_v4().to_string());
@@ -928,9 +982,16 @@ fn optional_display<T: std::fmt::Display>(value: Option<T>) -> String {
     value.map_or_else(|| "none".to_string(), |value| value.to_string())
 }
 
+/// Returns the unstructured error only when it adds context beyond a
+/// structured termination reason.
+fn distinct_failure_error<'a>(error: Option<&'a str>, termination_reason: &str) -> Option<&'a str> {
+    error.filter(|error| *error != termination_reason)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ipc::types::{ResultStatus, WorkerEvent};
     use orbs::orb::{OrbStatus, OrbType};
 
     fn active_task_orb() -> Orb {
@@ -939,6 +1000,67 @@ mod tests {
         // the next move.
         o.set_status(OrbStatus::Active).unwrap();
         o
+    }
+
+    #[test]
+    fn usage_from_send_falls_back_to_last_streamed_usage_event() {
+        let send = crate::worker::process::SendOutcome {
+            id: "send-1".into(),
+            status: ResultStatus::Ok,
+            response: None,
+            tool_calls_made: Vec::new(),
+            usage: None,
+            iterations: 1,
+            error: None,
+            events: vec![
+                WorkerEvent::Usage {
+                    prompt_tokens: 10,
+                    completion_tokens: 2,
+                    total_tokens: 12,
+                    cost_micros: None,
+                    cost_currency: None,
+                    cached_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                    generation_id: None,
+                },
+                WorkerEvent::Usage {
+                    prompt_tokens: 20,
+                    completion_tokens: 5,
+                    total_tokens: 25,
+                    cost_micros: Some(12),
+                    cost_currency: Some("USD".into()),
+                    cached_tokens: Some(3),
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                    generation_id: Some("gen-1".into()),
+                },
+            ],
+            model_latency_ms: None,
+            tool_latency_ms: None,
+            total_latency_ms: None,
+            confidence: None,
+            runtime: None,
+            routing: None,
+            failure: None,
+        };
+
+        let usage = send.effective_usage().expect("streamed usage");
+        assert_eq!(usage.total_tokens, 25);
+        assert_eq!(usage.cost_micros, Some(12));
+        assert_eq!(usage.generation_id.as_deref(), Some("gen-1"));
+    }
+
+    #[test]
+    fn distinct_failure_error_omits_repeated_termination_reason() {
+        assert_eq!(
+            distinct_failure_error(Some("stream decoder failed"), "stream decoder failed"),
+            None
+        );
+        assert_eq!(
+            distinct_failure_error(Some("worker stdout closed"), "provider stream ended"),
+            Some("worker stdout closed")
+        );
     }
 
     fn done_outcome() -> DispatchOutcome {
@@ -1183,6 +1305,7 @@ mod tests {
             worker_id: None,
             runtime: None,
             routing: None,
+            credential_source: None,
         }
     }
 
@@ -1212,11 +1335,36 @@ mod tests {
             r#"
 [models.options.fast]
 model = "catalog/fast"
+provider = "anthropic"
+router = "straitly"
+
+[heddle]
+config_path = "/tmp/heddle.toml"
+
+[heddle.routers.straitly]
+credential_source = "keychain:orboros/straitly"
 "#,
         )
         .unwrap();
         let wc = worker_config_for_with_model_config(&orb, &base_wc(), "x", &cfg).unwrap();
         assert_eq!(wc.model, "catalog/fast");
+        assert_eq!(
+            wc.runtime
+                .as_ref()
+                .and_then(|runtime| runtime.config_path.as_deref()),
+            Some("/tmp/heddle.toml")
+        );
+        assert_eq!(
+            wc.routing
+                .as_ref()
+                .and_then(|routing| routing.gateway.as_deref()),
+            Some("straitly")
+        );
+        assert!(matches!(
+            wc.credential_source,
+            Some(crate::ipc::types::HeadlessCredentialSource::Keychain { ref reference })
+                if reference == "keychain:orboros/straitly"
+        ));
     }
 
     #[test]
@@ -1341,5 +1489,59 @@ execute = "exec"
         .unwrap();
         let wc = default_worker_config(Some(home.path()), None).unwrap();
         assert_eq!(wc.model, "catalog/execute");
+    }
+
+    #[test]
+    fn default_worker_config_uses_router_specific_heddle_config_and_metadata() {
+        let home = tempfile::tempdir().unwrap();
+        let cfg_dir = home.path().join(".orboros");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            r#"
+worker_binary = "/usr/local/bin/heddle"
+
+[models.options.planner]
+model = "anthropic/claude-sonnet-4"
+provider = "anthropic"
+router = "straitly"
+
+[models.workers]
+execute = "planner"
+
+[heddle]
+config_path = "/tmp/heddle-default.toml"
+
+[heddle.routers.straitly]
+credential_source = "keychain:orboros/straitly"
+"#,
+        )
+        .unwrap();
+
+        let wc = default_worker_config(Some(home.path()), None).unwrap();
+        assert_eq!(wc.model, "anthropic/claude-sonnet-4");
+        assert_eq!(
+            wc.runtime
+                .as_ref()
+                .and_then(|runtime| runtime.config_path.as_deref()),
+            Some("/tmp/heddle-default.toml")
+        );
+        assert_eq!(
+            wc.routing
+                .as_ref()
+                .and_then(|routing| routing.gateway.as_deref()),
+            Some("straitly")
+        );
+        assert_eq!(
+            wc.routing
+                .as_ref()
+                .and_then(|routing| routing.upstream_provider.as_deref()),
+            Some("anthropic")
+        );
+        assert!(matches!(
+            wc.credential_source,
+            Some(crate::ipc::types::HeadlessCredentialSource::Keychain { ref reference })
+                if reference == "keychain:orboros/straitly"
+        ));
     }
 }

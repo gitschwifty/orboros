@@ -61,6 +61,7 @@ fn worker_config(script: &Path) -> WorkerConfig {
         worker_id: Some("worker-test-1".into()),
         runtime: None,
         routing: None,
+        credential_source: None,
     }
 }
 

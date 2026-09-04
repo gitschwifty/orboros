@@ -2756,6 +2756,7 @@ done
             worker_id: None,
             runtime: None,
             routing: None,
+            credential_source: None,
         };
         let request = BenchRunRequest {
             bench_root: dir.path(),

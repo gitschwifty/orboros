@@ -54,39 +54,13 @@ preserves a project's deliberate inheritance from global configuration. To
 regenerate the complete packaged template, use `config init --force` only after
 reviewing or backing up the current file.
 
-Never put provider credentials in TOML. For a worker-spawning command,
-Orboros resolves credentials in this order:
-
-1. An explicitly supplied process environment variable, such as
-   `OPENROUTER_API_KEY`. This remains the recommended CI and launch-wrapper
-   mechanism.
-2. On macOS, the current user's Keychain item for OpenRouter, using generic
-   password service `orboros.openrouter` and account `$USER`.
-3. The user-local fallback `~/.orboros/credentials.env`, only when it is a
-   regular non-symlink file with owner-only permissions (`chmod 600`).
-
-Automatic `.env` discovery in the current directory or an ancestor is not
-used. This avoids accidentally inheriting a credential from a repository or
-parent directory.
-
-To use the macOS fallback, add a generic password item in **Keychain Access**
-with service/name `orboros.openrouter`, account equal to your macOS username,
-and the OpenRouter API key as its password. Orboros reads it only when
-`OPENROUTER_API_KEY` is absent. It never prints the value.
-
-For a headless local fallback, create the file explicitly:
-
-```bash
-mkdir -p ~/.orboros
-chmod 700 ~/.orboros
-${EDITOR:-vi} ~/.orboros/credentials.env
-chmod 600 ~/.orboros/credentials.env
-```
-
-Use one `NAME=VALUE` line per provider, for example
-`OPENROUTER_API_KEY=...`. The file is user-local; do not place it in a project
-directory or commit it. Linux keyring integration is tracked separately; the
-environment and permission-checked file mechanisms remain portable.
+Never put provider credentials in Orboros TOML. Heddle owns all router
+credential resolution for worker processes, including environment variables,
+its Keychain references, and Heddle-local configuration. Orboros does not read
+credentials or preflight provider access. Heddle may request Keychain access
+only when a real worker initializes; normal tests use mock workers, and live
+Heddle tests are opt-in through `HEDDLE_BINARY`. A missing credential is
+reported by Heddle during worker initialization.
 
 ## External prompt sets
 
@@ -234,6 +208,37 @@ allowed_tools = ["read_file", "write_file", "edit_file", "glob", "grep", "bash"]
 allowed_tools = ["read_file", "glob", "grep", "web_fetch", "write_file"]
 ```
 
+To use a different Heddle router for selected models, keep the upstream model
+vendor and router separate, then map the router to its credential reference:
+
+```toml
+[models.options.straitly_planner]
+model = "anthropic/claude-sonnet-4"
+provider = "anthropic"
+router = "straitly"
+
+[models.coordinators]
+decompose = "straitly_planner"
+
+[models.phases]
+decomposing = "straitly_planner"
+refining = "straitly_planner"
+
+[heddle]
+config_path = "/Users/me/.config/heddle/config.toml"
+
+[heddle.routers.straitly]
+credential_source = "keychain:orboros/straitly"
+```
+
+An omitted catalog-option `router` continues to default to `openrouter`; the
+fallback `config_path` is used unless an `openrouter` entry is also supplied.
+Each router entry may set a `credential_source` such as
+`keychain:orboros/openrouter` or `environment`. Orboros forwards the
+non-secret reference only. A `keychain:` reference is sent to Heddle as
+`{ "source": "keychain", "reference": "..." }`; `environment` selects
+Heddle's inherited-environment source.
+
 Omit any optional section or field to inherit the lower-precedence value.
 
 ## Main fields
@@ -337,9 +342,13 @@ packaged template defines `read_only`, `research`, `test`, `edit`, and
   `stop_on_model_complete` honors a worker's explicit `"complete": true`
   response after applying that round's edits.
 - `[heddle]`: `config_path` is an optional Heddle headless configuration file
-  passed as `runtime.config_path` on worker initialization. The normal layered
-  config merge applies, so a project setting overrides a global setting. Use
-  an absolute path because workers may run from different worktrees.
+  passed as `runtime.config_path` on every worker initialization.
+  `[heddle.routers.<router>]` maps a model option's `router` to an optional
+  non-secret `credential_source`. The selected model's router is forwarded as
+  Heddle routing metadata, so one Heddle configuration can serve every router.
+  The normal layered config merge applies, so a project setting overrides a
+  global setting. Use an absolute path because workers may run from different
+  worktrees.
 
 ### Worker evidence
 

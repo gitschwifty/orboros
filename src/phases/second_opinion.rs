@@ -10,6 +10,7 @@
 //! human decision. This module's reviewer is an automated agent.
 
 use std::fmt::Write as _;
+use std::time::Instant;
 
 use chrono::Utc;
 use orbs::orb::Orb;
@@ -25,6 +26,8 @@ pub const REFINEMENT_REVIEWER_SYSTEM_PROMPT: &str = "You are an independent spec
 /// Errors from the reviewer worker.
 #[derive(Debug, thiserror::Error)]
 pub enum ReviewerError {
+    #[error("could not resolve reviewer model: {0}")]
+    ModelResolution(String),
     #[error("orb has no result to review (orb={orb_id})")]
     NoResult { orb_id: String },
     #[error("worker spawn failed: {0}")]
@@ -184,40 +187,7 @@ pub async fn run_reviewer(
     wc.system_prompt = system;
     wc.max_iterations = Some(1);
 
-    let mut worker = Worker::spawn(&wc)
-        .await
-        .map_err(|e| ReviewerError::WorkerSpawn(e.to_string()))?;
-    let outcome = worker
-        .send(&format!("review-{}", orb.id), &user)
-        .await
-        .map_err(|e| ReviewerError::WorkerSend(e.to_string()))?;
-    let _ = worker.shutdown().await;
-
-    let body = outcome.response.as_deref().unwrap_or("").trim();
-    if body.is_empty() {
-        return Err(ReviewerError::EmptyResponse);
-    }
-    let verdict = parse_verdict(body)?;
-    let critique = extract_critique(body).unwrap_or_default();
-    let suggested_changes = extract_suggested_changes(body);
-
-    info!(
-        verdict = ?short_verdict(&verdict),
-        critique_len = critique.len(),
-        "second-opinion reviewer produced verdict"
-    );
-    if verdict.is_accept() && !critique.is_empty() {
-        warn!("reviewer accepted but also provided a critique; using verdict");
-    }
-
-    Ok(ReviewReport {
-        verdict,
-        critique,
-        suggested_changes,
-        reviewer_model: model,
-        reviewed_at: Utc::now(),
-        reviewer_orb_id: None,
-    })
+    run_reviewer_with_config(orb, model, wc, user).await
 }
 
 /// Runs the mandatory post-refinement quality reviewer. Unlike the completion
@@ -225,7 +195,7 @@ pub async fn run_reviewer(
 /// child work can be released.
 pub async fn run_refinement_reviewer(
     orb: &Orb,
-    cfg: &SecondOpinionConfig,
+    model_config: &crate::config::OrbConfig,
     base_worker_config: &WorkerConfig,
     system_prompt: &str,
 ) -> Result<ReviewReport, ReviewerError> {
@@ -240,29 +210,34 @@ pub async fn run_refinement_reviewer(
     if let Some(criteria) = &orb.acceptance_criteria {
         let _ = write!(user, "\nAcceptance criteria:\n{criteria}\n");
     }
-    run_reviewer_with_prompts(orb, cfg, base_worker_config, system, user).await
+    let resolved = model_config
+        .model_resolver()
+        .resolve(crate::config::ModelRole::Reviewer)
+        .map_err(|error| ReviewerError::ModelResolution(error.to_string()))?;
+    let mut worker_config = base_worker_config.clone();
+    crate::worker::dispatcher::apply_resolved_model(&mut worker_config, model_config, &resolved);
+    worker_config.system_prompt = system;
+    worker_config.max_iterations = Some(1);
+    tracing::info!(
+        orb = %orb.id,
+        model = %resolved.model,
+        router = resolved.router.as_deref().unwrap_or("default"),
+        "starting refinement quality review"
+    );
+    run_reviewer_with_config(orb, resolved.model, worker_config, user).await
 }
 
-async fn run_reviewer_with_prompts(
+async fn run_reviewer_with_config(
     orb: &Orb,
-    cfg: &SecondOpinionConfig,
-    base_worker_config: &WorkerConfig,
-    system: String,
+    model: String,
+    worker_config: WorkerConfig,
     user: String,
 ) -> Result<ReviewReport, ReviewerError> {
-    let model = cfg
-        .reviewer_model
-        .clone()
-        .unwrap_or_else(|| base_worker_config.model.clone());
-
-    let mut wc = base_worker_config.clone();
-    wc.model = model.clone();
-    wc.system_prompt = system;
-    wc.max_iterations = Some(1);
-
-    let mut worker = Worker::spawn(&wc)
+    let started = Instant::now();
+    let mut worker = Worker::spawn(&worker_config)
         .await
         .map_err(|e| ReviewerError::WorkerSpawn(e.to_string()))?;
+
     let outcome = worker
         .send(&format!("review-{}", orb.id), &user)
         .await
@@ -276,11 +251,21 @@ async fn run_reviewer_with_prompts(
     let verdict = parse_verdict(body)?;
     let critique = extract_critique(body).unwrap_or_default();
     let suggested_changes = extract_suggested_changes(body);
+    let usage = outcome.effective_usage();
 
     info!(
+        orb = %orb.id,
+        model = %model,
         verdict = ?short_verdict(&verdict),
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        tokens_in = %usage.as_ref().map_or_else(|| "none".to_owned(), |usage| usage.prompt_tokens.to_string()),
+        tokens_out = %usage.as_ref().map_or_else(|| "none".to_owned(), |usage| usage.completion_tokens.to_string()),
+        total_tokens = %usage.as_ref().map_or_else(|| "none".to_owned(), |usage| usage.total_tokens.to_string()),
+        cache_read_tokens = usage.as_ref().and_then(|usage| usage.cached_tokens).unwrap_or(0),
+        cache_write_tokens = usage.as_ref().and_then(|usage| usage.cache_write_tokens).unwrap_or(0),
+        cost_usd = %crate::execution::format_cost_usd(usage.as_ref().and_then(|usage| usage.cost_micros)),
         critique_len = critique.len(),
-        "second-opinion reviewer produced verdict"
+        "refinement quality review completed"
     );
     if verdict.is_accept() && !critique.is_empty() {
         warn!("reviewer accepted but also provided a critique; using verdict");

@@ -700,9 +700,10 @@ fn require_binary(worker_binary: Option<&str>) -> anyhow::Result<&str> {
     })
 }
 
-/// Combined entry point used by every worker-spawning command. Resolves
-/// the worker binary (errors if unset), then runs `validate_worker_prereqs`
-/// unless `skip_prereq_check` is true.
+/// Combined entry point used by every worker-spawning command. Resolves and
+/// validates the worker binary and model shape unless `skip_prereq_check` is
+/// true. Heddle owns all credential resolution and reports its own router
+/// configuration errors during initialization.
 ///
 /// Returns the resolved binary path for the caller to keep using.
 fn prereq_check(
@@ -713,14 +714,14 @@ fn prereq_check(
 ) -> anyhow::Result<String> {
     let binary = require_binary(worker_binary)?;
     if skip {
-        tracing::warn!("--skip-prereq-check set; trusting caller for binary/model/credentials");
+        tracing::warn!("--skip-prereq-check set; trusting caller for binary/model validation");
         return Ok(binary.to_string());
     }
     orboros::startup_check::validate_worker_prereqs(&orboros::startup_check::PrereqCheck {
         worker_binary: binary,
         model,
         router,
-        require_credentials: true,
+        require_credentials: false,
     })?;
     Ok(orboros::startup_check::resolve_binary(binary)?
         .display()
@@ -743,18 +744,23 @@ fn resolved_worker_config(
         skip_prereq_check,
     )?;
     Ok((
-        make_worker_config(&binary, &resolved_model.model, ""),
+        make_worker_config(&binary, &resolved_model, &resolver.config, ""),
         resolver.config,
     ))
 }
 
-fn make_worker_config(binary: &str, model: &str, system_prompt: &str) -> WorkerConfig {
-    WorkerConfig {
+fn make_worker_config(
+    binary: &str,
+    model: &config::ResolvedModel,
+    config: &config::OrbConfig,
+    system_prompt: &str,
+) -> WorkerConfig {
+    let mut worker = WorkerConfig {
         command: binary.into(),
         args: vec![],
         cwd: None,
         env: vec![],
-        model: model.into(),
+        model: model.model.clone(),
         system_prompt: system_prompt.into(),
         tools: builtin_tools("execute")
             .iter()
@@ -768,7 +774,10 @@ fn make_worker_config(binary: &str, model: &str, system_prompt: &str) -> WorkerC
         worker_id: None,
         runtime: None,
         routing: None,
-    }
+        credential_source: None,
+    };
+    orboros::worker::dispatcher::apply_resolved_model(&mut worker, config, model);
+    worker
 }
 
 #[allow(
@@ -778,11 +787,6 @@ fn make_worker_config(binary: &str, model: &str, system_prompt: &str) -> WorkerC
 )]
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let credential_sources = if command_may_spawn_worker(&cli.command) {
-        orboros::credentials::load_process_credentials()?
-    } else {
-        Vec::new()
-    };
     if let Some(config_path) = &cli.config {
         std::env::set_var("ORBOROS_CONFIG_PATH", config_path);
     }
@@ -882,7 +886,6 @@ fn main() -> anyhow::Result<()> {
                 .with_filter(file_filter),
         )
         .init();
-    orboros::credentials::log_credential_sources(&credential_sources);
     std::fs::create_dir_all(&state_dir)?;
 
     // Standalone state has no daemon to serialize whole CLI operations. Hold
@@ -1195,24 +1198,6 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-fn command_may_spawn_worker(command: &Commands) -> bool {
-    matches!(
-        command,
-        Commands::Run { queue: false, .. }
-            | Commands::Execute { .. }
-            | Commands::Chat { .. }
-            | Commands::Daemon {
-                stop: false,
-                status: false,
-                ..
-            }
-            | Commands::Bench {
-                action: BenchAction::Run { .. },
-                ..
-            }
-    )
-}
-
 fn apply_daemon_settings(
     daemon_config: &mut DaemonConfig,
     settings: &config::DaemonSettingsConfig,
@@ -1313,8 +1298,8 @@ fn cmd_bench(
                 resolved_model.router.as_deref(),
                 skip_prereq_check,
             )?;
-            let worker_config = make_worker_config(&binary, &resolved_model.model, "");
-            let grader_worker_config = make_worker_config(&binary, &resolved_grader.model, "");
+            let worker_config = make_worker_config(&binary, &resolved_model, &cfg, "");
+            let grader_worker_config = make_worker_config(&binary, &resolved_grader, &cfg, "");
             // A benchmark model selection is a single-model baseline. Pin
             // every queue-dispatched role as well as the direct worker and
             // grader, rather than allowing project role mappings to override

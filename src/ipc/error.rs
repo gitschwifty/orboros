@@ -29,6 +29,31 @@ pub enum IpcError {
     #[error("protocol version mismatch: expected {expected}, got {actual}")]
     ProtocolVersionMismatch { expected: String, actual: String },
 
+    /// The worker rejected the initialization request with a structured
+    /// protocol error. Unlike an unexpected response, this is a useful
+    /// configuration/runtime failure reported by the worker itself.
+    #[error("worker rejected init ({code}): {message}")]
+    InitRejected {
+        code: String,
+        message: String,
+        retryable: bool,
+    },
+
     #[error("unexpected response type: expected {expected}, got {actual}")]
     UnexpectedResponse { expected: String, actual: String },
+}
+
+impl IpcError {
+    /// Whether a failure during worker spawn shows that the headless IPC
+    /// contract is unusable. Retrying an orb cannot repair this class of
+    /// failure, so the supervising daemon must stop for operator attention.
+    #[must_use]
+    pub const fn is_fatal_init_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::InitRejected { .. }
+                | Self::ProtocolVersionMismatch { .. }
+                | Self::UnexpectedResponse { .. }
+        )
+    }
 }

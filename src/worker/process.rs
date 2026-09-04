@@ -14,9 +14,9 @@ use tracing::{debug, instrument, warn};
 use crate::ipc::error::IpcError;
 use crate::ipc::transport::{read_response, write_request};
 use crate::ipc::types::{
-    AppAttribution, EffectiveRuntimeMetadata, ErrorEnvelope, FailureDetails, InitConfig,
-    IpcRequest, IpcResponse, ResultStatus, RoutingMetadata, RuntimePlacementConfig, WorkerEvent,
-    PROTOCOL_VERSION,
+    AppAttribution, EffectiveRuntimeMetadata, ErrorEnvelope, FailureDetails,
+    HeadlessCredentialSource, InitConfig, IpcRequest, IpcResponse, ResultStatus, RoutingMetadata,
+    RuntimePlacementConfig, WorkerEvent, PROTOCOL_VERSION,
 };
 
 /// Configuration for spawning a worker process.
@@ -52,6 +52,9 @@ pub struct WorkerConfig {
     pub runtime: Option<RuntimePlacementConfig>,
     /// Optional provider-routing metadata for this worker.
     pub routing: Option<RoutingMetadata>,
+    /// Optional non-secret reference that Heddle resolves for this worker's
+    /// selected router.
+    pub credential_source: Option<HeadlessCredentialSource>,
 }
 
 /// Runtime guidance appended to every Heddle system prompt.
@@ -126,6 +129,41 @@ pub struct SendOutcome {
     pub failure: Option<FailureDetails>,
 }
 
+impl SendOutcome {
+    /// Returns final usage when supplied, otherwise the last streamed usage
+    /// event. Some compatible headless workers report accounting only while
+    /// streaming even though the send itself completed normally.
+    #[must_use]
+    pub fn effective_usage(&self) -> Option<crate::ipc::types::Usage> {
+        self.usage.clone().or_else(|| {
+            self.events.iter().rev().find_map(|event| match event {
+                WorkerEvent::Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    cost_micros,
+                    cost_currency,
+                    cached_tokens,
+                    cache_write_tokens,
+                    reasoning_tokens,
+                    generation_id,
+                } => Some(crate::ipc::types::Usage {
+                    prompt_tokens: *prompt_tokens,
+                    completion_tokens: *completion_tokens,
+                    total_tokens: *total_tokens,
+                    cost_micros: *cost_micros,
+                    cost_currency: cost_currency.clone(),
+                    cached_tokens: *cached_tokens,
+                    cache_write_tokens: *cache_write_tokens,
+                    reasoning_tokens: *reasoning_tokens,
+                    generation_id: generation_id.clone(),
+                }),
+                _ => None,
+            })
+        })
+    }
+}
+
 /// Handle for sending a cancel request to a running worker.
 /// Clone-able so it can be held by timeout/budget watchers.
 #[derive(Clone)]
@@ -186,6 +224,14 @@ impl Worker {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
+        // The supervisor handles Ctrl-C as a graceful admission barrier. Put
+        // the worker in its own process group so the terminal's SIGINT reaches
+        // Orboros, not an in-flight Heddle worker that is meant to drain.
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
+
         if let Some(cwd) = &config.cwd {
             cmd.current_dir(cwd);
         }
@@ -214,12 +260,20 @@ impl Worker {
             routing: None,
         };
 
-        if let Some(dur) = config.init_timeout {
+        let init_result = if let Some(dur) = config.init_timeout {
             tokio::time::timeout(dur, worker.init(config))
                 .await
-                .map_err(|_| IpcError::InitTimeout(dur))??;
+                .map_err(|_| IpcError::InitTimeout(dur))?
         } else {
-            worker.init(config).await?;
+            worker.init(config).await
+        };
+        if let Err(error) = init_result {
+            // A worker may send a structured rejection yet remain alive (for
+            // example after a bad credential). Do not leave that process
+            // behind merely because the init handshake failed.
+            let _ = worker.child.kill().await;
+            let _ = worker.child.wait().await;
+            return Err(error);
         }
         debug!("worker ready");
         Ok(worker)
@@ -248,6 +302,11 @@ impl Worker {
                     title: "Orboros".into(),
                     categories: Some("cli-agent".into()),
                 }),
+                credential_source: config.credential_source.clone(),
+                router: config
+                    .routing
+                    .as_ref()
+                    .and_then(|routing| routing.gateway.clone()),
                 runtime: config.runtime.clone(),
                 routing: config.routing.clone(),
             },
@@ -271,11 +330,8 @@ impl Worker {
                 routing,
                 ..
             } => {
-                if let Some(ref envelope) = error {
-                    return Err(IpcError::UnexpectedResponse {
-                        expected: "init_ok without error".into(),
-                        actual: envelope.message.clone(),
-                    });
+                if let Some(envelope) = error {
+                    return Err(Self::init_rejected(envelope));
                 }
                 if let Some(version) = &protocol_version {
                     if !protocol_versions_compatible(PROTOCOL_VERSION, version) {
@@ -301,14 +357,25 @@ impl Worker {
                 status: ResultStatus::Error,
                 error,
                 ..
-            } => Err(IpcError::UnexpectedResponse {
-                expected: "init_ok".into(),
-                actual: error.map_or_else(|| "unknown error during init".into(), |e| e.message),
-            }),
+            } => Err(error.map_or_else(
+                || IpcError::UnexpectedResponse {
+                    expected: "init_ok".into(),
+                    actual: "unknown error during init".into(),
+                },
+                Self::init_rejected,
+            )),
             other => Err(IpcError::UnexpectedResponse {
                 expected: "init_ok".into(),
                 actual: format!("{other:?}"),
             }),
+        }
+    }
+
+    fn init_rejected(envelope: ErrorEnvelope) -> IpcError {
+        IpcError::InitRejected {
+            code: envelope.code,
+            message: envelope.message,
+            retryable: envelope.retryable,
         }
     }
 
@@ -846,6 +913,7 @@ mod tests {
             worker_id: None,
             runtime: None,
             routing: None,
+            credential_source: None,
         }
     }
 
@@ -884,6 +952,7 @@ mod tests {
             worker_id: None,
             runtime: None,
             routing: None,
+            credential_source: None,
         }
     }
 
@@ -917,6 +986,7 @@ mod tests {
             worker_id: None,
             runtime: None,
             routing: None,
+            credential_source: None,
         }
     }
 
@@ -941,6 +1011,7 @@ mod tests {
             worker_id: None,
             runtime: None,
             routing: None,
+            credential_source: None,
         }
     }
 
@@ -948,6 +1019,21 @@ mod tests {
     async fn spawn_and_init_mock_worker() {
         let worker = Worker::spawn(&mock_worker_config()).await.unwrap();
         assert_eq!(worker.session_id(), "mock-sess-001");
+    }
+
+    #[test]
+    fn structured_init_rejection_is_fatal_and_keeps_worker_detail() {
+        let error = Worker::init_rejected(ErrorEnvelope {
+            code: "credential_required".into(),
+            message: "Straitly router credential is required".into(),
+            retryable: false,
+            details: None,
+        });
+        assert!(error.is_fatal_init_failure());
+        assert_eq!(
+            error.to_string(),
+            "worker rejected init (credential_required): Straitly router credential is required"
+        );
     }
 
     #[tokio::test]
@@ -1010,6 +1096,7 @@ mod tests {
             worker_id: None,
             runtime: None,
             routing: None,
+            credential_source: None,
         };
 
         let worker = Worker::spawn(&config).await.unwrap();
@@ -1040,6 +1127,7 @@ mod tests {
             worker_id: None,
             runtime: None,
             routing: None,
+            credential_source: None,
         };
 
         let mut worker = Worker::spawn(&config).await.unwrap();
@@ -1097,6 +1185,7 @@ mod tests {
             worker_id: None,
             runtime: None,
             routing: None,
+            credential_source: None,
         };
 
         let mut worker = Worker::spawn(&config).await.unwrap();
@@ -1219,6 +1308,7 @@ mod tests {
             worker_id: None,
             runtime: None,
             routing: None,
+            credential_source: None,
         };
         let worker = Worker::spawn(&config).await.unwrap();
         // Very short grace period — should trigger kill

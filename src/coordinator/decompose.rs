@@ -109,8 +109,9 @@ async fn decompose_with_system_prompt(
         shutdown_timeout: worker_config.shutdown_timeout,
         task_id: None,
         worker_id: None,
-        runtime: None,
+        runtime: worker_config.runtime.clone(),
         routing: None,
+        credential_source: worker_config.credential_source.clone(),
     };
 
     info!("Spawning coordinator worker for task decomposition");

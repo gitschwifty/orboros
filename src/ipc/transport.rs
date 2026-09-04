@@ -56,6 +56,8 @@ mod tests {
                 task_id: None,
                 worker_id: None,
                 app_attribution: None,
+                credential_source: None,
+                router: None,
                 runtime: None,
                 routing: None,
             },

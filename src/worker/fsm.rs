@@ -40,6 +40,9 @@ impl From<&IpcError> for FailureClass {
             IpcError::UnexpectedResponse { expected, actual } => FailureClass::Protocol {
                 message: format!("expected {expected}, got {actual}"),
             },
+            IpcError::InitRejected { code, message, .. } => FailureClass::Protocol {
+                message: format!("init rejected ({code}): {message}"),
+            },
             IpcError::InitTimeout(_) => FailureClass::Timeout {
                 phase: TimeoutPhase::Init,
             },
@@ -348,6 +351,7 @@ mod tests {
             worker_id: None,
             runtime: None,
             routing: None,
+            credential_source: None,
         }
     }
 
@@ -368,6 +372,7 @@ mod tests {
             worker_id: None,
             runtime: None,
             routing: None,
+            credential_source: None,
         }
     }
 

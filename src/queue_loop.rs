@@ -971,7 +971,12 @@ impl QueueLoop {
             match joined {
                 Ok(Ok(true)) => completed = completed.saturating_add(1),
                 Ok(Ok(false)) => {} // dispatched but didn't end Done
-                Ok(Err(e)) => tracing::warn!(error = %e, "dispatch_one errored"),
+                Ok(Err(error)) => {
+                    self.stop();
+                    join_set.abort_all();
+                    while join_set.join_next().await.is_some() {}
+                    return Err(error);
+                }
                 Err(e) => tracing::warn!(error = %e, "dispatch task panicked"),
             }
         }
@@ -1591,9 +1596,11 @@ async fn dispatch_one_owned(
         .model_resolver()
         .resolve(target.model_role())
         .map_err(std::io::Error::other)?;
-    if resolved_model.source != "default_model" {
-        target_base_wc.model = resolved_model.model;
-    }
+    crate::worker::dispatcher::apply_resolved_model(
+        &mut target_base_wc,
+        model_config,
+        &resolved_model,
+    );
     target_base_wc.tools = crate::routing::profile::resolve_phase_tools(
         &model_config.tool_profiles,
         &base_wc.tools,
@@ -1895,7 +1902,7 @@ async fn dispatch_one_owned(
                     .await
                     .map_err(std::io::Error::other)?;
             };
-            tracing::info!(orb = %orb.id, refinement_round = round, max_refinement_rounds = max_rounds, "processing refinement round");
+            tracing::info!(orb = %orb.id, refinement_round = round, max_refinement_rounds = max_rounds, "applying refinement round candidate");
             let before = (
                 orb.description.clone(),
                 orb.design.clone(),
@@ -2007,7 +2014,7 @@ async fn dispatch_one_owned(
             .map_err(std::io::Error::other)?;
         match crate::phases::second_opinion::run_refinement_reviewer(
             &orb,
-            &model_config.second_opinion,
+            model_config,
             base_wc,
             &reviewer_prompt.system_prompt,
         )
@@ -2076,6 +2083,7 @@ async fn dispatch_one_owned(
                         orb = %orb.id,
                         quality_review_attempt,
                         max_quality_review_attempts = model_config.refinement.max_review_attempts,
+                        error = %error,
                         "refinement quality reviewer failed; scheduling fresh retry from the previous round"
                     );
                 } else {
@@ -2083,6 +2091,7 @@ async fn dispatch_one_owned(
                         orb = %orb.id,
                         quality_review_attempt,
                         max_quality_review_attempts = model_config.refinement.max_review_attempts,
+                        error = %error,
                         "refinement quality-review retry budget exhausted after reviewer failure; holding for human review"
                     );
                 }
@@ -2675,6 +2684,7 @@ mod tests {
                 inherit_ambient_config: None,
             }),
             routing: None,
+            credential_source: None,
         };
         configure_worker_runtime(&mut config, dir.path(), "orb-a", "execute", 2).unwrap();
         let runtime = config.runtime.unwrap();
@@ -2756,6 +2766,7 @@ mod tests {
             worker_id: None,
             runtime: None,
             routing: None,
+            credential_source: None,
         };
 
         let result = ql
@@ -3139,6 +3150,7 @@ mod tests {
             worker_id: None,
             runtime: None,
             routing: None,
+            credential_source: None,
         };
 
         assert_eq!(ql.dispatch_ready_orbs(&worker, 1).await.unwrap(), 0);
@@ -3193,6 +3205,7 @@ done
             worker_id: None,
             runtime: None,
             routing: None,
+            credential_source: None,
         };
 
         assert_eq!(ql.dispatch_ready_orbs(&worker, 1).await.unwrap(), 1);
@@ -3243,6 +3256,7 @@ done"#,
             worker_id: None,
             runtime: None,
             routing: None,
+            credential_source: None,
         };
         assert_eq!(ql.dispatch_ready_orbs(&worker, 1).await.unwrap(), 1);
         let parent = orb_store.load_by_id(&feature.id).unwrap().unwrap();
@@ -3305,6 +3319,7 @@ done"#,
             worker_id: None,
             runtime: None,
             routing: None,
+            credential_source: None,
         };
 
         assert_eq!(ql.dispatch_ready_orbs(&worker, 1).await.unwrap(), 1);

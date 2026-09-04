@@ -44,6 +44,14 @@ pub struct InitConfig {
     pub worker_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_attribution: Option<AppAttribution>,
+    /// A non-secret Heddle credential reference selected by the configured
+    /// router. Heddle resolves it and never returns its value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_source: Option<HeadlessCredentialSource>,
+    /// Heddle router/client selected for this worker. Unlike `routing`, this
+    /// is an execution setting rather than request metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimePlacementConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,6 +64,14 @@ pub struct AppAttribution {
     pub title: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub categories: Option<String>,
+}
+
+/// Source selection for a non-secret credential Heddle resolves.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum HeadlessCredentialSource {
+    Environment,
+    Keychain { reference: String },
 }
 
 /// Requested placement for Heddle's per-worker runtime files.
@@ -498,11 +514,19 @@ mod tests {
                     title: "Orboros".into(),
                     categories: Some("cli-agent".into()),
                 }),
+                credential_source: Some(HeadlessCredentialSource::Keychain {
+                    reference: "keychain:orboros/straitly".into(),
+                }),
+                router: Some("straitly".into()),
                 runtime: None,
                 routing: None,
             },
         };
         let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(
+            r#""credential_source":{"source":"keychain","reference":"keychain:orboros/straitly"}"#
+        ));
+        assert!(json.contains(r#""router":"straitly""#));
         let parsed: IpcRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(req, parsed);
     }

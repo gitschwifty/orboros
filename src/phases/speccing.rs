@@ -375,6 +375,7 @@ mod tests {
             worker_id: None,
             runtime: None,
             routing: None,
+            credential_source: None,
         }
     }
 

@@ -34,6 +34,7 @@ fn mock_worker_config() -> WorkerConfig {
         worker_id: None,
         runtime: None,
         routing: None,
+        credential_source: None,
     }
 }
 

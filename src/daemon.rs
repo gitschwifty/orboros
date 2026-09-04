@@ -317,7 +317,7 @@ fn project_run_aggregate(
 async fn tick_project(
     project: SupervisedProject,
     global_semaphore: Option<std::sync::Arc<tokio::sync::Semaphore>>,
-) {
+) -> Result<()> {
     let project_name = project.name.as_str();
     let project_root = project
         .project_root
@@ -337,8 +337,7 @@ async fn tick_project(
         ),
         Ok(_) => {}
         Err(error) => {
-            tracing::error!(project = project_name, %error, "project tick failed; continuing");
-            return;
+            return Err(error).with_context(|| format!("project {project_name} tick failed"));
         }
     }
 
@@ -361,34 +360,45 @@ async fn tick_project(
                 "workers completed this tick"
             ),
             Err(error) => {
-                tracing::error!(project = project_name, %error, "project dispatch failed; continuing");
+                project.queue.stop();
+                return Err(error)
+                    .with_context(|| format!("project {project_name} dispatch failed"));
             }
         }
     }
     project.queue.fire_on_queue_tick().await;
+    Ok(())
 }
 
 /// Run exactly one isolated tick for every supplied project.  This is kept
 /// public for operator tooling and lets tests exercise supervisor behavior
 /// without waiting for signals or a timer.
 pub async fn tick_supervised_projects(projects: &[SupervisedProject]) {
-    tick_supervised_projects_with_global(projects, None).await;
+    if let Err(error) = tick_supervised_projects_with_global(projects, None).await {
+        tracing::error!(%error, "supervised project tick failed");
+    }
 }
 
 async fn tick_supervised_projects_with_global(
     projects: &[SupervisedProject],
     global_semaphore: Option<std::sync::Arc<tokio::sync::Semaphore>>,
-) {
+) -> Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
     for project in projects.iter().cloned() {
         let global_semaphore = global_semaphore.clone();
         tasks.spawn(async move { tick_project(project, global_semaphore).await });
     }
+    let mut first_error = None;
     while let Some(result) = tasks.join_next().await {
-        if let Err(error) = result {
-            tracing::error!(%error, "supervised project tick panicked");
+        match result {
+            Ok(Err(error)) if first_error.is_none() => first_error = Some(error),
+            Err(error) if first_error.is_none() => {
+                first_error = Some(anyhow::anyhow!("supervised project tick panicked: {error}"));
+            }
+            Ok(Ok(()) | Err(_)) | Err(_) => {}
         }
     }
+    first_error.map_or(Ok(()), Err)
 }
 
 /// Run a single PID-managed daemon which supervises multiple project queues.
@@ -415,6 +425,22 @@ pub async fn run_supervisor_with_control_socket(
         "supervisor daemon started"
     );
     let mut shutdown_rx = setup_signal_handlers();
+    // Stop dispatch admission as soon as the signal task publishes shutdown,
+    // rather than waiting for the supervisor loop to win its next select.
+    // This closes the small window where a worker exits while Ctrl-C is being
+    // handled and the dispatcher would otherwise start its fresh-worker retry.
+    let mut admission_shutdown_rx = shutdown_rx.clone();
+    let admission_queues: Vec<_> = projects
+        .iter()
+        .map(|project| project.queue.clone())
+        .collect();
+    let admission_stop_task = tokio::spawn(async move {
+        if admission_shutdown_rx.changed().await.is_ok() && *admission_shutdown_rx.borrow() {
+            for queue in admission_queues {
+                queue.stop();
+            }
+        }
+    });
     let run_started_at = chrono::Utc::now();
     let run_id = uuid::Uuid::new_v4().to_string();
     for project in &projects {
@@ -468,11 +494,17 @@ pub async fn run_supervisor_with_control_socket(
                             // prevents still-queued work from starting; work
                             // that already holds a permit finishes and writes
                             // its normal outcome before we exit.
-                            (&mut tick).await;
+                            let _ = (&mut tick).await;
                             break 'supervisor;
                         }
                     }
-                    () = &mut tick => {}
+                    result = &mut tick => {
+                        if let Err(error) = result {
+                            tracing::error!(%error, "fatal headless IPC failure; stopping supervisor");
+                            for project in &projects { project.queue.stop(); }
+                            break 'supervisor;
+                        }
+                    }
                 }
                 if let Some(supervisor) = &control_supervisor {
                     let (queues, dispatch) = supervisor.lock().await.take_attached_queues();
@@ -486,7 +518,12 @@ pub async fn run_supervisor_with_control_socket(
                             telemetry: None,
                         })
                     }).collect();
-                    tick_supervised_projects_with_global(&attached, global_semaphore.clone()).await;
+                    if let Err(error) = tick_supervised_projects_with_global(&attached, global_semaphore.clone()).await {
+                        tracing::error!(%error, "fatal headless IPC failure in attached project; stopping supervisor");
+                        for project in &projects { project.queue.stop(); }
+                        supervisor.lock().await.restore_attached_queues(queues, dispatch);
+                        break 'supervisor;
+                    }
                     supervisor.lock().await.restore_attached_queues(queues, dispatch);
                 }
             }
@@ -498,6 +535,7 @@ pub async fn run_supervisor_with_control_socket(
     if let Some(server) = control_server {
         server.abort();
     }
+    admission_stop_task.abort();
     summary_task.abort();
     for project in &projects {
         if let Some(telemetry) = &project.telemetry {
@@ -537,6 +575,13 @@ pub async fn run_daemon(
 
     // Set up signal handlers
     let mut shutdown_rx = setup_signal_handlers();
+    let mut admission_shutdown_rx = shutdown_rx.clone();
+    let admission_queue = queue.clone();
+    let admission_stop_task = tokio::spawn(async move {
+        if admission_shutdown_rx.changed().await.is_ok() && *admission_shutdown_rx.borrow() {
+            admission_queue.stop();
+        }
+    });
 
     // Run the queue loop with periodic log rotation
     let tick_interval = std::time::Duration::from_millis(config.tick_interval_ms);
@@ -588,7 +633,8 @@ pub async fn run_daemon(
                             tracing::debug!(dispatched = n, "workers completed this tick");
                         }
                         Err(e) => {
-                            tracing::error!("dispatch_ready_orbs failed: {e}");
+                            tracing::error!("fatal worker dispatch failure; stopping daemon: {e}");
+                            queue.stop();
                         }
                     }
                 }
@@ -609,6 +655,7 @@ pub async fn run_daemon(
     if let Err(e) = remove_pid_file(&config) {
         tracing::warn!("failed to remove PID file: {e}");
     }
+    admission_stop_task.abort();
     tracing::info!("daemon stopped");
 
     Ok(())

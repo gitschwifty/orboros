@@ -181,6 +181,42 @@ pub struct HeddleSettingsConfig {
     /// Absolute path recommended: it is interpreted by the Heddle process,
     /// whose working directory may be the assigned project worktree.
     pub config_path: Option<String>,
+    /// Router-specific settings containing the non-secret credential reference
+    /// Heddle resolves for each dispatched worker.
+    pub routers: BTreeMap<String, HeddleRouterConfig>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct HeddleRouterConfig {
+    /// A non-secret reference resolved by Heddle, e.g.
+    /// `keychain:orboros/straitly` or `environment`.
+    pub credential_source: Option<String>,
+}
+
+impl HeddleSettingsConfig {
+    /// Returns the project-wide Heddle configuration. The router is selected
+    /// per init request through routing metadata, not by replacing the Heddle
+    /// configuration file.
+    #[must_use]
+    pub fn config_path_for_router(&self, _router: Option<&str>) -> Option<String> {
+        self.config_path.clone()
+    }
+
+    #[must_use]
+    pub fn credential_source_for_router(
+        &self,
+        router: Option<&str>,
+    ) -> Option<crate::ipc::types::HeadlessCredentialSource> {
+        let reference = router
+            .and_then(|router| self.routers.get(router))
+            .and_then(|router| router.credential_source.clone())?;
+        Some(if reference == "environment" {
+            crate::ipc::types::HeadlessCredentialSource::Environment
+        } else {
+            crate::ipc::types::HeadlessCredentialSource::Keychain { reference }
+        })
+    }
 }
 
 /// Policy for repeated structured Refining phase dispatches. The default is
@@ -2213,6 +2249,7 @@ system = "project speccing"
             workers: WorkerSettingsConfig { retries: -1 },
             heddle: HeddleSettingsConfig {
                 config_path: Some("/tmp/heddle.toml".into()),
+                routers: BTreeMap::new(),
             },
             refinement: RefinementSettingsConfig {
                 max_rounds: 3,
