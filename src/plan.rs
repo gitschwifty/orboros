@@ -13,7 +13,7 @@ use crate::phases::decompose::{apply_decomposition, decompose_orb, snapshot_deco
 /// Configuration for the plan pipeline.
 #[derive(Debug, Clone, Default)]
 pub struct PlanConfig {
-    /// If true, only run shallow decomposition (no refinement).
+    /// If true, persist decomposition and stop in Decomposing before refinement.
     pub shallow: bool,
     /// If set, read the task description from this file.
     pub file: Option<PathBuf>,
@@ -82,21 +82,13 @@ pub fn build_shared_plan(
         children.push(child);
     }
     if shallow {
-        // `--shallow` is an explicit operator choice to accept the local,
-        // line-based scaffold without a refinement worker or review gate. The
-        // normal queue may now schedule its child tasks.
-        epic.set_phase(OrbPhase::Refining)
-            .map_err(|e| anyhow::anyhow!("refining transition rejected: {e}"))?;
-        epic.set_phase(OrbPhase::Review)
-            .map_err(|e| anyhow::anyhow!("review transition rejected: {e}"))?;
-        epic.set_phase(OrbPhase::Waiting)
-            .map_err(|e| anyhow::anyhow!("waiting transition rejected: {e}"))?;
-    } else {
-        // A normal plan has only constructed a local child scaffold. Refining
-        // is deliberately left queued for a worker; it has not completed.
-        epic.set_phase(OrbPhase::Refining)
-            .map_err(|e| anyhow::anyhow!("refining transition rejected: {e}"))?;
+        return Ok((epic, children, edges));
     }
+
+    // A normal plan has only constructed a local child scaffold. Refining
+    // is deliberately left queued for a worker; it has not completed.
+    epic.set_phase(OrbPhase::Refining)
+        .map_err(|e| anyhow::anyhow!("refining transition rejected: {e}"))?;
     Ok((epic, children, edges))
 }
 
@@ -139,7 +131,7 @@ pub fn print_plan_summary(
 ) {
     print_plan_tree(store, dep_store, epic);
     let mode = if shallow {
-        "shallow scaffold (refinement skipped by --shallow)"
+        "shallow scaffold (stopped before refinement; planning may resume on execution)"
     } else {
         "normal scaffold (refinement queued)"
     };
@@ -256,7 +248,8 @@ pub fn parse_plan_text(content: &str) -> anyhow::Result<(String, String)> {
 /// 4. Runs shallow decomposition (stub: splits description lines into subtasks)
 /// 5. Persists children and dep edges to the pipeline store
 /// 6. Takes a decomposition snapshot
-/// 7. Returns the epic orb
+/// 7. Queues refinement unless shallow; shallow plans remain in Decomposing
+/// 8. Returns the epic orb
 ///
 /// # Errors
 ///
@@ -300,17 +293,14 @@ pub fn create_plan(
     // Snapshot the decomposition state
     snapshot_decomposition(&pipeline)?;
 
-    // Normal plans queue a refinement worker. Shallow plans intentionally
-    // accept the locally scaffolded child graph and release the children
-    // without a refinement worker or review gate.
+    // Decomposing is the last reached phase for shallow plans. Waiting requires
+    // review, so advancing there would claim work that has not happened.
+    if config.shallow {
+        return Ok((epic, pipeline));
+    }
+
     epic.set_phase(OrbPhase::Refining)
         .map_err(|e| anyhow::anyhow!("refining transition rejected: {e}"))?;
-    if config.shallow {
-        epic.set_phase(OrbPhase::Review)
-            .map_err(|e| anyhow::anyhow!("review transition rejected: {e}"))?;
-        epic.set_phase(OrbPhase::Waiting)
-            .map_err(|e| anyhow::anyhow!("waiting transition rejected: {e}"))?;
-    }
     store
         .update(&epic)
         .map_err(|e| anyhow::anyhow!("failed to update epic phase: {e}"))?;
@@ -464,10 +454,10 @@ mod tests {
     }
 
     #[test]
-    fn shared_shallow_plan_skips_refinement_and_releases_children() {
+    fn shared_shallow_plan_stops_before_refinement() {
         let (epic, children, edges) = build_shared_plan("Feature", "First\nSecond", true).unwrap();
 
-        assert_eq!(epic.phase, Some(OrbPhase::Waiting));
+        assert_eq!(epic.phase, Some(OrbPhase::Decomposing));
         assert_eq!(children.len(), 2);
         assert_eq!(
             edges
@@ -527,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn create_plan_shallow_skips_refinement_and_waits_for_children() {
+    fn create_plan_shallow_persists_decomposition_without_refinement() {
         let tmp = tmp_base_dir();
         let config = PlanConfig {
             shallow: true,
@@ -537,11 +527,98 @@ mod tests {
         let (epic, pipeline) =
             create_plan("Feature X", "Step one\nStep two", tmp.path(), &config).unwrap();
 
-        assert_eq!(epic.phase, Some(OrbPhase::Waiting));
+        assert_eq!(epic.phase, Some(OrbPhase::Decomposing));
+        assert_eq!(
+            pipeline
+                .orb_store()
+                .load_by_id(&epic.id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            Some(OrbPhase::Decomposing)
+        );
         assert_eq!(
             pipeline.orb_store().load_children(&epic.id).unwrap().len(),
             2
         );
+        assert!(pipeline.snapshots_dir().join("decomposition").exists());
+        assert!(!pipeline.snapshots_dir().join("refinement-1").exists());
+    }
+
+    #[test]
+    fn plan_modes_preserve_the_same_decomposition() {
+        let mut graphs = Vec::new();
+        for shallow in [false, true] {
+            let tmp = tmp_base_dir();
+            let config = PlanConfig {
+                shallow,
+                ..Default::default()
+            };
+            let (epic, pipeline) =
+                create_plan("Feature", " First\n\nSecond ", tmp.path(), &config).unwrap();
+            let store = pipeline.orb_store();
+            let deps = DepStore::new(pipeline.deps_path());
+            let snapshot = pipeline.snapshots_dir().join("decomposition");
+            let snapshot_store = OrbStore::new(snapshot.join("orbs.jsonl"));
+            let snapshot_deps = DepStore::new(snapshot.join("deps.jsonl"));
+            assert_eq!(
+                snapshot_store.load_by_id(&epic.id).unwrap().unwrap().phase,
+                Some(OrbPhase::Decomposing)
+            );
+            assert_eq!(snapshot_store.load_children(&epic.id).unwrap().len(), 2);
+            let edge_signature = |edges: Vec<DepEdge>| {
+                let mut signature: Vec<_> = edges
+                    .into_iter()
+                    .map(|edge| {
+                        (
+                            edge.from.as_str().replace(epic.id.as_str(), "epic"),
+                            edge.to.as_str().replace(epic.id.as_str(), "epic"),
+                            edge.edge_type,
+                        )
+                    })
+                    .collect();
+                signature.sort_by_key(|(from, to, edge_type)| {
+                    (from.clone(), to.clone(), format!("{edge_type:?}"))
+                });
+                signature
+            };
+            assert_eq!(
+                edge_signature(snapshot_deps.all_edges().unwrap()),
+                edge_signature(deps.all_edges().unwrap())
+            );
+            assert_eq!(epic.description, " First\n\nSecond ");
+
+            let mut children: Vec<_> = store
+                .load_children(&epic.id)
+                .unwrap()
+                .into_iter()
+                .map(|child| (child.title, child.description))
+                .collect();
+            children.sort();
+            let edges: Vec<_> = deps
+                .all_edges()
+                .unwrap()
+                .into_iter()
+                .map(|edge| {
+                    (
+                        edge.from.as_str().replace(epic.id.as_str(), "epic"),
+                        edge.to.as_str().replace(epic.id.as_str(), "epic"),
+                        edge.edge_type,
+                    )
+                })
+                .collect();
+            let mut edges = edges;
+            edges.sort_by_key(|(from, to, edge_type)| {
+                (from.clone(), to.clone(), format!("{edge_type:?}"))
+            });
+            assert_eq!(edges.len(), 5);
+            print_plan_status(&store, &deps, epic.id.as_str()).unwrap();
+            print_plan_status(&store, &deps, epic.id.as_str()).unwrap();
+            assert_eq!(store.load_all().unwrap().len(), 3);
+            assert_eq!(deps.all_edges().unwrap().len(), 5);
+            graphs.push((children, edges));
+        }
+        assert_eq!(graphs.first(), graphs.last());
     }
 
     #[test]

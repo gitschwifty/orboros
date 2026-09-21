@@ -98,9 +98,11 @@ orboros plan "API redesign" --shallow
 ```
 
 `plan` creates an epic plus a local, line-based child scaffold in the selected
-state store. A normal plan leaves refinement queued; `--shallow` explicitly
-skips refinement and releases the scaffolded children for execution. Neither
-mode runs a worker while creating the plan. The completion summary names the
+state store. A normal plan leaves refinement queued; `--shallow` stops after
+persisting the scaffold, leaving the epic in `Decomposing` without entering
+`Refining`, `Review`, or `Waiting`. Later queue/daemon execution can
+resume planning from that phase. Neither mode runs a worker while creating
+the plan. The completion summary names the
 state source and gives the next command. Inspect an existing plan with:
 
 ```bash
@@ -345,13 +347,19 @@ step; `review-queue` is read-only.
 ```bash
 orboros orb logs orb-k4f
 orboros orb logs orb-k4f --attempt 2
-orboros orb reset orb-k4f
+orboros orb reset orb-k4f --reason "fixed worker setup"
 orboros orb rollback-list orb-k4f
 orboros orb rollback orb-k4f --count 1
 ```
 
 `orb logs` lists every durable outer attempt and its Heddle transcript. Reset
 only a failed orb; it appends retryable state without deleting evidence.
+`orb reset <ID> [--reason <TEXT>]` clears stale outcomes and records the full
+failed snapshot, timestamp, operator intent, reason, and target state in
+`events.jsonl`. Tasks return to pending; phase orbs return to their evidenced
+failed worker phase. Ambiguous phase history is rejected, with no force override.
+Existing pipeline copies are synchronized. See
+[retrying failed orbs](getting-started.md#retry-a-failed-orb) for limitations.
 `rollback-list` shows append-only checkpoints, and `rollback` restores a prior
 snapshot while retaining the history that made recovery possible.
 
