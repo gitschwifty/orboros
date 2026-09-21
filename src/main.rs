@@ -106,7 +106,7 @@ enum Commands {
         /// Read the plan description from a markdown file.
         #[arg(long)]
         file: Option<PathBuf>,
-        /// Only run shallow decomposition (no refinement).
+        /// Persist initial decomposition and stop before refinement (phase: Decomposing).
         #[arg(long)]
         shallow: bool,
         /// Show an existing plan's lifecycle, dispatch eligibility, and next action.
@@ -513,6 +513,9 @@ enum OrbAction {
     Reset {
         /// Failed orb ID.
         id: String,
+        /// Operator intent retained with the failed attempt in the audit trail.
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Restore an earlier append-only orb snapshot.
     Rollback {
@@ -1139,7 +1142,15 @@ fn main() -> anyhow::Result<()> {
                         &model_config,
                     )
                 }
-                OrbAction::Reset { id } => orb_cmd::cmd_orb_reset(&orb_store, &id),
+                OrbAction::Reset { id, reason } => {
+                    if let Some(writer) = &shared_writer {
+                        writer.reset_orb(&orb_store, &id, reason.as_deref())?;
+                        println!("Reset {id} for retry.");
+                        Ok(())
+                    } else {
+                        orb_cmd::cmd_orb_reset_with_reason(&orb_store, &id, reason.as_deref())
+                    }
+                }
                 OrbAction::Rollback {
                     id,
                     count,
@@ -1542,7 +1553,8 @@ fn foreground_queue_with_project(
         .map(Path::to_path_buf)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| state_dir.to_path_buf());
-    let mut queue = QueueLoop::new(orb_store, dep_store, state_dir.to_path_buf());
+    let mut queue = QueueLoop::new(orb_store, dep_store, state_dir.to_path_buf())
+        .with_completion_commit_contract();
     let telemetry_project = shared_project.cloned().or_else(|| {
         let home = dirs::home_dir()?;
         let project_dir = project_dir?;
@@ -1884,6 +1896,19 @@ fn cmd_daemon_start(
         return cmd_supervisor_start(&home, daemon_config, project);
     }
 
+    let absolute_state_dir = std::fs::canonicalize(state_dir)?;
+    let registered_project = config::list_projects(&home)?.into_iter().find(|entry| {
+        entry.runnable_path().is_some_and(|path| {
+            std::fs::canonicalize(path.join(".orbs")).is_ok_and(|path| path == absolute_state_dir)
+        }) || std::fs::canonicalize(entry.shared_state_dir(&home))
+            .is_ok_and(|path| path == absolute_state_dir)
+    });
+    let project_cwd = match &registered_project {
+        Some(entry) => entry.worker_cwd()?.to_path_buf(),
+        None => project_dir_for_state_dir(&absolute_state_dir)
+            .unwrap_or_else(|| absolute_state_dir.clone()),
+    };
+
     println!(
         "Starting single-project daemon for {}...",
         state_dir.display()
@@ -1894,12 +1919,13 @@ fn cmd_daemon_start(
     let log_dir = state_dir.join("logs");
     let mut queue =
         orboros::queue_loop::QueueLoop::new(orb_store, dep_store, state_dir.to_path_buf())
+            .with_completion_commit_contract()
             .with_worker_evidence_dir(log_dir.join("heddle"))
             .with_execution_log_path(log_dir.join("executions.jsonl"));
 
     // Attach HookSink so the daemon fires lifecycle hooks (closes
     // task 56 follow-up: daemon-side QueueLoop::with_hooks plumbing).
-    if let Some(sink) = orboros::hooks::HookSink::from_state_dir(state_dir, state_dir)? {
+    if let Some(sink) = orboros::hooks::HookSink::from_state_dir(state_dir, &project_cwd)? {
         queue = queue.with_hooks(sink);
     }
 
@@ -1907,11 +1933,16 @@ fn cmd_daemon_start(
     // worker_binary. When absent, the daemon stays pure
     // state-machine — workers never spawn. Lets users opt in
     // to autonomous dispatch without making it mandatory.
-    let project_max_concurrency = config::load_config(Some(state_dir))?.max_concurrency;
-    let dispatch = match orboros::worker::dispatcher::default_worker_config(
-        dirs::home_dir().as_deref(),
-        Some(state_dir),
-    ) {
+    let config_root = registered_project
+        .as_ref()
+        .and_then(config::ProjectEntry::config_root)
+        .unwrap_or(&project_cwd);
+    let project_max_concurrency = config::load_config(Some(config_root))?.max_concurrency;
+    let worker_config = match &registered_project {
+        Some(entry) => orboros::worker::dispatcher::project_worker_config(Some(&home), entry),
+        None => orboros::worker::dispatcher::default_worker_config(Some(&home), Some(&project_cwd)),
+    };
+    let dispatch = match worker_config {
         Ok(base_worker_config) => Some(orboros::daemon::DispatchSettings {
             base_worker_config,
             max_concurrency: project_max_concurrency,
@@ -1968,6 +1999,11 @@ fn cmd_supervisor_start(
     use orboros::daemon::SupervisedProject;
     use orboros::supervisor::{control_socket_path, LocalSupervisor, SupervisorStoreWriter};
     use std::sync::Arc;
+    if let Some(name) = selected_project {
+        let entry = config::find_project(home, name)?
+            .ok_or_else(|| anyhow::anyhow!("Project {name:?} is not registered"))?;
+        entry.worker_cwd()?;
+    }
     let (registered, skipped) = config::registered_project_state_dirs(home)?;
     for project in skipped {
         let path = project
@@ -2000,6 +2036,7 @@ fn cmd_supervisor_start(
     for project in registered {
         let entry = project.entry;
         let legacy_state_dir = project.state_dir;
+        let project_cwd = entry.worker_cwd()?;
         let project_config = config::load_config(entry.config_root())?;
         let shared_state = project_config.daemon.shared_state;
         let project_state_dir = if shared_state {
@@ -2047,32 +2084,25 @@ fn cmd_supervisor_start(
         has_shared_state |= shared_state;
         let log_dir = entry.log_dir(home);
         let mut queue = QueueLoop::new(orb_store, dep_store, project_state_dir.clone())
+            .with_completion_commit_contract()
             .with_worker_evidence_dir(log_dir.join("heddle"))
             .with_execution_log_path(entry.execution_log_path(home))
             .with_project_key(entry.name.clone())
             .with_telemetry_store(orboros::telemetry::TelemetryStore::new(
                 entry.shared_project_dir(home).join("telemetry"),
             ));
-        let project_cwd = entry
-            .runnable_path()
-            .unwrap_or_else(|| project_state_dir.parent().unwrap_or(&project_state_dir));
         if let Some(sink) =
             orboros::hooks::HookSink::from_state_dir(&project_state_dir, project_cwd)?
         {
             queue = queue.with_hooks(sink);
         }
         let project_max_concurrency = project_config.max_concurrency;
-        let dispatch = match orboros::worker::dispatcher::default_worker_config(
-            Some(home),
-            entry.config_root(),
-        ) {
-            Ok(mut base_worker_config) => {
-                base_worker_config.cwd = entry.runnable_path().map(Path::to_path_buf);
-                Some(orboros::daemon::DispatchSettings {
-                    base_worker_config,
-                    max_concurrency: project_max_concurrency,
-                })
-            }
+        let dispatch = match orboros::worker::dispatcher::project_worker_config(Some(home), &entry)
+        {
+            Ok(base_worker_config) => Some(orboros::daemon::DispatchSettings {
+                base_worker_config,
+                max_concurrency: project_max_concurrency,
+            }),
             Err(error) => {
                 tracing::warn!(project = %entry.name, %error, "project dispatch disabled — worker_binary unconfigured");
                 None

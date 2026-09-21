@@ -24,22 +24,23 @@ fn orb_snapshots(store: &OrbStore, id: &str) -> anyhow::Result<Vec<Orb>> {
         .collect())
 }
 
-/// Returns the last worker-dispatchable phase before a failure. Aggregate
-/// phases are deliberately excluded: restoring a failed parent must never
-/// cause its children to start as a side effect of reset.
+/// Only the immediately preceding non-failed phase is evidence for retry.
+/// Never search past aggregate/review states into an older worker attempt.
 fn retry_phase_from_history(snapshots: &[Orb]) -> Option<OrbPhase> {
     snapshots
         .iter()
         .rev()
-        .find_map(|snapshot| match snapshot.phase {
-            Some(
-                phase @ (OrbPhase::Speccing
-                | OrbPhase::Decomposing
-                | OrbPhase::Refining
-                | OrbPhase::Reevaluating
-                | OrbPhase::Executing),
-            ) => Some(phase),
-            _ => None,
+        .find(|orb| orb.phase != Some(OrbPhase::Failed))
+        .and_then(|orb| orb.phase)
+        .filter(|phase| {
+            matches!(
+                phase,
+                OrbPhase::Speccing
+                    | OrbPhase::Decomposing
+                    | OrbPhase::Refining
+                    | OrbPhase::Reevaluating
+                    | OrbPhase::Executing
+            )
         })
 }
 
@@ -88,42 +89,173 @@ pub fn cmd_orb_recover_decomposition(
     Ok(())
 }
 
-/// Appends a retryable state for a failed orb without erasing its prior JSONL
-/// diagnostic record. Phase parents return to the failed dispatch phase;
-/// ordinary task orbs return to Pending.
+/// Resets a failed orb with no operator reason.
+///
+/// # Errors
+/// Returns an error for unsafe lifecycle states or persistence failures.
 pub fn cmd_orb_reset(store: &OrbStore, id: &str) -> anyhow::Result<()> {
-    let snapshots = orb_snapshots(store, id)?;
-    let mut orb = store
+    cmd_orb_reset_with_reason(store, id, None)
+}
+
+/// Resets local state while retaining the failed attempt in an audit event.
+/// The CLI holds the local mutation lease for this entire operation.
+///
+/// # Errors
+/// Returns an error for unsafe lifecycle states or persistence failures.
+pub fn cmd_orb_reset_with_reason(
+    store: &OrbStore,
+    id: &str,
+    reason: Option<&str>,
+) -> anyhow::Result<()> {
+    let (orb, event) = prepare_reset(store, id, reason)?;
+    let base = store
+        .path()
+        .parent()
+        .context("orb store has no parent directory")?;
+    persist_reset(base, &orb, &event)?;
+    println!("Reset {id} for retry.");
+    Ok(())
+}
+
+/// A deliberate operator-only transition, separate from normal lifecycle edges.
+/// Failed remains terminal to automatic scheduling and ordinary status updates.
+pub(crate) fn prepare_reset(
+    store: &OrbStore,
+    id: &str,
+    reason: Option<&str>,
+) -> anyhow::Result<(Orb, orbs::audit::AuditEvent)> {
+    let prior = store
         .load_by_id(&OrbId::from_raw(id))?
         .ok_or_else(|| anyhow::anyhow!("orb not found: {id}"))?;
-    anyhow::ensure!(
-        orb.phase == Some(OrbPhase::Failed) || orb.status == Some(OrbStatus::Failed),
-        "orb {id} is not failed"
-    );
+    let mut orb = prior.clone();
     if orb.orb_type.uses_phase() {
-        let category = orb
+        anyhow::ensure!(
+            orb.phase == Some(OrbPhase::Failed) && orb.status.is_none(),
+            "orb {id} must have only a failed phase to reset"
+        );
+        let snapshots = orb_snapshots(store, id)?;
+        let historical = snapshots
+            .iter()
+            .rev()
+            .find(|snapshot| snapshot.phase != Some(OrbPhase::Failed));
+        let marker = orb
             .execution
             .as_ref()
             .and_then(|execution| execution.prompt_category.as_deref());
-        orb.phase = Some(category.map_or_else(
-            || retry_phase_from_history(&snapshots).unwrap_or(OrbPhase::Executing),
-            |category| match category {
-                "phase.speccing" => OrbPhase::Speccing,
-                "phase.decomposing" => OrbPhase::Decomposing,
-                "phase.refining" => OrbPhase::Refining,
-                "phase.reevaluating" => OrbPhase::Reevaluating,
-                _ => OrbPhase::Executing,
-            },
-        ));
-        orb.closed_at = None;
+        let marked_phase = match marker {
+            Some("phase.speccing") => Some(OrbPhase::Speccing),
+            Some("phase.decomposing") => Some(OrbPhase::Decomposing),
+            Some("phase.refining") => Some(OrbPhase::Refining),
+            Some("phase.reevaluating") => Some(OrbPhase::Reevaluating),
+            Some("worker.execute") => Some(OrbPhase::Executing),
+            Some(other) => bail!("orb {id} has an unsupported retry marker: {other}"),
+            None => None,
+        };
+        let phase = if historical.is_some() {
+            let phase = retry_phase_from_history(&snapshots)
+                .context("failed parent did not fail in a retryable worker phase")?;
+            anyhow::ensure!(
+                marked_phase.is_none_or(|marked| marked == phase),
+                "orb {id} has conflicting retry phase evidence"
+            );
+            phase
+        } else {
+            marked_phase
+                .context("failed parent has no retry phase evidence; inspect its history")?
+        };
+        orb.phase = Some(phase);
     } else {
+        anyhow::ensure!(
+            orb.status == Some(OrbStatus::Failed) && orb.phase.is_none(),
+            "orb {id} must have only a failed status to reset"
+        );
         orb.status = Some(OrbStatus::Pending);
-        orb.closed_at = None;
     }
+    orb.closed_at = None;
     orb.execution = None;
-    store.update(&orb)?;
-    println!("Reset {id} for retry.");
+    orb.result = None;
+    orb.confidence = None;
+    orb.review_report = None;
+    orb.review_critique = None;
+    orb.worker_model = None;
+    orb.updated_at = chrono::Utc::now();
+    let event = orbs::audit::AuditEvent::new(
+        orb.id.clone(),
+        if orb.orb_type.uses_phase() {
+            orbs::audit::EventType::PhaseChanged
+        } else {
+            orbs::audit::EventType::StatusChanged
+        },
+        "operator:orb-reset",
+        Some(serde_json::to_string(&serde_json::json!({
+            "operation": "reset", "intent": "retry_failed_attempt", "reason": reason,
+            "prior": prior, "target_status": orb.status, "target_phase": orb.phase,
+        }))?),
+    );
+    Ok((orb, event))
+}
+
+/// Materializes a reset and its diagnostics. Shared mode journals this entire
+/// intent before calling here, so an interrupted projection can be replayed.
+pub(crate) fn persist_reset(
+    base: &std::path::Path,
+    orb: &Orb,
+    event: &orbs::audit::AuditEvent,
+) -> std::io::Result<()> {
+    let mut mirrors = Vec::new();
+    let pipelines = base.join("pipelines");
+    if pipelines.exists() {
+        for entry in std::fs::read_dir(pipelines)? {
+            let path = entry?.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let store = OrbStore::new(path.join("orbs.jsonl"));
+            if store.load_by_id(&orb.id)?.is_some() {
+                if path.join(".lock").exists() {
+                    return Err(std::io::Error::other(format!(
+                        "pipeline {} has an incomplete mutation; recover it before reset",
+                        path.display()
+                    )));
+                }
+                mirrors.push(store);
+            }
+        }
+    }
+    // Write intent and the full failed snapshot before clearing any diagnostics.
+    let audit = orbs::audit_store::AuditStore::new(base.join("events.jsonl"));
+    if !audit
+        .events_for_orb(&orb.id)?
+        .iter()
+        .any(|saved| saved.id == event.id)
+    {
+        append_reset_record(audit.events_path(), event)?;
+    }
+    append_reset_record(&base.join("orbs.jsonl"), orb)?;
+    for mirror in mirrors {
+        append_reset_record(mirror.path(), orb).map_err(|error| {
+            std::io::Error::other(format!(
+                "canonical reset saved, but pipeline {} needs repair: {error}",
+                mirror.path().display()
+            ))
+        })?;
+    }
     Ok(())
+}
+
+fn append_reset_record<T: serde::Serialize>(
+    path: &std::path::Path,
+    record: &T,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut row = serde_json::to_vec(record).map_err(std::io::Error::other)?;
+    row.push(b'\n');
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.write_all(&row)?;
+    file.sync_data()
 }
 
 /// Restores an earlier append-only snapshot for an orb.
@@ -1624,6 +1756,109 @@ mod tests {
         let orb =
             cmd_orb_create(&store, "Orb", "Original", OrbType::Task, 3, vec![], None).unwrap();
         assert!(cmd_orb_append_description(&store, &orb.id.to_string(), " \n ").is_err());
+    }
+
+    #[test]
+    fn reset_preserves_failed_attempt_and_reason_but_clears_outcome() {
+        let (dir, store) = temp_orb_store();
+        let mut orb = Orb::new("Failed task", "keep specification").with_parent(
+            OrbId::from_raw("orb-parent"),
+            Some(OrbId::from_raw("orb-root")),
+        );
+        orb.status = Some(OrbStatus::Failed);
+        orb.result = Some("worker failed before commit".into());
+        orb.confidence = Some(0.2);
+        orb.closed_at = Some(chrono::Utc::now());
+        orb.execution = Some(orbs::orb::ExecutionMeta::default());
+        store.append(&orb).unwrap();
+        cmd_orb_reset_with_reason(&store, orb.id.as_str(), Some("fixed setup")).unwrap();
+        let reset = store.load_by_id(&orb.id).unwrap().unwrap();
+        assert_eq!(reset.status, Some(OrbStatus::Pending));
+        assert_eq!(reset.id, orb.id);
+        assert_eq!(reset.title, orb.title);
+        assert_eq!(reset.description, orb.description);
+        assert_eq!(reset.parent_id, orb.parent_id);
+        assert_eq!(reset.root_id, orb.root_id);
+        assert!(reset.result.is_none());
+        assert!(reset.execution.is_none());
+        assert!(reset.confidence.is_none());
+        assert!(reset.closed_at.is_none());
+        let events = orbs::audit_store::AuditStore::new(dir.path().join("events.jsonl"))
+            .events_for_orb(&orb.id)
+            .unwrap();
+        let details: serde_json::Value =
+            serde_json::from_str(events[0].details.as_ref().unwrap()).unwrap();
+        assert_eq!(details["reason"], "fixed setup");
+        assert_eq!(details["prior"]["result"], "worker failed before commit");
+        assert!(cmd_orb_reset(&store, orb.id.as_str()).is_err());
+        assert_eq!(orb_snapshots(&store, orb.id.as_str()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn reset_rejects_nonfailed_states_and_ambiguous_parent_history() {
+        for status in [
+            OrbStatus::Done,
+            OrbStatus::Active,
+            OrbStatus::Review,
+            OrbStatus::Cancelled,
+        ] {
+            let (_dir, store) = temp_orb_store();
+            let mut orb = Orb::new("Task", "spec");
+            orb.status = Some(status);
+            store.append(&orb).unwrap();
+            assert!(cmd_orb_reset(&store, orb.id.as_str()).is_err());
+            assert_eq!(orb_snapshots(&store, orb.id.as_str()).unwrap().len(), 1);
+        }
+        for kind in [OrbType::Epic, OrbType::Feature] {
+            let (_dir, store) = temp_orb_store();
+            let mut orb = Orb::new("Parent", "spec").with_type(kind);
+            orb.phase = Some(OrbPhase::Failed);
+            store.append(&orb).unwrap();
+            assert!(cmd_orb_reset(&store, orb.id.as_str()).is_err());
+        }
+    }
+
+    #[test]
+    fn reset_updates_existing_pipeline_copy() {
+        let (dir, store) = temp_orb_store();
+        let mut orb = Orb::new("Feature", "spec").with_type(OrbType::Feature);
+        orb.phase = Some(OrbPhase::Decomposing);
+        store.append(&orb).unwrap();
+        let pipeline = orbs::pipeline::create_pipeline(dir.path(), &orb).unwrap();
+        orb.phase = Some(OrbPhase::Failed);
+        store.update(&orb).unwrap();
+        pipeline.orb_store().append(&orb).unwrap();
+        cmd_orb_reset(&store, orb.id.as_str()).unwrap();
+        let canonical = store.load_by_id(&orb.id).unwrap().unwrap();
+        let local = pipeline.orb_store().load_by_id(&orb.id).unwrap().unwrap();
+        assert_eq!(canonical.phase, Some(OrbPhase::Decomposing));
+        assert_eq!(
+            serde_json::to_value(canonical).unwrap(),
+            serde_json::to_value(local).unwrap()
+        );
+    }
+
+    #[test]
+    fn reset_refuses_aggregate_history_and_preserves_state_on_audit_failure() {
+        let (dir, store) = temp_orb_store();
+        let mut orb = Orb::new("Parent", "spec").with_type(OrbType::Epic);
+        orb.phase = Some(OrbPhase::Refining);
+        store.append(&orb).unwrap();
+        orb.phase = Some(OrbPhase::ExecutingChildren);
+        store.update(&orb).unwrap();
+        orb.phase = Some(OrbPhase::Failed);
+        store.update(&orb).unwrap();
+        assert!(cmd_orb_reset(&store, orb.id.as_str()).is_err());
+
+        let mut task = Orb::new("Task", "spec");
+        task.status = Some(OrbStatus::Failed);
+        store.append(&task).unwrap();
+        std::fs::create_dir(dir.path().join("events.jsonl")).unwrap();
+        assert!(cmd_orb_reset(&store, task.id.as_str()).is_err());
+        assert_eq!(
+            store.load_by_id(&task.id).unwrap().unwrap().status,
+            Some(OrbStatus::Failed)
+        );
     }
 
     #[test]

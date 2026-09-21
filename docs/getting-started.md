@@ -217,3 +217,37 @@ your-project/
         snapshots/
         history/
 ```
+
+### Retry a failed orb
+
+Inspect the failure and fix its cause before requesting a new attempt:
+
+```bash
+orboros orb show orb-k4f
+orboros orb logs orb-k4f
+orboros orb reset orb-k4f --reason "fixed worker setup"
+```
+
+Reset preserves the ID, specification, hierarchy, dependencies, revision count,
+and previous execution records. Tasks return to `Pending`; epics and features
+return to their evidenced failed worker phase (speccing, decomposition,
+refinement, re-evaluation, or execution). Missing or conflicting phase evidence
+and failures from aggregate/review phases require manual investigation. There
+is no force or arbitrary retry-phase override. Successful, active, review,
+cancelled, and already-reset orbs are rejected.
+
+The current result, execution metadata, confidence, review outcome/critique,
+and closure timestamp are cleared. `events.jsonl` retains a timestamped
+operator reset intent, optional reason, full failed snapshot, and target state;
+previous orb snapshots and worker logs remain intact. The daemon discovers the
+reset through its normal canonical-store scan and dependency/parent gates.
+Reset does not start the daemon or reset children or dependencies.
+
+Existing pipeline copies are updated along with canonical state. Shared mode
+requires the running supervisor and journals the reset for replay, rejecting
+concurrent changes. Local mode uses the command's mutation lease. Local writes
+across audit, canonical, and pipeline files are not one filesystem transaction:
+a storage failure can leave a recorded intent without a completed reset, or a
+canonical reset with an out-of-date pipeline copy. Errors are surfaced; inspect
+and repair the affected projection before continuing. A repeated successful
+reset is rejected because the orb is no longer failed.
