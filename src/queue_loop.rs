@@ -42,7 +42,7 @@ fn fatal_headless_ipc_error(error: anyhow::Error) -> std::io::Error {
 fn is_fatal_headless_ipc_error(error: &std::io::Error) -> bool {
     error
         .get_ref()
-        .is_some_and(|source| source.is::<FatalHeadlessIpcFailure>())
+        .is_some_and(<dyn std::error::Error + Send + Sync>::is::<FatalHeadlessIpcFailure>)
 }
 
 struct InFlightDispatchGuard(Arc<AtomicUsize>);
@@ -240,6 +240,7 @@ pub struct QueueLoop {
     worker_evidence_dir: PathBuf,
     project_key: Option<String>,
     telemetry_store: Option<crate::telemetry::TelemetryStore>,
+    completion_commit_contract: bool,
 }
 
 impl QueueLoop {
@@ -268,6 +269,7 @@ impl QueueLoop {
             worker_evidence_dir,
             project_key: None,
             telemetry_store: None,
+            completion_commit_contract: false,
         }
     }
 
@@ -300,6 +302,14 @@ impl QueueLoop {
         telemetry_store: crate::telemetry::TelemetryStore,
     ) -> Self {
         self.telemetry_store = Some(telemetry_store);
+        self
+    }
+
+    /// Requires successful execution workers to create and report one focused
+    /// completion commit. Embedded benchmark queues leave this disabled.
+    #[must_use]
+    pub fn with_completion_commit_contract(mut self) -> Self {
+        self.completion_commit_contract = true;
         self
     }
 
@@ -418,6 +428,8 @@ impl QueueLoop {
         }
 
         let mut result = TickResult::default();
+        // Operator resets re-enter through this canonical scan and the normal
+        // dependency gates; no separate retry queue bypasses lifecycle checks.
         let all_orbs = self.orb_store.load_all()?;
         tracing::Span::current().record("orb_count", all_orbs.len());
 
@@ -900,6 +912,16 @@ impl QueueLoop {
         if targets.is_empty() {
             return Ok(0);
         }
+        if self.completion_commit_contract
+            && max_concurrency > 1
+            && targets
+                .iter()
+                .any(|(_, target)| *target == DispatchTarget::Execute)
+        {
+            return Err(std::io::Error::other(
+                "completion commits require serial main-worktree execution (max_concurrency = 1)",
+            ));
+        }
 
         let mut orb_config = match &self.config_override {
             Some(config) => config.clone(),
@@ -923,6 +945,7 @@ impl QueueLoop {
         // started are allowed to finish and persist their outcome, while work
         // still waiting for a permit must not begin during shutdown.
         let running = self.running_flag();
+        let completion_commit_contract = self.completion_commit_contract;
         let context_orbs = Arc::new(all_orbs);
         let context_edges = Arc::new(all_edges);
         let mut join_set = JoinSet::new();
@@ -984,6 +1007,7 @@ impl QueueLoop {
                     worker_evidence_dir,
                     project_key,
                     telemetry_store,
+                    completion_commit_contract,
                     running,
                 )
                 .await
@@ -1433,7 +1457,9 @@ async fn recover_structured_phase_output(
 /// AND hasn't been dispatched yet (`execution` is None).
 fn dispatch_target_for(orb: &Orb) -> Option<DispatchTarget> {
     if orb.execution.is_some() {
-        // Already dispatched — don't redispatch on the same tick.
+        // Completion clears this marker only after a successful nonterminal
+        // transition. A timestamp alone cannot distinguish a live worker from
+        // an interrupted attempt, so restart must not silently authorize retry.
         return None;
     }
     if orb.orb_type.uses_phase() {
@@ -1573,6 +1599,7 @@ async fn dispatch_one_owned(
     worker_evidence_dir: PathBuf,
     project_key: Option<String>,
     telemetry_store: Option<crate::telemetry::TelemetryStore>,
+    completion_commit_contract: bool,
     running: Arc<AtomicBool>,
 ) -> std::io::Result<bool> {
     use crate::worker::dispatcher::{
@@ -1637,6 +1664,20 @@ async fn dispatch_one_owned(
     );
     let mut wc = worker_config_for_with_model_config(&orb, &target_base_wc, &system, model_config)
         .map_err(std::io::Error::other)?;
+    let commit_snapshot = if target == DispatchTarget::Execute && completion_commit_contract {
+        Some(match wc.cwd.as_deref() {
+            Some(cwd) => crate::worker::commit::Snapshot::capture(cwd).await,
+            None => Err(anyhow::anyhow!(
+                "completion commits require an explicit worker cwd"
+            )),
+        })
+    } else {
+        None
+    };
+    if let Some(Ok(snapshot)) = &commit_snapshot {
+        wc.system_prompt
+            .push_str(&snapshot.guidance(&orb.id.to_string()));
+    }
     let log_root = worker_evidence_dir;
     configure_worker_runtime(
         &mut wc,
@@ -1676,18 +1717,37 @@ async fn dispatch_one_owned(
     let mut completed_retries = 0_u32;
     let mut outer_attempt = 1_u32;
     let mut outcome = loop {
-        let outcome = dispatch_orb_while_running(&orb, &user, &wc, hooks.as_deref(), &running)
+        if let Some(Err(error)) = &commit_snapshot {
+            let mut outcome = crate::worker::dispatcher::DispatchOutcome::aborted(
+                wc.model.clone(),
+                format!("execution commit contract: {error:#}"),
+            );
+            outcome.status = crate::worker::dispatcher::DispatchStatus::Failed;
+            break outcome;
+        }
+        let dispatch = if target == DispatchTarget::Execute {
+            crate::worker::dispatcher::dispatch_orb_with_retry_limit(
+                &orb,
+                &user,
+                &wc,
+                hooks.as_deref(),
+                1,
+                Some(&running),
+            )
             .await
-            .map_err(|error| {
-                if error
-                    .downcast_ref::<crate::ipc::error::IpcError>()
-                    .is_some_and(crate::ipc::error::IpcError::is_fatal_init_failure)
-                {
-                    fatal_headless_ipc_error(error)
-                } else {
-                    std::io::Error::other(error)
-                }
-            })?;
+        } else {
+            dispatch_orb_while_running(&orb, &user, &wc, hooks.as_deref(), &running).await
+        };
+        let outcome = dispatch.map_err(|error| {
+            if error
+                .downcast_ref::<crate::ipc::error::IpcError>()
+                .is_some_and(crate::ipc::error::IpcError::is_fatal_init_failure)
+            {
+                fatal_headless_ipc_error(error)
+            } else {
+                std::io::Error::other(error)
+            }
+        })?;
         let failed = matches!(
             outcome.status,
             crate::worker::dispatcher::DispatchStatus::Error
@@ -2190,6 +2250,33 @@ async fn dispatch_one_owned(
             }
         }
     }
+    let mut completion_commit = None;
+    let mut commit_contract_error = commit_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.as_ref().err().map(|error| format!("{error:#}")));
+    if let Some(Ok(snapshot)) = &commit_snapshot {
+        match snapshot
+            .verify(
+                &orb.id.to_string(),
+                outcome.status == crate::worker::dispatcher::DispatchStatus::Done,
+                outcome.response.as_deref().unwrap_or_default(),
+            )
+            .await
+        {
+            Ok(commit) => completion_commit = commit,
+            Err(error) => {
+                let diagnostic = format!("execution commit contract: {error:#}");
+                commit_contract_error = Some(diagnostic.clone());
+                outcome.error = Some(match outcome.error.take() {
+                    Some(previous) => format!("{previous}; {diagnostic}"),
+                    None => diagnostic,
+                });
+                if outcome.status == crate::worker::dispatcher::DispatchStatus::Done {
+                    outcome.status = crate::worker::dispatcher::DispatchStatus::Failed;
+                }
+            }
+        }
+    }
     let mut outcome = crate::worker::dispatcher::with_prompt_metadata(
         outcome,
         prompt_category.clone(),
@@ -2218,7 +2305,8 @@ async fn dispatch_one_owned(
             .find(|candidate| &candidate.id == parent_id)
             .map(|parent| parent.description.as_str())
     });
-    let recovery_eligible = running.load(Ordering::SeqCst)
+    let recovery_eligible = target != DispatchTarget::Execute
+        && running.load(Ordering::SeqCst)
         && partial_artifact_recovery_is_eligible(
             &orb,
             target,
@@ -2249,6 +2337,8 @@ async fn dispatch_one_owned(
             })
         });
     }
+    execution_record.completion_commit = completion_commit;
+    execution_record.commit_contract_error = commit_contract_error;
     execution_record.phase_output_recovery = phase_output_recovery;
     if let Some(source) = structured_recovery_source {
         execution_record.tool_policy_source = Some(
@@ -2834,6 +2924,173 @@ mod tests {
         assert_eq!(result.reason, DrainStopReason::TargetTerminal);
         assert_eq!(result.cycles, 0);
         assert_eq!(result.workers_completed, 0);
+    }
+
+    #[test]
+    fn reset_phase_orbs_are_discovered_for_worker_dispatch() {
+        for kind in [OrbType::Epic, OrbType::Feature] {
+            for phase in [
+                OrbPhase::Speccing,
+                OrbPhase::Decomposing,
+                OrbPhase::Refining,
+                OrbPhase::Reevaluating,
+                OrbPhase::Executing,
+            ] {
+                let (_tmp, store, _deps, _base) = setup();
+                let mut orb = Orb::new("Parent", "retry phase").with_type(kind.clone());
+                orb.phase = Some(phase);
+                store.append(&orb).unwrap();
+                orb.phase = Some(OrbPhase::Failed);
+                orb.execution = Some(orbs::orb::ExecutionMeta::default());
+                store.update(&orb).unwrap();
+                assert!(dispatch_target_for(&orb).is_none());
+                crate::orb_cmd::cmd_orb_reset(&store, orb.id.as_str()).unwrap();
+                let reset = store.load_by_id(&orb.id).unwrap().unwrap();
+                assert_eq!(reset.phase, Some(phase));
+                assert!(dispatch_target_for(&reset).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn successful_phase_completion_remains_dispatchable_after_reload() {
+        use crate::execution::{ExecutionRecord, ExecutionStore};
+        use crate::worker::dispatcher::{apply_dispatch_outcome, DispatchOutcome, DispatchStatus};
+
+        for (phase, next, target) in [
+            (
+                OrbPhase::Speccing,
+                OrbPhase::Decomposing,
+                Some(DispatchTarget::Decomposing),
+            ),
+            (
+                OrbPhase::Decomposing,
+                OrbPhase::Refining,
+                Some(DispatchTarget::Refining),
+            ),
+            (OrbPhase::Refining, OrbPhase::Review, None),
+            (
+                OrbPhase::Reevaluating,
+                OrbPhase::Executing,
+                Some(DispatchTarget::Execute),
+            ),
+        ] {
+            let (_tmp, store, _deps, base) = setup();
+            let mut orb = Orb::new("Parent", "phase completion").with_type(OrbType::Epic);
+            orb.phase = Some(phase);
+            orb.execution = Some(orbs::orb::ExecutionMeta::default());
+            store.append(&orb).unwrap();
+            let mut outcome = DispatchOutcome::aborted("mock/phase".into(), "unused".into());
+            outcome.status = DispatchStatus::Done;
+            outcome.error = None;
+            outcome.response = Some("phase result".into());
+            outcome.confidence = Some(0.9);
+            let ledger = ExecutionStore::new(base.join("executions.jsonl"));
+            let record = ExecutionRecord::from_outcome(
+                &orb,
+                "phase",
+                "read_only",
+                None,
+                vec![],
+                &outcome,
+                None,
+            );
+            ledger.append(&record).unwrap();
+            let history = std::fs::read(ledger.path()).unwrap();
+
+            apply_dispatch_outcome(&mut orb, &outcome).unwrap();
+            store.update(&orb).unwrap();
+
+            let reopened = OrbStore::new(store.path());
+            let mut restored = reopened.load_by_id(&orb.id).unwrap().unwrap();
+            assert_eq!(restored.phase, Some(next));
+            assert!(restored.execution.is_none());
+            assert_eq!(restored.result.as_deref(), Some("phase result"));
+            assert_eq!(restored.confidence, Some(0.9));
+            assert_eq!(dispatch_target_for(&restored), target);
+            if next == OrbPhase::Review {
+                restored.set_phase(OrbPhase::Waiting).unwrap();
+                reopened.update(&restored).unwrap();
+                restored = OrbStore::new(store.path())
+                    .load_by_id(&orb.id)
+                    .unwrap()
+                    .unwrap();
+                assert!(restored.execution.is_none());
+                restored.set_phase(OrbPhase::Reevaluating).unwrap();
+                assert_eq!(
+                    dispatch_target_for(&restored),
+                    Some(DispatchTarget::Reevaluating)
+                );
+            }
+            assert_eq!(std::fs::read(ledger.path()).unwrap(), history);
+            assert_eq!(
+                ExecutionStore::new(ledger.path()).read_all().unwrap().len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_phase_marker_remains_blocked_after_reload_and_abort() {
+        use crate::worker::dispatcher::{apply_dispatch_outcome, DispatchOutcome};
+
+        let (_tmp, store, _deps, _base) = setup();
+        let mut orb = Orb::new("Interrupted", "phase attempt").with_type(OrbType::Epic);
+        orb.phase = Some(OrbPhase::Speccing);
+        orb.execution = Some(orbs::orb::ExecutionMeta {
+            dispatched_at: Some(chrono::Utc::now() - chrono::Duration::days(7)),
+            ..Default::default()
+        });
+        store.append(&orb).unwrap();
+        let mut restored = OrbStore::new(store.path())
+            .load_by_id(&orb.id)
+            .unwrap()
+            .unwrap();
+        let before = serde_json::to_value(&restored).unwrap();
+        let aborted = DispatchOutcome::aborted("mock/phase".into(), "hook veto".into());
+        apply_dispatch_outcome(&mut restored, &aborted).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), before);
+        assert!(dispatch_target_for(&restored).is_none());
+        assert!(crate::orb_cmd::cmd_orb_reset(&store, orb.id.as_str()).is_err());
+    }
+
+    #[test]
+    fn unsuccessful_phase_completion_requires_explicit_retry_after_reload() {
+        use crate::worker::dispatcher::{apply_dispatch_outcome, DispatchOutcome, DispatchStatus};
+
+        for status in [
+            DispatchStatus::Failed,
+            DispatchStatus::Error,
+            DispatchStatus::Cancelled,
+        ] {
+            let (_tmp, store, _deps, _base) = setup();
+            let mut orb = Orb::new("Failed phase", "retry policy").with_type(OrbType::Epic);
+            orb.phase = Some(OrbPhase::Speccing);
+            store.append(&orb).unwrap();
+            let mut outcome = DispatchOutcome::aborted("mock/phase".into(), "interrupted".into());
+            outcome.status = status.clone();
+            outcome.prompt_category = Some("phase.speccing".into());
+            apply_dispatch_outcome(&mut orb, &outcome).unwrap();
+            store.update(&orb).unwrap();
+
+            let reopened = OrbStore::new(store.path());
+            let restored = reopened.load_by_id(&orb.id).unwrap().unwrap();
+            assert!(dispatch_target_for(&restored).is_none());
+            assert!(restored.result.as_deref().unwrap().contains("interrupted"));
+            let marker = restored.execution.as_ref().unwrap();
+            assert_eq!(marker.worker_model.as_deref(), Some("mock/phase"));
+            assert!(marker.completed_at.is_some());
+            if status == DispatchStatus::Cancelled {
+                assert_eq!(restored.phase, Some(OrbPhase::Cancelled));
+                assert!(crate::orb_cmd::cmd_orb_reset(&reopened, orb.id.as_str()).is_err());
+            } else {
+                assert_eq!(restored.phase, Some(OrbPhase::Failed));
+                crate::orb_cmd::cmd_orb_reset(&reopened, orb.id.as_str()).unwrap();
+                let reset = reopened.load_by_id(&orb.id).unwrap().unwrap();
+                assert_eq!(dispatch_target_for(&reset), Some(DispatchTarget::Speccing));
+                assert!(reset.execution.is_none());
+            }
+        }
     }
 
     // ── tick detects pipeline orbs ───────────────────────────────────

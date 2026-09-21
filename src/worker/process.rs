@@ -1283,6 +1283,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn main_worktree_cwd_supplies_ancestor_context_without_sibling_container_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = tokio::fs::canonicalize(dir.path()).await.unwrap();
+        let main = root.join("main");
+        tokio::fs::create_dir(&main).await.unwrap();
+        tokio::fs::write(root.join("AGENTS.md"), "ancestor")
+            .await
+            .unwrap();
+        tokio::fs::write(main.join("AGENTS.md"), "main worktree")
+            .await
+            .unwrap();
+        let mut config = mock_worker_config();
+        config.command = "python3".into();
+        config.args = vec![PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test-fixtures/mock-worker-context.py")
+            .to_string_lossy()
+            .into_owned()];
+        config.cwd = Some(main.clone());
+
+        // Works with no container at all, then still excludes a sibling container.
+        for with_container in [false, true] {
+            if with_container {
+                tokio::fs::create_dir(root.join("container")).await.unwrap();
+                tokio::fs::write(root.join("container/AGENTS.md"), "sibling")
+                    .await
+                    .unwrap();
+            }
+            let mut worker = Worker::spawn(&config).await.unwrap();
+            let outcome = worker.send("context", "report cwd context").await.unwrap();
+            let response: serde_json::Value =
+                serde_json::from_str(outcome.response.as_deref().unwrap()).unwrap();
+            assert_eq!(response["cwd"], main.to_string_lossy().as_ref());
+            let contexts = response["contexts"].as_array().unwrap();
+            let ancestor =
+                serde_json::Value::String(root.join("AGENTS.md").to_string_lossy().into_owned());
+            let local =
+                serde_json::Value::String(main.join("AGENTS.md").to_string_lossy().into_owned());
+            assert!(
+                contexts.iter().position(|path| path == &ancestor).unwrap()
+                    < contexts.iter().position(|path| path == &local).unwrap()
+            );
+            assert!(!contexts
+                .iter()
+                .any(|path| path.as_str().unwrap().contains("container/AGENTS.md")));
+            worker.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn worker_force_stop_kills_on_timeout() {
         // Use a worker that won't respond to shutdown (mock-worker-slow with long delay)
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

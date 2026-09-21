@@ -45,6 +45,11 @@ pub struct PromptContextMetrics {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionRecord {
+    /// Completion contract evidence; absent for historical and non-execution records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_commit: Option<crate::worker::commit::CommitEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_contract_error: Option<String>,
     pub orb_id: String,
     pub parent_id: Option<String>,
     pub dispatch_kind: String,
@@ -285,6 +290,8 @@ impl ExecutionRecord {
             retries: outcome.retries,
             prompt_context,
             decomposition_repair: None,
+            completion_commit: None,
+            commit_contract_error: None,
             phase_output_recovery: None,
             phase_retry: None,
             terminal_retry: outcome.terminal_retry.clone(),

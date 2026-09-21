@@ -347,6 +347,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = TelemetryStore::new(dir.path().join("telemetry"));
         let records = vec![ExecutionRecord {
+            completion_commit: None,
+            commit_contract_error: None,
             orb_id: "orb-1".into(),
             parent_id: None,
             dispatch_kind: "worker.execute".into(),
