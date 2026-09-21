@@ -170,7 +170,7 @@ impl DispatchOutcome {
     /// the dispatcher returns this when a pre-worker-spawn hook
     /// short-circuits. No timing or worker fields are populated;
     /// timestamps are set to "now" for completeness.
-    fn aborted(worker_model: String, reason: String) -> Self {
+    pub(crate) fn aborted(worker_model: String, reason: String) -> Self {
         let now = Utc::now();
         Self {
             status: DispatchStatus::Aborted,
@@ -267,7 +267,7 @@ pub async fn dispatch_orb_once(
     dispatch_orb_with_retry_limit(orb, prompt, worker_config, hooks, 0, None).await
 }
 
-async fn dispatch_orb_with_retry_limit(
+pub(crate) async fn dispatch_orb_with_retry_limit(
     orb: &Orb,
     prompt: &str,
     worker_config: &WorkerConfig,
@@ -860,6 +860,22 @@ fn next_phase_on_dispatch_success(current: Option<OrbPhase>) -> OrbPhase {
         // a bug rather than silently mis-advancing.
         _ => OrbPhase::Done,
     }
+}
+
+/// Builds registered-project dispatch configuration, keeping config discovery
+/// and the runnable worktree separate.
+///
+/// # Errors
+/// Fails if the runnable path is unusable or worker configuration cannot load.
+pub fn project_worker_config(
+    home: Option<&std::path::Path>,
+    project: &crate::config::ProjectEntry,
+) -> anyhow::Result<WorkerConfig> {
+    let cwd = project.worker_cwd()?;
+    let mut worker = default_worker_config(home, project.config_root())?;
+    worker.cwd = Some(cwd.to_path_buf());
+    tracing::info!(project = %project.name, worker_cwd = %cwd.display(), "configured project worker cwd");
+    Ok(worker)
 }
 
 /// Builds a base `WorkerConfig` from the layered project config.
@@ -1471,6 +1487,74 @@ config_path = "/Users/test/.orboros/heddle-config.toml"
             Some("/Users/test/.orboros/heddle-config.toml")
         );
         assert_eq!(wc.model, "anthropic/test");
+    }
+
+    #[test]
+    fn registered_workers_keep_distinct_worktrees_and_state_separate() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".orboros")).unwrap();
+        std::fs::write(
+            home.path().join(".orboros/config.toml"),
+            "worker_binary = \"heddle\"\n",
+        )
+        .unwrap();
+        let mut cwds = Vec::new();
+        for name in ["alpha", "beta"] {
+            let worktree = root.path().join(name);
+            std::fs::create_dir(&worktree).unwrap();
+            let project = crate::config::ProjectEntry {
+                name: name.into(),
+                path: Some(worktree.clone()),
+                root_dir: Some(root.path().to_path_buf()),
+                created_at: chrono::Utc::now(),
+            };
+            let base = project_worker_config(Some(home.path()), &project).unwrap();
+            let derived = worker_config_for(&active_task_orb(), &base, "worker");
+            assert_eq!(derived.cwd.as_deref(), Some(worktree.as_path()));
+            assert_ne!(derived.cwd, Some(project.shared_state_dir(home.path())));
+            assert_eq!(base.command, "heddle");
+            cwds.push(derived.cwd);
+        }
+        assert_ne!(cwds[0], cwds[1]);
+    }
+
+    #[test]
+    fn registered_worker_cwd_falls_back_to_root_only_when_path_is_unset() {
+        let root = tempfile::tempdir().unwrap();
+        let mut project = crate::config::ProjectEntry {
+            name: "root-only".into(),
+            path: None,
+            root_dir: Some(root.path().to_path_buf()),
+            created_at: chrono::Utc::now(),
+        };
+        assert_eq!(project.worker_cwd().unwrap(), root.path());
+        project.path = Some(root.path().join("missing-worktree"));
+        assert!(project.worker_cwd().is_err());
+    }
+
+    #[test]
+    fn registered_worker_rejects_unusable_paths_with_project_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        for path in [
+            None,
+            Some(dir.path().join("missing")),
+            Some(file),
+            Some("relative".into()),
+        ] {
+            let project = crate::config::ProjectEntry {
+                name: "broken-project".into(),
+                path,
+                root_dir: None,
+                created_at: chrono::Utc::now(),
+            };
+            let error = project_worker_config(Some(dir.path()), &project).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("broken-project"), "{message}");
+            assert!(message.contains("runnable path"), "{message}");
+        }
     }
 
     #[test]

@@ -1169,6 +1169,36 @@ impl ProjectEntry {
         self.path.as_deref().or(self.root_dir.as_deref())
     }
 
+    /// Returns the registered worker cwd without depending on the launch directory.
+    ///
+    /// # Errors
+    /// Fails for unset, relative, inaccessible, or non-directory runnable paths.
+    pub fn worker_cwd(&self) -> anyhow::Result<&Path> {
+        let path = self
+            .runnable_path()
+            .ok_or_else(|| anyhow::anyhow!("project {:?} has no runnable path", self.name))?;
+        anyhow::ensure!(
+            path.is_absolute(),
+            "project {:?} runnable path {} must be absolute",
+            self.name,
+            path.display()
+        );
+        let metadata = std::fs::metadata(path).map_err(|error| {
+            anyhow::Error::new(error).context(format!(
+                "project {:?} cannot access runnable path {}",
+                self.name,
+                path.display()
+            ))
+        })?;
+        anyhow::ensure!(
+            metadata.is_dir(),
+            "project {:?} runnable path {} is not a directory",
+            self.name,
+            path.display()
+        );
+        Ok(path)
+    }
+
     /// Stable user-local directory name for shared runtime state.
     ///
     /// A readable prefix aids operators while the project-name hash prevents

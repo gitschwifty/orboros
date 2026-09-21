@@ -102,6 +102,11 @@ pub struct StateReceipt {
 pub enum SharedStateMutation {
     /// Create or replace the latest record for one orb.
     UpsertOrb { orb: Orb },
+    /// Operator retry intent, including the full failed snapshot in the audit event.
+    ResetOrb {
+        orb: Orb,
+        event: orbs::audit::AuditEvent,
+    },
     /// Create or replace the latest record for one dependency edge.
     UpsertDependency { edge: DepEdge },
     /// Apply several related changes as one authoritative operation. This is
@@ -592,6 +597,22 @@ impl SupervisorStoreWriter {
         ))
     }
 
+    /// Prepare against a captured revision; reject concurrent state changes.
+    pub fn reset_orb(
+        &self,
+        store: &orbs::orb_store::OrbStore,
+        id: &str,
+        reason: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let revision = self.snapshot_revision()?;
+        let (orb, event) = crate::orb_cmd::prepare_reset(store, id, reason)?;
+        self.submit(
+            &SharedStateMutation::ResetOrb { orb, event },
+            Some(revision),
+        )?;
+        Ok(())
+    }
+
     /// Submit related mutations as one revisioned, replayable operation.
     pub fn submit_batch(&self, mutations: Vec<SharedStateMutation>) -> io::Result<u64> {
         self.submit(&SharedStateMutation::Batch { mutations }, None)
@@ -826,12 +847,11 @@ impl LocalSupervisor {
         .with_execution_log_path(authority.project().execution_log_path(&self.home))
         .with_project_key(project_name);
         self.queues.insert(project_name.into(), queue);
-        let dispatch = crate::worker::dispatcher::default_worker_config(
+        let dispatch = crate::worker::dispatcher::project_worker_config(
             Some(&self.home),
-            authority.project().config_root(),
+            authority.project(),
         )
-        .map(|mut base_worker_config| {
-            base_worker_config.cwd = authority.project().runnable_path().map(Path::to_path_buf);
+        .map(|base_worker_config| {
             crate::daemon::DispatchSettings {
                 base_worker_config,
                 max_concurrency: crate::config::load_config(authority.project().config_root())
@@ -1055,6 +1075,14 @@ impl StateProjection {
             SharedStateMutation::UpsertOrb { orb } => {
                 append_materialized(&state_dir.join("orbs.jsonl"), &orb)?;
             }
+            SharedStateMutation::ResetOrb { orb, event } => {
+                crate::orb_cmd::persist_reset(state_dir, &orb, &event).map_err(|source| {
+                    StateProjectionError::Write {
+                        path: state_dir.to_path_buf(),
+                        source,
+                    }
+                })?;
+            }
             SharedStateMutation::UpsertDependency { edge } => {
                 append_materialized(&state_dir.join("deps.jsonl"), &edge)?;
             }
@@ -1187,6 +1215,34 @@ mod tests {
     use orbs::orb_store::OrbStore;
 
     use super::*;
+
+    #[test]
+    fn reset_projection_replay_preserves_audit_identity_and_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OrbStore::new(dir.path().join("orbs.jsonl"));
+        let mut orb = Orb::new("Failed", "specification");
+        orb.status = Some(orbs::orb::OrbStatus::Failed);
+        orb.result = Some("setup failure".into());
+        store.append(&orb).unwrap();
+        let (reset, event) =
+            crate::orb_cmd::prepare_reset(&store, orb.id.as_str(), Some("fixed")).unwrap();
+        let mutation = SharedStateMutation::ResetOrb { orb: reset, event };
+        StateProjection::apply_mutation(dir.path(), mutation.clone()).unwrap();
+        StateProjection::apply_mutation(dir.path(), mutation).unwrap();
+        let events = orbs::audit_store::AuditStore::new(dir.path().join("events.jsonl"))
+            .events_for_orb(&orb.id)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0]
+            .details
+            .as_ref()
+            .unwrap()
+            .contains("setup failure"));
+        assert_eq!(
+            store.load_by_id(&orb.id).unwrap().unwrap().status,
+            Some(orbs::orb::OrbStatus::Pending)
+        );
+    }
 
     fn metadata(project_id: &str, epoch: u64) -> ProjectLeaseMetadata {
         ProjectLeaseMetadata {
