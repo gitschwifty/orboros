@@ -40,3 +40,41 @@ Remaining: typed transport attribution through spawn/send error paths, phase
 recovery labels, telemetry-level indexing and exhaustive fixtures. Existing
 human-readable error storage is unchanged; complete redaction of arbitrary
 upstream error bodies needs a separate boundary audit. No checks were run.
+
+## Tasks 138–142: graph, admission, boundaries and terminal validity
+
+138: explicit local IDs and `depends_on` now override legacy order groups.
+Validation rejects mixed schemas, duplicate/empty IDs, unknown references,
+self-dependencies and cycles before materialization. Explicit graphs persist
+exact prerequisite edges, including fan-in/fan-out; node summaries are logged.
+The prompt requests explicit dependencies and artifact rationale. Historical
+order-only output remains accepted. Remaining: enforce graph-only new worker
+output separately from historical readers, durable local-ID graph evidence,
+rationale validation and updated end-to-end worker fixtures.
+
+139: each queue dispatch pass checks declared child edges and current child
+statuses before admitting a child-bearing phase parent for final execution.
+Missing edge targets and reset/failed children block admission, as does a false
+final-work decision. Logs expose the checkpoint. Remaining: durable accepted
+checkpoint/attempt lineage, atomic admission against concurrent reset, and
+restart/rollback exactly-once guarantees. A log checkpoint is not durable proof.
+
+140: dispatch logs report effective local cap, queued candidates and available
+aggregate permits, explicitly distinguishing queued state from in-flight work.
+Remaining: configuration-layer provenance, startup aggregate `unbounded` output,
+periodic usage/status integration and individual capacity-blocked decisions.
+
+141: no enforcement change. Current profiles filter tool names, not filesystem
+access. A correct denial covering bash, symlinks and traversal requires an
+execution-runtime capability in Heddle. No cross-repository changes were made.
+Still needed: runtime path denial, bounded current-state capability, separate
+research/artifact-write profile and durable denial diagnostics. Prompt advice
+cannot satisfy this access boundary.
+
+142: obvious terminal DSML/XML/native JSON tool-call envelopes fail closed with
+`malformed_terminal_output`, enter bounded fresh-worker retry, and are removed
+from the ordinary result. No worktree-edit requirement is imposed. The existing
+protected worker transcript remains the place for raw response evidence.
+Remaining: profile-specific structured completion fields, nested/mixed provider
+fragments and broader protocol fixtures. Focused graph and terminal-envelope
+tests were added but not executed.

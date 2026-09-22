@@ -129,6 +129,9 @@ fn failure_cause(outcome: &DispatchOutcome) -> Option<&'static str> {
             "unknown"
         });
     }
+    if outcome.error.as_deref() == Some("malformed_terminal_output: unresolved provider tool call") {
+        return Some("malformed_terminal_output");
+    }
     Some("unknown")
 }
 
@@ -381,7 +384,7 @@ pub(crate) async fn dispatch_orb_with_retry_limit(
                 break outcome;
             }
         }
-        let (outcome, retry_kind) = match Worker::spawn(&attempt_config).await {
+        let (mut outcome, mut retry_kind) = match Worker::spawn(&attempt_config).await {
             Ok(mut worker) => match worker.send(&send_id, &attempt_prompt).await {
                 Ok(send_outcome) => {
                     let retryable = send_outcome
@@ -459,6 +462,14 @@ pub(crate) async fn dispatch_orb_with_retry_limit(
                 )
             }
         };
+        if outcome.status == DispatchStatus::Done
+            && outcome.response.as_deref().is_some_and(unresolved_tool_output)
+        {
+            outcome.status = DispatchStatus::Failed;
+            outcome.response = None;
+            outcome.error = Some("malformed_terminal_output: unresolved provider tool call".into());
+            retry_kind = Some(RetryKind::Transient);
+        }
         attempts.push(DispatchAttempt::from_outcome(&outcome));
         // Give the supervisor's shutdown watcher a chance to stop admission
         // before deciding whether this retry can create another worker.
@@ -628,6 +639,23 @@ fn prepare_fresh_worker_attempt(worker_config: &mut WorkerConfig) -> std::io::Re
         runtime.state_root = Some(worker_state.display().to_string());
     }
     Ok(())
+}
+
+/// Reject protocol envelopes, without interpreting ordinary prose mentioning tools.
+fn unresolved_tool_output(response: &str) -> bool {
+    let text = response.trim();
+    if text.starts_with("<｜DSML｜tool_calls>")
+        || text.starts_with("<tool_call>")
+        || text.starts_with("<tool_calls>")
+        || text.starts_with("<|tool_call|>")
+    {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(text).ok().is_some_and(|value| {
+        value.get("tool_calls").and_then(serde_json::Value::as_array)
+            .is_some_and(|calls| !calls.is_empty())
+            || value.get("type").and_then(serde_json::Value::as_str) == Some("function_call")
+    })
 }
 
 fn build_outcome(
@@ -1685,5 +1713,18 @@ credential_source = "keychain:orboros/straitly"
             Some(crate::ipc::types::HeadlessCredentialSource::Keychain { ref reference })
                 if reference == "keychain:orboros/straitly"
         ));
+    }
+}
+
+#[cfg(test)]
+mod terminal_validity_tests {
+    use super::unresolved_tool_output;
+
+    #[test]
+    fn rejects_unresolved_protocol_but_allows_no_edit_completion() {
+        assert!(unresolved_tool_output("<｜DSML｜tool_calls>pending"));
+        assert!(unresolved_tool_output(r#"{"tool_calls":[{"id":"call_1"}]}"#));
+        assert!(!unresolved_tool_output("Inspection complete; no changes needed."));
+        assert!(!unresolved_tool_output("The tool_calls field is documented."));
     }
 }
