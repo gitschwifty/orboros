@@ -409,3 +409,20 @@ the local benchmark archive and preserves its lookup metadata.
 | `docs` | status | Documentation |
 | `epic` | phase | Large initiative, decomposes into features/tasks |
 | `feature` | phase | Feature, decomposes into tasks |
+
+### Inspect low-confidence results
+
+Use `orboros review-queue --max-confidence 0.5` to list orbs with a recorded
+self-reported score at or below the threshold, including their lifecycle and
+next inspection command. Unscored orbs are excluded. This view does not apply
+a review decision or change state. Without the flag, `review-queue` continues
+to show second-opinion revise verdicts.
+
+### JSON operational file output
+
+Pass `--log-json` to keep the terminal readable while writing versioned JSON
+lines to the operational file sink. For example,
+`orboros --log-file /tmp/orboros.log --log-json daemon` writes
+`/tmp/orboros.log.jsonl`. Without `--log-file`, the existing project or
+supervisor log location is used with the same extra suffix. Rotated logs use
+`.1` after the full filename. Benchmark run logs remain text.

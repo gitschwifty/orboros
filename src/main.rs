@@ -54,6 +54,11 @@ struct Cli {
     #[arg(long, global = true)]
     log_file: Option<String>,
 
+    /// Write operational file logs as JSON lines; terminal and benchmark logs stay readable.
+    /// JSON output uses the selected log path with an additional .jsonl suffix.
+    #[arg(long, global = true)]
+    log_json: bool,
+
     /// Tracing filter directive, e.g. `orboros=debug,tokio=warn`.
     #[arg(long, global = true)]
     log_level: Option<String>,
@@ -172,7 +177,12 @@ enum Commands {
     },
     /// List orbs whose second-opinion reviewer verdict is `Revise`,
     /// pending operator action.
-    ReviewQueue,
+    ReviewQueue {
+        /// Show scored orbs at or below this threshold instead of revise verdicts.
+        /// Missing confidence is excluded; this does not change lifecycle state.
+        #[arg(long, value_name = "0..1")]
+        max_confidence: Option<f32>,
+    },
     /// Benchmark corpus + harness (task 59).
     Bench {
         /// Root containing t1/, t2/, t3/, prompts/, and results/.
@@ -846,6 +856,15 @@ fn main() -> anyhow::Result<()> {
             .or_else(|| global_logging.file.as_deref().map(resolve_state_dir))
             .or(default_log_file)
     });
+    let general_log_file = general_log_file.map(|path| {
+        if cli.log_json {
+            let mut name = path.into_os_string();
+            name.push(".jsonl");
+            PathBuf::from(name)
+        } else {
+            path
+        }
+    });
     if let Some(path) = general_log_file.as_deref() {
         orboros::bench::log::start_general(path)?;
     }
@@ -880,14 +899,21 @@ fn main() -> anyhow::Result<()> {
                 .with_target(false)
                 .with_filter(bench_filter),
         )
-        .with(
+        .with((!cli.log_json).then(|| {
             tracing_subscriber::fmt::layer()
                 .with_writer(orboros::bench::log::GeneralLogWriter)
                 .with_timer(orboros::time::LocalTimestamp)
                 .with_ansi(false)
                 .with_target(false)
-                .with_filter(file_filter),
-        )
+                .with_filter(file_filter.clone())
+        }))
+        .with(cli.log_json.then(|| {
+            tracing_subscriber::fmt::layer()
+                .event_format(orboros::operational_log::JsonOperationalFormat)
+                .with_writer(orboros::bench::log::GeneralLogWriter)
+                .with_ansi(false)
+                .with_filter(file_filter)
+        }))
         .init();
     std::fs::create_dir_all(&state_dir)?;
 
@@ -964,11 +990,7 @@ fn main() -> anyhow::Result<()> {
             if let Some(pf) = pid_file {
                 daemon_config.pid_file = resolve_state_dir(&pf);
             }
-            if let Some(lf) = &cli.log_file {
-                daemon_config.log_file = Some(resolve_state_dir(lf));
-            } else if daemon_config.log_file.is_none() {
-                daemon_config.log_file.clone_from(&general_log_file);
-            }
+            daemon_config.log_file.clone_from(&general_log_file);
             if let Some(ti) = tick_interval {
                 daemon_config.tick_interval_ms = ti;
             }
@@ -1189,9 +1211,12 @@ fn main() -> anyhow::Result<()> {
                 orboros::hooks::cmd::cmd_hooks_log(&state_dir, orb.as_deref(), limit)
             }
         },
-        Commands::ReviewQueue => {
+        Commands::ReviewQueue { max_confidence } => {
             let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
-            orb_cmd::cmd_review_queue(&orb_store)
+            match max_confidence {
+                Some(threshold) => orb_cmd::cmd_low_confidence_queue(&orb_store, threshold),
+                None => orb_cmd::cmd_review_queue(&orb_store),
+            }
         }
         Commands::Bench {
             bench_root,

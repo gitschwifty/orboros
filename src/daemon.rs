@@ -170,7 +170,9 @@ pub fn rotate_log(config: &DaemonConfig) -> Result<()> {
     }
 
     // Rotate: rename current to .1
-    let rotated = log_file.with_extension("log.1");
+    let mut rotated_name = log_file.as_os_str().to_os_string();
+    rotated_name.push(".1");
+    let rotated = PathBuf::from(rotated_name);
     std::fs::rename(log_file, &rotated)
         .with_context(|| format!("rotating log file to {}", rotated.display()))?;
 
