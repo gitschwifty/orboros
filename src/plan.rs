@@ -171,7 +171,7 @@ pub fn print_plan_status(store: &OrbStore, dep_store: &DepStore, id: &str) -> an
     );
     let all_orbs = store.load_all()?;
     let children = store.load_children(&epic.id)?;
-    let ready = dep_store.ready(&all_orbs).unwrap_or_default();
+    let ready = dep_store.ready(&all_orbs)?;
     let phase = epic.phase.unwrap_or(OrbPhase::Pending);
     let child_done = children
         .iter()
@@ -195,34 +195,52 @@ pub fn print_plan_status(store: &OrbStore, dep_store: &DepStore, id: &str) -> an
     println!(
         "Dispatch:   {}",
         if epic.execution.is_some() {
-            "in flight (execution marker present)"
+            "execution marker present (worker liveness not confirmed)"
         } else {
             "no execution marker"
         }
     );
-    let next = match phase {
-        OrbPhase::Speccing
-        | OrbPhase::Decomposing
-        | OrbPhase::Refining
-        | OrbPhase::Reevaluating
-            if epic.execution.is_none() =>
-        {
-            format!("eligible for {} dispatch", phase_name(phase))
-        }
-        OrbPhase::Review => "awaiting review decision".to_string(),
-        OrbPhase::Waiting if child_failed > 0 => {
-            "blocked: reset or recover the failed child before continuing".to_string()
-        }
-        OrbPhase::Waiting if child_done == children.len() && !children.is_empty() => {
-            "children complete; queue will advance parent final work or completion".to_string()
-        }
-        OrbPhase::Waiting => "children are ready for queue execution".to_string(),
-        OrbPhase::Done => "complete".to_string(),
-        OrbPhase::Failed => "failed; inspect attempts, then reset the relevant orb".to_string(),
-        _ => "not currently queue-dispatchable; inspect lifecycle state".to_string(),
-    };
+    let next = plan_next_action(
+        phase, epic.execution.is_some(), epic.id.as_str(), children.len(),
+        child_done, child_failed, child_ready,
+    );
     println!("Next action: {next}");
     Ok(())
+}
+
+fn plan_next_action(
+    phase: OrbPhase,
+    execution_present: bool,
+    id: &str,
+    child_count: usize,
+    child_done: usize,
+    child_failed: usize,
+    child_ready: usize,
+) -> String {
+    if execution_present {
+        return format!(
+            "execution marker present; confirm worker activity with orboros orb logs {id} and orboros daemon --status before recovery"
+        );
+    }
+    match phase {
+        OrbPhase::Speccing | OrbPhase::Decomposing | OrbPhase::Refining | OrbPhase::Reevaluating => {
+            format!("eligible for {} dispatch; orboros execute {id} --wait", phase_name(phase))
+        }
+        OrbPhase::Review => format!("awaiting review; orboros orb show {id}, then orboros orb review {id} <decision>"),
+        OrbPhase::Waiting if child_failed > 0 => {
+            format!("blocked by failed child; orboros orb deps {id}, then inspect that child's orb logs and orb reset it")
+        }
+        OrbPhase::Waiting if child_done == child_count && child_count > 0 => {
+            format!("children complete; orboros execute {id} --wait advances parent final work or completion")
+        }
+        OrbPhase::Waiting if child_ready > 0 => {
+            format!("{child_ready} children ready; orboros execute {id} --wait")
+        }
+        OrbPhase::Waiting => format!("no ready children; orboros orb deps {id} to inspect dependencies and orboros orb show <child-id> to inspect lifecycle"),
+        OrbPhase::Done => "complete; no further action required".to_string(),
+        OrbPhase::Failed => format!("failed; orboros orb logs {id}, then orboros orb reset {id} after resolving the failure"),
+        _ => format!("not currently queue-dispatchable; orboros orb show {id} to inspect lifecycle state"),
+    }
 }
 
 fn phase_name(phase: OrbPhase) -> &'static str {
@@ -436,6 +454,24 @@ mod tests {
 
     fn tmp_base_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn waiting_plan_guidance_distinguishes_blocked_and_ready_children() {
+        let blocked = plan_next_action(OrbPhase::Waiting, false, "orb-test", 2, 0, 0, 0);
+        assert!(blocked.contains("no ready children"));
+        assert!(blocked.contains("orb deps orb-test"));
+        let ready = plan_next_action(OrbPhase::Waiting, false, "orb-test", 2, 0, 0, 1);
+        assert!(ready.contains("execute orb-test --wait"));
+        let failed = plan_next_action(OrbPhase::Waiting, false, "orb-test", 2, 0, 1, 0);
+        assert!(failed.contains("failed child"));
+    }
+
+    #[test]
+    fn execution_marker_is_not_proof_of_a_live_worker() {
+        let next = plan_next_action(OrbPhase::Refining, true, "orb-test", 1, 0, 0, 0);
+        assert!(next.contains("confirm worker activity"));
+        assert!(!next.contains("eligible"));
     }
 
     #[test]
