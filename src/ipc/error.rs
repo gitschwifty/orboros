@@ -53,7 +53,8 @@ impl IpcError {
     pub const fn is_fatal_init_failure(&self) -> bool {
         matches!(
             self,
-            Self::Cleanup(_) | Self::InitRejected { .. }
+            Self::Cleanup(_)
+                | Self::InitRejected { .. }
                 | Self::ProtocolVersionMismatch { .. }
                 | Self::UnexpectedResponse { .. }
         )

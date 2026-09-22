@@ -96,8 +96,8 @@ struct DispatchClaim {
 
 impl DispatchClaim {
     fn acquire(store: &OrbStore, orb: &Orb) -> std::io::Result<Self> {
-        use std::io::Write;
         use sha2::{Digest, Sha256};
+        use std::io::Write;
 
         let parent = store.path().parent().unwrap_or_else(|| Path::new("."));
         let directory = parent.join("dispatch-claims");
@@ -106,14 +106,20 @@ impl DispatchClaim {
         let key = format!("{:x}", Sha256::digest(orb.id.to_string().as_bytes()));
         let path = directory.join(format!("{key}.claim"));
         let attempt_id = uuid::Uuid::new_v4().to_string();
-        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
-        serde_json::to_writer(&mut file, &serde_json::json!({
-            "attempt_id": attempt_id,
-            "orb_id": orb.id.to_string(),
-            "claimed_at": chrono::Utc::now(),
-            "phase": orb.phase,
-            "status": orb.status,
-        }))?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        serde_json::to_writer(
+            &mut file,
+            &serde_json::json!({
+                "attempt_id": attempt_id,
+                "orb_id": orb.id.to_string(),
+                "claimed_at": chrono::Utc::now(),
+                "phase": orb.phase,
+                "status": orb.status,
+            }),
+        )?;
         file.write_all(b"\n")?;
         file.sync_all()?;
         std::fs::File::open(&directory)?.sync_all()?;
@@ -124,8 +130,15 @@ impl DispatchClaim {
         // Shared writers acknowledge journal durability; local writers need
         // their projection synced before the admission claim is retired.
         std::fs::File::open(store.path())?.sync_all()?;
-        let parent = self.path.parent().ok_or_else(|| std::io::Error::other("claim has no parent"))?;
-        std::fs::rename(&self.path, self.path.with_extension(format!("{}.resolved", self.attempt_id)))?;
+        let parent = self
+            .path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("claim has no parent"))?;
+        std::fs::rename(
+            &self.path,
+            self.path
+                .with_extension(format!("{}.resolved", self.attempt_id)),
+        )?;
         std::fs::File::open(parent)?.sync_all()
     }
 }
@@ -133,15 +146,22 @@ impl DispatchClaim {
 /// Missing predecessors are blockers, just like failed or incomplete ones.
 fn execution_dependencies_done(orb: &Orb, orbs: &[Orb], edges: &[orbs::dep::DepEdge]) -> bool {
     use orbs::dep::EdgeType;
-    edges.iter().filter_map(|edge| {
-        if edge.edge_type == EdgeType::DependsOn && edge.from == orb.id {
-            Some(&edge.to)
-        } else if edge.edge_type == EdgeType::Blocks && edge.to == orb.id {
-            Some(&edge.from)
-        } else {
-            None
-        }
-    }).all(|id| orbs.iter().any(|candidate| &candidate.id == id && candidate.effective_status() == TaskStatus::Done))
+    edges
+        .iter()
+        .filter_map(|edge| {
+            if edge.edge_type == EdgeType::DependsOn && edge.from == orb.id {
+                Some(&edge.to)
+            } else if edge.edge_type == EdgeType::Blocks && edge.to == orb.id {
+                Some(&edge.from)
+            } else {
+                None
+            }
+        })
+        .all(|id| {
+            orbs.iter().any(|candidate| {
+                &candidate.id == id && candidate.effective_status() == TaskStatus::Done
+            })
+        })
 }
 
 /// Determines the last completed refinement round visible from an orb
@@ -527,7 +547,9 @@ impl QueueLoop {
 
         result.pipelines_started = self.start_pipelines_with_hooks(&all_orbs).await?;
         result.orbs_executed = self.execute_ready_with_hooks(&all_orbs).await?;
-        result.roots_completed = self.complete_roots_with_hooks(&self.orb_store.load_all()?).await?;
+        result.roots_completed = self
+            .complete_roots_with_hooks(&self.orb_store.load_all()?)
+            .await?;
         result.orbs_reevaluated = self.reevaluate_waiting_with_hooks(&all_orbs).await?;
 
         Ok(result)
@@ -1251,7 +1273,10 @@ fn blocked_by_parent_review(orb: &Orb, orbs: &[Orb]) -> bool {
         let Some(parent) = orbs.iter().find(|candidate| &candidate.id == id) else {
             return true;
         };
-        if matches!(parent.effective_status(), TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Tombstone) {
+        if matches!(
+            parent.effective_status(),
+            TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Tombstone
+        ) {
             return true;
         }
         let phase_parent_released = matches!(
@@ -1286,9 +1311,16 @@ fn has_children(orb: &Orb, orbs: &[Orb]) -> bool {
 /// Task parents are aggregates; phase parents may own final work only after
 /// every required child completed. Child results remain the durable evidence.
 fn parent_execution_ready(orb: &Orb, orbs: &[Orb]) -> bool {
-    let children: Vec<_> = orbs.iter().filter(|child| child.parent_id.as_ref() == Some(&orb.id)).collect();
-    children.is_empty() || (orb.orb_type.uses_phase() && orb.has_parent_final_work
-        && children.iter().all(|child| child.effective_status() == TaskStatus::Done))
+    let children: Vec<_> = orbs
+        .iter()
+        .filter(|child| child.parent_id.as_ref() == Some(&orb.id))
+        .collect();
+    children.is_empty()
+        || (orb.orb_type.uses_phase()
+            && orb.has_parent_final_work
+            && children
+                .iter()
+                .all(|child| child.effective_status() == TaskStatus::Done))
 }
 
 /// A required child failure blocks the parent without changing the parent's
@@ -1687,8 +1719,12 @@ async fn dispatch_one_owned(
 
     let claim_store = store.clone();
     let claim_orb = orb.clone();
-    let claim = match tokio::task::spawn_blocking(move || DispatchClaim::acquire(&claim_store, &claim_orb))
-        .await.map_err(std::io::Error::other)? {
+    let claim = match tokio::task::spawn_blocking(move || {
+        DispatchClaim::acquire(&claim_store, &claim_orb)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+    {
         Ok(claim) => claim,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             tracing::warn!(orb = %orb.id, "unresolved dispatch claim; explicit recovery required");
@@ -1707,7 +1743,9 @@ async fn dispatch_one_owned(
                     && parent_execution_ready(current, &current_orbs)))
     });
     if !eligible || !running.load(Ordering::SeqCst) {
-        tokio::task::spawn_blocking(move || claim.finish(&store)).await.map_err(std::io::Error::other)??;
+        tokio::task::spawn_blocking(move || claim.finish(&store))
+            .await
+            .map_err(std::io::Error::other)??;
         return Ok(false);
     }
     if let Some(current) = fresh {
@@ -2621,7 +2659,9 @@ async fn dispatch_one_owned(
     }
 
     store.update(&orb)?;
-    tokio::task::spawn_blocking(move || claim.finish(&store)).await.map_err(std::io::Error::other)??;
+    tokio::task::spawn_blocking(move || claim.finish(&store))
+        .await
+        .map_err(std::io::Error::other)??;
     Ok(outcome.status == crate::worker::dispatcher::DispatchStatus::Done)
 }
 
@@ -2678,7 +2718,10 @@ mod tests {
         let path = claim.path.clone();
         let attempt_id = claim.attempt_id.clone();
         drop(claim);
-        assert_eq!(DispatchClaim::acquire(&store, &orb).err().unwrap().kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            DispatchClaim::acquire(&store, &orb).err().unwrap().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
         DispatchClaim { path, attempt_id }.finish(&store).unwrap();
         assert!(DispatchClaim::acquire(&store, &orb).is_ok());
     }
@@ -2688,9 +2731,17 @@ mod tests {
         let orb = Orb::new("Execute", "requires predecessor");
         let mut dependency = Orb::new("Dependency", "must succeed");
         let edge = DepEdge::new(orb.id.clone(), dependency.id.clone(), EdgeType::DependsOn);
-        assert!(!execution_dependencies_done(&orb, &[], std::slice::from_ref(&edge)));
+        assert!(!execution_dependencies_done(
+            &orb,
+            &[],
+            std::slice::from_ref(&edge)
+        ));
         dependency.status = Some(OrbStatus::Failed);
-        assert!(!execution_dependencies_done(&orb, std::slice::from_ref(&dependency), std::slice::from_ref(&edge)));
+        assert!(!execution_dependencies_done(
+            &orb,
+            std::slice::from_ref(&dependency),
+            std::slice::from_ref(&edge)
+        ));
         dependency.status = Some(OrbStatus::Done);
         assert!(execution_dependencies_done(&orb, &[dependency], &[edge]));
     }
@@ -2698,7 +2749,8 @@ mod tests {
     #[test]
     fn missing_and_cyclic_parent_evidence_blocks_dispatch() {
         let mut parent = Orb::new("Parent", "parent");
-        let child = Orb::new("Child", "child").with_parent(parent.id.clone(), Some(parent.id.clone()));
+        let child =
+            Orb::new("Child", "child").with_parent(parent.id.clone(), Some(parent.id.clone()));
         assert!(blocked_by_parent_review(&child, &[]));
         parent.parent_id = Some(child.id.clone());
         assert!(blocked_by_parent_review(&child, &[parent, child.clone()]));

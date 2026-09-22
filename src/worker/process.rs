@@ -98,7 +98,10 @@ impl OwnedProcessGroup {
         let _ = child;
         Self {
             #[cfg(unix)]
-            id: child.id().and_then(|id| libc::pid_t::try_from(id).ok()).filter(|id| *id > 0),
+            id: child
+                .id()
+                .and_then(|id| libc::pid_t::try_from(id).ok())
+                .filter(|id| *id > 0),
         }
     }
 
@@ -585,15 +588,22 @@ impl Worker {
         // Once the entire owned group was terminated, a failed handshake does
         // not make checkout reuse unsafe. Keep its diagnostic visible.
         if !matches!(handshake, Ok(Ok(()))) {
-            warn!(?handshake, "worker shutdown handshake failed; owned group terminated");
+            warn!(
+                ?handshake,
+                "worker shutdown handshake failed; owned group terminated"
+            );
         }
         Ok(())
     }
 
     async fn terminate_owned(&mut self) -> Result<(), IpcError> {
-        self.group.terminate().map_err(|error| IpcError::Cleanup(error.to_string()))?;
+        self.group
+            .terminate()
+            .map_err(|error| IpcError::Cleanup(error.to_string()))?;
         #[cfg(not(unix))]
-        self.child.start_kill().map_err(|error| IpcError::Cleanup(error.to_string()))?;
+        self.child
+            .start_kill()
+            .map_err(|error| IpcError::Cleanup(error.to_string()))?;
         tokio::time::timeout(Duration::from_secs(5), self.child.wait())
             .await
             .map_err(|_| IpcError::Cleanup("timed out reaping worker".into()))?

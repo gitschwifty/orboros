@@ -7,7 +7,9 @@ use crate::config::OrbConfig;
 const COMPLETION_CHECKPOINT: &str = "orboros:checkpoint:post_completion";
 
 pub(crate) fn is_completion_checkpoint(orb: &Orb) -> bool {
-    orb.labels.iter().any(|label| label == COMPLETION_CHECKPOINT)
+    orb.labels
+        .iter()
+        .any(|label| label == COMPLETION_CHECKPOINT)
 }
 
 pub(crate) fn clear_checkpoint(orb: &mut Orb) {

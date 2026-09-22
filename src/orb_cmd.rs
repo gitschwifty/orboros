@@ -1050,11 +1050,12 @@ pub fn cmd_orb_review(
         .load_children(&orb.id)
         .context("failed to load orb children")?;
     let post_completion_review = orb.orb_type.uses_phase()
-        && (crate::phases::review::is_completion_checkpoint(&orb) || orb
-            .execution
-            .as_ref()
-            .and_then(|execution| execution.prompt_category.as_deref())
-            == Some("worker.execute")
+        && (crate::phases::review::is_completion_checkpoint(&orb)
+            || orb
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.prompt_category.as_deref())
+                == Some("worker.execute")
             || (!children.is_empty()
                 && children
                     .iter()

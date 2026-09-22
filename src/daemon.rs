@@ -438,7 +438,9 @@ pub async fn run_supervisor_with_control_socket(
         .iter()
         .map(|project| project.queue.clone())
         .collect();
-    let admission_supervisor = control_socket.as_ref().map(|(_, supervisor)| std::sync::Arc::clone(supervisor));
+    let admission_supervisor = control_socket
+        .as_ref()
+        .map(|(_, supervisor)| std::sync::Arc::clone(supervisor));
     let admission_stop_task = tokio::spawn(async move {
         if admission_shutdown_rx.changed().await.is_ok() && *admission_shutdown_rx.borrow() {
             for queue in admission_queues {

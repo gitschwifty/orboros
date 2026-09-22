@@ -797,8 +797,11 @@ pub fn apply_dispatch_outcome_with_review(
             orb.confidence = outcome.confidence;
             if orb.orb_type.uses_phase() {
                 if orb.phase == Some(OrbPhase::Reevaluating) {
-                    if let Some(plan) = outcome.response.as_deref()
-                        .and_then(crate::phases::re_evaluation::parse_response) {
+                    if let Some(plan) = outcome
+                        .response
+                        .as_deref()
+                        .and_then(crate::phases::re_evaluation::parse_response)
+                    {
                         crate::phases::re_evaluation::apply_plan(orb, &plan)?;
                         if orb.phase != Some(OrbPhase::Failed) {
                             orb.execution = None;

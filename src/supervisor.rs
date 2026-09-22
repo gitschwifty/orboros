@@ -278,9 +278,11 @@ impl OperationJournal {
         let mut row = Vec::new();
         loop {
             row.clear();
-            let count = reader.read_until(b'\n', &mut row).map_err(|source| OperationJournalError::Read {
-                path: path.clone(),
-                source,
+            let count = reader.read_until(b'\n', &mut row).map_err(|source| {
+                OperationJournalError::Read {
+                    path: path.clone(),
+                    source,
+                }
             })?;
             if count == 0 {
                 break;
@@ -294,22 +296,28 @@ impl OperationJournal {
                 Ok(receipt) => receipt,
                 Err(source) if !terminated && source.is_eof() => {
                     tracing::warn!(path = %path.display(), offset, %source, "discarding incomplete journal tail");
-                    reader.get_ref().set_len(offset).map_err(|source| OperationJournalError::Append {
-                        path: path.clone(),
-                        source,
+                    reader.get_ref().set_len(offset).map_err(|source| {
+                        OperationJournalError::Append {
+                            path: path.clone(),
+                            source,
+                        }
                     })?;
                     break;
                 }
-                Err(source) => return Err(OperationJournalError::Parse {
-                    path: path.clone(),
-                    source,
-                }),
+                Err(source) => {
+                    return Err(OperationJournalError::Parse {
+                        path: path.clone(),
+                        source,
+                    })
+                }
             };
             if !terminated {
                 tracing::warn!(path = %path.display(), "repairing missing journal delimiter");
-                reader.get_mut().write_all(b"\n").map_err(|source| OperationJournalError::Append {
-                    path: path.clone(),
-                    source,
+                reader.get_mut().write_all(b"\n").map_err(|source| {
+                    OperationJournalError::Append {
+                        path: path.clone(),
+                        source,
+                    }
                 })?;
             }
             revision = revision.max(receipt.revision);
@@ -317,7 +325,9 @@ impl OperationJournal {
             offset += count as u64;
         }
         // Persist recovery and the directory entry before exposing receipts.
-        reader.get_ref().sync_all()
+        reader
+            .get_ref()
+            .sync_all()
             .and_then(|()| File::open(state_dir)?.sync_all())
             .map_err(|source| OperationJournalError::Append {
                 path: path.clone(),
@@ -860,12 +870,13 @@ impl LocalSupervisor {
                 if !detached && self.projects.contains_key(&project_name) {
                     SupervisorResponse::Rejected {
                         code: "project_draining".into(),
-                        detail: "admission stopped; retry detach after the active tick drains".into(),
+                        detail: "admission stopped; retry detach after the active tick drains"
+                            .into(),
                     }
                 } else {
                     SupervisorResponse::Detached { detached }
                 }
-            },
+            }
             SupervisorRequest::Status { project_name } => self.project(&project_name).map_or_else(
                 || SupervisorResponse::Rejected {
                     code: "project_not_attached".into(),
@@ -948,7 +959,9 @@ impl LocalSupervisor {
         HashMap<String, Option<crate::daemon::DispatchSettings>>,
     ) {
         // Only one snapshot may own a tick for a project at a time.
-        let queues: HashMap<_, _> = self.queues.iter()
+        let queues: HashMap<_, _> = self
+            .queues
+            .iter()
             .filter(|(name, _)| !self.ticking.contains(*name))
             .map(|(name, queue)| (name.clone(), queue.clone()))
             .collect();
@@ -1070,7 +1083,11 @@ impl ProjectStateAuthority {
     fn project_pending_operations(&mut self) -> Result<(), StateProjectionError> {
         let mut applied_revision = StateProjection::applied_revision(&self.state_dir)?;
         if applied_revision > self.journal.revision() {
-            tracing::warn!(applied_revision, journal_revision = self.journal.revision(), "projection watermark exceeds journal; replaying from the beginning");
+            tracing::warn!(
+                applied_revision,
+                journal_revision = self.journal.revision(),
+                "projection watermark exceeds journal; replaying from the beginning"
+            );
             applied_revision = 0;
         }
         for receipt in self.journal.receipts_after(applied_revision) {
