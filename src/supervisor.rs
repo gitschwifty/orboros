@@ -229,6 +229,8 @@ pub enum StateProjectionError {
 /// Failures exposed by the project state authority.
 #[derive(Debug, Error)]
 pub enum ProjectAuthorityError {
+    #[error("supervisor is stopping")]
+    Stopping,
     #[error(transparent)]
     Lease(#[from] ProjectLeaseError),
     #[error(transparent)]
@@ -482,6 +484,8 @@ pub struct LocalSupervisor {
     next_epoch: u64,
     projects: HashMap<String, ProjectStateAuthority>,
     queues: HashMap<String, crate::queue_loop::QueueLoop>,
+    ticking: std::collections::HashSet<String>,
+    stopping: bool,
     dispatch: HashMap<String, Option<crate::daemon::DispatchSettings>>,
 }
 
@@ -771,6 +775,8 @@ impl LocalSupervisor {
             next_epoch: 1,
             projects: HashMap::new(),
             queues: HashMap::new(),
+            ticking: std::collections::HashSet::new(),
+            stopping: false,
             dispatch: HashMap::new(),
         }
     }
@@ -780,6 +786,9 @@ impl LocalSupervisor {
         &mut self,
         project: ProjectEntry,
     ) -> Result<AttachOutcome, ProjectAuthorityError> {
+        if self.stopping {
+            return Err(ProjectAuthorityError::Stopping);
+        }
         if self.projects.contains_key(&project.name) {
             return Ok(AttachOutcome::AlreadyAttached);
         }
@@ -798,9 +807,15 @@ impl LocalSupervisor {
 
     /// Detaches a project and releases its writer lease.
     pub fn detach(&mut self, project_name: &str) -> Option<ProjectStateAuthority> {
-        if let Some(queue) = self.queues.remove(project_name) {
+        if let Some(queue) = self.queues.get(project_name) {
             queue.stop();
+            if self.ticking.contains(project_name) || queue.in_flight_dispatch_count() != 0 {
+                // Keep the authority and stopped queue registered until the
+                // tick has persisted all admitted outcomes. Detach is retried.
+                return None;
+            }
         }
+        self.queues.remove(project_name);
         self.dispatch.remove(project_name);
         let detached = self.projects.remove(project_name);
         if let Some(authority) = &detached {
@@ -827,6 +842,10 @@ impl LocalSupervisor {
     /// Handles one typed supervisor request synchronously.
     pub fn handle(&mut self, request: SupervisorRequest) -> SupervisorResponse {
         match request {
+            SupervisorRequest::Attach { .. } if self.stopping => SupervisorResponse::Rejected {
+                code: "supervisor_stopping".into(),
+                detail: "new attachments are disabled during shutdown".into(),
+            },
             SupervisorRequest::Attach { project } => match self.attach(project.clone()) {
                 Ok(outcome) => {
                     self.ensure_queue(&project.name);
@@ -836,8 +855,16 @@ impl LocalSupervisor {
                 }
                 Err(error) => rejected(&error),
             },
-            SupervisorRequest::Detach { project_name } => SupervisorResponse::Detached {
-                detached: self.detach(&project_name).is_some(),
+            SupervisorRequest::Detach { project_name } => {
+                let detached = self.detach(&project_name).is_some();
+                if !detached && self.projects.contains_key(&project_name) {
+                    SupervisorResponse::Rejected {
+                        code: "project_draining".into(),
+                        detail: "admission stopped; retry detach after the active tick drains".into(),
+                    }
+                } else {
+                    SupervisorResponse::Detached { detached }
+                }
             },
             SupervisorRequest::Status { project_name } => self.project(&project_name).map_or_else(
                 || SupervisorResponse::Rejected {
@@ -920,24 +947,38 @@ impl LocalSupervisor {
         HashMap<String, crate::queue_loop::QueueLoop>,
         HashMap<String, Option<crate::daemon::DispatchSettings>>,
     ) {
-        (
-            std::mem::take(&mut self.queues),
-            std::mem::take(&mut self.dispatch),
-        )
+        // Only one snapshot may own a tick for a project at a time.
+        let queues: HashMap<_, _> = self.queues.iter()
+            .filter(|(name, _)| !self.ticking.contains(*name))
+            .map(|(name, queue)| (name.clone(), queue.clone()))
+            .collect();
+        self.ticking.extend(queues.keys().cloned());
+        (queues, self.dispatch.clone())
     }
 
     pub fn restore_attached_queues(
         &mut self,
         queues: HashMap<String, crate::queue_loop::QueueLoop>,
-        dispatch: HashMap<String, Option<crate::daemon::DispatchSettings>>,
+        _dispatch: HashMap<String, Option<crate::daemon::DispatchSettings>>,
     ) {
-        self.queues.extend(queues);
-        self.dispatch.extend(dispatch);
+        // The registry retained the actual lifecycle handles throughout.
+        // Never restore an old snapshot over a new attachment.
+        for name in queues.keys() {
+            self.ticking.remove(name);
+        }
+    }
+
+    pub fn stop_admission(&mut self) {
+        self.stopping = true;
+        for queue in self.queues.values() {
+            queue.stop();
+        }
     }
 }
 
 fn rejected(error: &ProjectAuthorityError) -> SupervisorResponse {
     let code = match error {
+        ProjectAuthorityError::Stopping => "supervisor_stopping",
         ProjectAuthorityError::RevisionConflict { .. } => "revision_conflict",
         ProjectAuthorityError::Lease(ProjectLeaseError::Busy { .. }) => "project_busy",
         ProjectAuthorityError::Lease(_)

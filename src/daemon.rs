@@ -438,10 +438,14 @@ pub async fn run_supervisor_with_control_socket(
         .iter()
         .map(|project| project.queue.clone())
         .collect();
+    let admission_supervisor = control_socket.as_ref().map(|(_, supervisor)| std::sync::Arc::clone(supervisor));
     let admission_stop_task = tokio::spawn(async move {
         if admission_shutdown_rx.changed().await.is_ok() && *admission_shutdown_rx.borrow() {
             for queue in admission_queues {
                 queue.stop();
+            }
+            if let Some(supervisor) = admission_supervisor {
+                supervisor.lock().await.stop_admission();
             }
         }
     });
@@ -532,6 +536,9 @@ pub async fn run_supervisor_with_control_socket(
                 }
             }
         }
+    }
+    if let Some(supervisor) = &control_supervisor {
+        supervisor.lock().await.stop_admission();
     }
     if let Err(error) = remove_pid_file(&config) {
         tracing::warn!(%error, "failed to remove PID file");

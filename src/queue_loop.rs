@@ -86,6 +86,64 @@ async fn retry_backoff_while_running(running: &AtomicBool, backoff: Duration) ->
     false
 }
 
+/// A durable, exclusive claim for one queue dispatch episode (including its
+/// bounded retries and reviewers). Never cleared by Drop: cancellation and
+/// ambiguous failures require explicit operator reconciliation.
+struct DispatchClaim {
+    path: PathBuf,
+    attempt_id: String,
+}
+
+impl DispatchClaim {
+    fn acquire(store: &OrbStore, orb: &Orb) -> std::io::Result<Self> {
+        use std::io::Write;
+        use sha2::{Digest, Sha256};
+
+        let parent = store.path().parent().unwrap_or_else(|| Path::new("."));
+        let directory = parent.join("dispatch-claims");
+        std::fs::create_dir_all(&directory)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        let key = format!("{:x}", Sha256::digest(orb.id.to_string().as_bytes()));
+        let path = directory.join(format!("{key}.claim"));
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)?;
+        serde_json::to_writer(&mut file, &serde_json::json!({
+            "attempt_id": attempt_id,
+            "orb_id": orb.id.to_string(),
+            "claimed_at": chrono::Utc::now(),
+            "phase": orb.phase,
+            "status": orb.status,
+        }))?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        std::fs::File::open(&directory)?.sync_all()?;
+        Ok(Self { path, attempt_id })
+    }
+
+    fn finish(self, store: &OrbStore) -> std::io::Result<()> {
+        // Shared writers acknowledge journal durability; local writers need
+        // their projection synced before the admission claim is retired.
+        std::fs::File::open(store.path())?.sync_all()?;
+        let parent = self.path.parent().ok_or_else(|| std::io::Error::other("claim has no parent"))?;
+        std::fs::rename(&self.path, self.path.with_extension(format!("{}.resolved", self.attempt_id)))?;
+        std::fs::File::open(parent)?.sync_all()
+    }
+}
+
+/// Missing predecessors are blockers, just like failed or incomplete ones.
+fn execution_dependencies_done(orb: &Orb, orbs: &[Orb], edges: &[orbs::dep::DepEdge]) -> bool {
+    use orbs::dep::EdgeType;
+    edges.iter().filter_map(|edge| {
+        if edge.edge_type == EdgeType::DependsOn && edge.from == orb.id {
+            Some(&edge.to)
+        } else if edge.edge_type == EdgeType::Blocks && edge.to == orb.id {
+            Some(&edge.from)
+        } else {
+            None
+        }
+    }).all(|id| orbs.iter().any(|candidate| &candidate.id == id && candidate.effective_status() == TaskStatus::Done))
+}
+
 /// Determines the last completed refinement round visible from an orb
 /// checkpoint. Restored snapshots retain their original timestamp, which
 /// makes the append-only execution ledger a bounded, history-aware view.
@@ -422,7 +480,7 @@ impl QueueLoop {
     /// Returns an IO error if store operations fail.
     #[instrument(name = "queue.tick", level = "debug", skip(self), fields(orb_count = tracing::field::Empty))]
     pub fn tick(&self) -> std::io::Result<TickResult> {
-        if self.paused.load(Ordering::SeqCst) {
+        if self.paused.load(Ordering::SeqCst) || !self.running.load(Ordering::SeqCst) {
             debug!("queue paused; skipping tick");
             return Ok(TickResult::default());
         }
@@ -440,7 +498,7 @@ impl QueueLoop {
         result.orbs_executed = self.execute_ready(&all_orbs)?;
 
         // 3. Root completion: root orbs whose children are all Done
-        result.roots_completed = self.complete_roots(&all_orbs)?;
+        result.roots_completed = self.complete_roots(&self.orb_store.load_all()?)?;
 
         // 4. Waiting orbs: blocked orbs → trigger re-evaluation
         result.orbs_reevaluated = self.reevaluate_waiting(&all_orbs)?;
@@ -460,7 +518,7 @@ impl QueueLoop {
     ///
     /// Returns an IO error if store operations fail.
     pub async fn tick_async(&self) -> std::io::Result<TickResult> {
-        if self.paused.load(Ordering::SeqCst) {
+        if self.paused.load(Ordering::SeqCst) || !self.running.load(Ordering::SeqCst) {
             return Ok(TickResult::default());
         }
 
@@ -469,7 +527,7 @@ impl QueueLoop {
 
         result.pipelines_started = self.start_pipelines_with_hooks(&all_orbs).await?;
         result.orbs_executed = self.execute_ready_with_hooks(&all_orbs).await?;
-        result.roots_completed = self.complete_roots_with_hooks(&all_orbs).await?;
+        result.roots_completed = self.complete_roots_with_hooks(&self.orb_store.load_all()?).await?;
         result.orbs_reevaluated = self.reevaluate_waiting_with_hooks(&all_orbs).await?;
 
         Ok(result)
@@ -584,6 +642,7 @@ impl QueueLoop {
             if orb.effective_status() == TaskStatus::Done
                 || orb.effective_status() == TaskStatus::Failed
                 || orb.effective_status() == TaskStatus::Cancelled
+                || orb.effective_status() == TaskStatus::Tombstone
             {
                 continue;
             }
@@ -742,6 +801,7 @@ impl QueueLoop {
             if orb.effective_status() == TaskStatus::Done
                 || orb.effective_status() == TaskStatus::Failed
                 || orb.effective_status() == TaskStatus::Cancelled
+                || orb.effective_status() == TaskStatus::Tombstone
             {
                 continue;
             }
@@ -1182,10 +1242,18 @@ fn is_terminal(orb: &Orb) -> bool {
 /// phase; failed and cancelled parents never release descendants.
 fn blocked_by_parent_review(orb: &Orb, orbs: &[Orb]) -> bool {
     let mut parent_id = orb.parent_id.as_ref();
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(&orb.id);
     while let Some(id) = parent_id {
+        if !visited.insert(id) {
+            return true;
+        }
         let Some(parent) = orbs.iter().find(|candidate| &candidate.id == id) else {
-            break;
+            return true;
         };
+        if matches!(parent.effective_status(), TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Tombstone) {
+            return true;
+        }
         let phase_parent_released = matches!(
             parent.phase,
             Some(OrbPhase::Waiting | OrbPhase::Executing | OrbPhase::ExecutingChildren)
@@ -1213,6 +1281,14 @@ fn index_children_by_parent(orbs: &[Orb]) -> HashMap<&OrbId, Vec<&Orb>> {
 fn has_children(orb: &Orb, orbs: &[Orb]) -> bool {
     orbs.iter()
         .any(|candidate| candidate.parent_id.as_ref() == Some(&orb.id))
+}
+
+/// Task parents are aggregates; phase parents may own final work only after
+/// every required child completed. Child results remain the durable evidence.
+fn parent_execution_ready(orb: &Orb, orbs: &[Orb]) -> bool {
+    let children: Vec<_> = orbs.iter().filter(|child| child.parent_id.as_ref() == Some(&orb.id)).collect();
+    children.is_empty() || (orb.orb_type.uses_phase() && orb.has_parent_final_work
+        && children.iter().all(|child| child.effective_status() == TaskStatus::Done))
 }
 
 /// A required child failure blocks the parent without changing the parent's
@@ -1608,6 +1684,35 @@ async fn dispatch_one_owned(
         apply_dispatch_outcome_with_review, dispatch_orb_while_running,
         worker_config_for_with_model_config,
     };
+
+    let claim_store = store.clone();
+    let claim_orb = orb.clone();
+    let claim = match tokio::task::spawn_blocking(move || DispatchClaim::acquire(&claim_store, &claim_orb))
+        .await.map_err(std::io::Error::other)? {
+        Ok(claim) => claim,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            tracing::warn!(orb = %orb.id, "unresolved dispatch claim; explicit recovery required");
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    let fresh = store.load_by_id(&orb.id)?;
+    let current_orbs = store.load_all()?;
+    let current_edges = dep_store.all_edges().map_err(std::io::Error::other)?;
+    let eligible = fresh.as_ref().is_some_and(|current| {
+        dispatch_target_for(current) == Some(target)
+            && !blocked_by_parent_review(current, &current_orbs)
+            && (target != DispatchTarget::Execute
+                || (execution_dependencies_done(current, &current_orbs, &current_edges)
+                    && parent_execution_ready(current, &current_orbs)))
+    });
+    if !eligible || !running.load(Ordering::SeqCst) {
+        tokio::task::spawn_blocking(move || claim.finish(&store)).await.map_err(std::io::Error::other)??;
+        return Ok(false);
+    }
+    if let Some(current) = fresh {
+        orb = current;
+    }
 
     let (built_in_system, user) = match target {
         DispatchTarget::Speccing => crate::phases::speccing::build_prompt(&orb),
@@ -2508,16 +2613,15 @@ async fn dispatch_one_owned(
                 DispatchTarget::Refining
                 | DispatchTarget::Decomposing
                 | DispatchTarget::Execute => {}
-                DispatchTarget::Reevaluating => {
-                    if let Some(plan) = crate::phases::re_evaluation::parse_response(response) {
-                        let _ = crate::phases::re_evaluation::apply_plan(&mut orb, &plan);
-                    }
-                }
+                // The dispatcher applies the verdict directly from
+                // Reevaluating, before any generic phase advancement.
+                DispatchTarget::Reevaluating => {}
             }
         }
     }
 
     store.update(&orb)?;
+    tokio::task::spawn_blocking(move || claim.finish(&store)).await.map_err(std::io::Error::other)??;
     Ok(outcome.status == crate::worker::dispatcher::DispatchStatus::Done)
 }
 
@@ -2563,6 +2667,42 @@ fn configure_worker_runtime(
 mod tests {
     use super::*;
     use orbs::dep::{DepEdge, EdgeType};
+
+    #[test]
+    fn durable_claim_survives_drop_and_requires_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OrbStore::new(dir.path().join("orbs.jsonl"));
+        let orb = Orb::new("Claim", "do not repeat side effects");
+        store.append(&orb).unwrap();
+        let claim = DispatchClaim::acquire(&store, &orb).unwrap();
+        let path = claim.path.clone();
+        let attempt_id = claim.attempt_id.clone();
+        drop(claim);
+        assert_eq!(DispatchClaim::acquire(&store, &orb).err().unwrap().kind(), std::io::ErrorKind::AlreadyExists);
+        DispatchClaim { path, attempt_id }.finish(&store).unwrap();
+        assert!(DispatchClaim::acquire(&store, &orb).is_ok());
+    }
+
+    #[test]
+    fn missing_or_failed_dependency_never_authorizes_execution() {
+        let orb = Orb::new("Execute", "requires predecessor");
+        let mut dependency = Orb::new("Dependency", "must succeed");
+        let edge = DepEdge::new(orb.id.clone(), dependency.id.clone(), EdgeType::DependsOn);
+        assert!(!execution_dependencies_done(&orb, &[], std::slice::from_ref(&edge)));
+        dependency.status = Some(OrbStatus::Failed);
+        assert!(!execution_dependencies_done(&orb, std::slice::from_ref(&dependency), std::slice::from_ref(&edge)));
+        dependency.status = Some(OrbStatus::Done);
+        assert!(execution_dependencies_done(&orb, &[dependency], &[edge]));
+    }
+
+    #[test]
+    fn missing_and_cyclic_parent_evidence_blocks_dispatch() {
+        let mut parent = Orb::new("Parent", "parent");
+        let child = Orb::new("Child", "child").with_parent(parent.id.clone(), Some(parent.id.clone()));
+        assert!(blocked_by_parent_review(&child, &[]));
+        parent.parent_id = Some(child.id.clone());
+        assert!(blocked_by_parent_review(&child, &[parent, child.clone()]));
+    }
     use orbs::orb::OrbType;
 
     #[test]

@@ -2,6 +2,18 @@ use orbs::orb::{Orb, OrbPhase};
 
 use crate::config::OrbConfig;
 
+// Persist the checkpoint separately from transient dispatch metadata without
+// changing the pinned external Orb schema. This label is reserved to Orboros.
+const COMPLETION_CHECKPOINT: &str = "orboros:checkpoint:post_completion";
+
+pub(crate) fn is_completion_checkpoint(orb: &Orb) -> bool {
+    orb.labels.iter().any(|label| label == COMPLETION_CHECKPOINT)
+}
+
+pub(crate) fn clear_checkpoint(orb: &mut Orb) {
+    orb.labels.retain(|label| label != COMPLETION_CHECKPOINT);
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -57,9 +69,14 @@ pub fn needs_review(orb: &Orb, config: &OrbConfig) -> bool {
 /// reach Review).
 pub fn enter_review(
     orb: &mut Orb,
-    _checkpoint_type: CheckpointType,
+    checkpoint_type: CheckpointType,
 ) -> Result<(), orbs::orb::TransitionError> {
-    orb.set_phase(OrbPhase::Review)
+    orb.set_phase(OrbPhase::Review)?;
+    clear_checkpoint(orb);
+    if checkpoint_type == CheckpointType::PostCompletion {
+        orb.labels.push(COMPLETION_CHECKPOINT.into());
+    }
+    Ok(())
 }
 
 /// Applies a review decision, transitioning the orb to the appropriate phase.
@@ -91,7 +108,12 @@ pub fn apply_decision(
             CheckpointType::PostRefinement => orb.set_phase(OrbPhase::Refining),
             CheckpointType::PostCompletion => orb.set_phase(OrbPhase::Executing),
         },
+    }?;
+    clear_checkpoint(orb);
+    if matches!(decision, ReviewDecision::RequestChanges { .. }) {
+        orb.execution = None;
     }
+    Ok(())
 }
 
 /// Placeholder confidence check. Returns true if the orb has both a `result`
