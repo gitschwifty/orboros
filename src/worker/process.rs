@@ -85,9 +85,56 @@ with the available tools and return the required result."
     )
 }
 
+/// Own the group only while its leader remains unreaped. Signal exactly once
+/// before reaping; retaining a numeric PGID after that would risk identity reuse.
+struct OwnedProcessGroup {
+    #[cfg(unix)]
+    id: Option<libc::pid_t>,
+}
+
+impl OwnedProcessGroup {
+    fn new(child: &Child) -> Self {
+        #[cfg(not(unix))]
+        let _ = child;
+        Self {
+            #[cfg(unix)]
+            id: child
+                .id()
+                .and_then(|id| libc::pid_t::try_from(id).ok())
+                .filter(|id| *id > 0),
+        }
+    }
+
+    fn terminate(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        if let Some(id) = self.id {
+            // SAFETY: a positive, unreaped owned group leader is the identity
+            // anchor. The negative argument selects only its private group.
+            if unsafe { libc::kill(-id, libc::SIGKILL) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
+            }
+            self.id = None;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for OwnedProcessGroup {
+    fn drop(&mut self) {
+        if let Err(error) = self.terminate() {
+            warn!(%error, "owned process group cleanup failed during drop");
+        }
+    }
+}
+
 /// A running worker process communicating over JSON-line IPC.
 #[allow(clippy::struct_field_names)]
 pub struct Worker {
+    // Declared first so group termination precedes Child kill-on-drop/reaping.
+    group: OwnedProcessGroup,
     child: Child,
     stdin: Arc<TokioMutex<ChildStdin>>,
     reader: BufReader<ChildStdout>,
@@ -241,6 +288,7 @@ impl Worker {
         }
 
         let mut child = cmd.spawn().map_err(IpcError::Write)?;
+        let group = OwnedProcessGroup::new(&child);
 
         let stdin = Arc::new(TokioMutex::new(
             child.stdin.take().ok_or(IpcError::StdoutClosed)?,
@@ -249,6 +297,7 @@ impl Worker {
         let reader = BufReader::new(stdout);
 
         let mut worker = Self {
+            group,
             child,
             stdin,
             reader,
@@ -263,7 +312,7 @@ impl Worker {
         let init_result = if let Some(dur) = config.init_timeout {
             tokio::time::timeout(dur, worker.init(config))
                 .await
-                .map_err(|_| IpcError::InitTimeout(dur))?
+                .unwrap_or(Err(IpcError::InitTimeout(dur)))
         } else {
             worker.init(config).await
         };
@@ -271,8 +320,9 @@ impl Worker {
             // A worker may send a structured rejection yet remain alive (for
             // example after a bad credential). Do not leave that process
             // behind merely because the init handshake failed.
-            let _ = worker.child.kill().await;
-            let _ = worker.child.wait().await;
+            worker.terminate_owned().await.map_err(|cleanup| {
+                IpcError::Cleanup(format!("{error}; cleanup failed: {cleanup}"))
+            })?;
             return Err(error);
         }
         debug!("worker ready");
@@ -532,13 +582,43 @@ impl Worker {
         fields(worker_id = %self.worker_id, session_id = %self.session_id)
     )]
     pub async fn shutdown(mut self) -> Result<(), IpcError> {
-        if let Some(dur) = self.shutdown_timeout {
-            tokio::time::timeout(dur, self.shutdown_inner())
-                .await
-                .map_err(|_| IpcError::ShutdownTimeout(dur))?
-        } else {
-            self.shutdown_inner().await
+        let timeout = self.shutdown_timeout.unwrap_or(Duration::from_secs(5));
+        let handshake = tokio::time::timeout(timeout, self.shutdown_inner()).await;
+        self.terminate_owned().await?;
+        // Once the entire owned group was terminated, a failed handshake does
+        // not make checkout reuse unsafe. Keep its diagnostic visible.
+        if !matches!(handshake, Ok(Ok(()))) {
+            warn!(
+                ?handshake,
+                "worker shutdown handshake failed; owned group terminated"
+            );
         }
+        Ok(())
+    }
+
+    async fn terminate_owned(&mut self) -> Result<(), IpcError> {
+        if let Err(error) = self.group.terminate() {
+            // Some platforms report EPERM when the process group has already
+            // disappeared during graceful shutdown. Kill the leader directly
+            // and still reap it; the group handle is cleared only after the
+            // signal attempt above, so no stale group id is retained.
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                self.child
+                    .start_kill()
+                    .map_err(|error| IpcError::Cleanup(error.to_string()))?;
+            } else {
+                return Err(IpcError::Cleanup(error.to_string()));
+            }
+        }
+        #[cfg(not(unix))]
+        self.child
+            .start_kill()
+            .map_err(|error| IpcError::Cleanup(error.to_string()))?;
+        tokio::time::timeout(Duration::from_secs(5), self.child.wait())
+            .await
+            .map_err(|_| IpcError::Cleanup("timed out reaping worker".into()))?
+            .map_err(|error| IpcError::Cleanup(error.to_string()))?;
+        Ok(())
     }
 
     async fn shutdown_inner(&mut self) -> Result<(), IpcError> {
@@ -557,7 +637,8 @@ impl Worker {
 
         match response {
             IpcResponse::ShutdownOk { .. } => {
-                let _ = self.child.wait().await;
+                // Keep the leader unreaped until group cleanup signals all
+                // inherited descendants, including after a graceful reply.
                 Ok(())
             }
             other => Err(IpcError::UnexpectedResponse {
@@ -567,16 +648,11 @@ impl Worker {
         }
     }
 
-    /// Attempts graceful shutdown within the grace period, then kills the process.
-    /// Always succeeds — errors from shutdown are swallowed.
-    pub async fn force_stop(mut self, grace: Duration) {
-        let ok = matches!(
-            tokio::time::timeout(grace, self.shutdown_inner()).await,
-            Ok(Ok(()))
-        );
-        if !ok {
-            let _ = self.child.kill().await;
-        }
+    /// Attempts a bounded handshake, then terminates the owned group and reaps
+    /// the leader. Cleanup failure must block replacement work.
+    pub async fn force_stop(mut self, grace: Duration) -> Result<(), IpcError> {
+        let _ = tokio::time::timeout(grace, self.shutdown_inner()).await;
+        self.terminate_owned().await
     }
 
     /// Returns the session ID assigned by the worker during init.
@@ -1278,7 +1354,7 @@ mod tests {
     async fn worker_force_stop_graceful() {
         let worker = Worker::spawn(&mock_worker_config()).await.unwrap();
         // force_stop with generous grace should shutdown gracefully
-        worker.force_stop(Duration::from_secs(5)).await;
+        worker.force_stop(Duration::from_secs(5)).await.unwrap();
         // No panic = success
     }
 
@@ -1361,7 +1437,7 @@ mod tests {
         };
         let worker = Worker::spawn(&config).await.unwrap();
         // Very short grace period — should trigger kill
-        worker.force_stop(Duration::from_millis(50)).await;
+        worker.force_stop(Duration::from_millis(50)).await.unwrap();
         // No panic/hang = success
     }
 

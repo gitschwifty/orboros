@@ -117,18 +117,122 @@ pub fn apply_decomposition(
     store: &OrbStore,
     dep_store: &DepStore,
 ) -> anyhow::Result<()> {
+    let parent_id = result
+        .children
+        .first()
+        .and_then(|child| child.parent_id.as_ref())
+        .ok_or_else(|| anyhow::anyhow!("decomposition must contain parented children"))?;
+    let existing = store.load_all()?;
+    let existing_edges = dep_store.all_edges()?;
     for child in &result.children {
-        store
-            .append(child)
-            .map_err(|e| anyhow::anyhow!("failed to append child orb: {e}"))?;
+        anyhow::ensure!(
+            child.parent_id.as_ref() == Some(parent_id),
+            "mixed decomposition parents"
+        );
+        if let Some(prior) = existing.iter().find(|prior| prior.id == child.id) {
+            anyhow::ensure!(
+                prior.parent_id == child.parent_id && prior.root_id == child.root_id,
+                "child {} already belongs to another hierarchy",
+                child.id
+            );
+        }
     }
-
+    for prior in existing
+        .iter()
+        .filter(|orb| orb.parent_id.as_ref() == Some(parent_id))
+    {
+        anyhow::ensure!(
+            result.children.iter().any(|child| child.id == prior.id),
+            "decomposition would orphan existing child {}; reconcile obsolete work explicitly",
+            prior.id
+        );
+    }
+    for edge in &existing_edges {
+        let internal = result.children.iter().any(|child| child.id == edge.from)
+            && result.children.iter().any(|child| child.id == edge.to);
+        if internal && edge.edge_type.is_blocking() {
+            anyhow::ensure!(
+                result.edges.iter().any(|planned| same_edge(edge, planned)),
+                "decomposition conflicts with existing ordering {} -> {}; reconcile explicitly",
+                edge.from,
+                edge.to
+            );
+        }
+    }
+    persist_plan_identity(result, store, parent_id)?;
+    for child in &result.children {
+        // Existing records are authoritative, including operator edits and
+        // terminal results. Replay must never append a fresh Pending version.
+        if !existing.iter().any(|prior| prior.id == child.id) {
+            store
+                .append(child)
+                .map_err(|e| anyhow::anyhow!("failed to append child orb: {e}"))?;
+        }
+    }
     for edge in &result.edges {
-        dep_store
-            .add_edge(edge.clone())
-            .map_err(|e| anyhow::anyhow!("failed to add dep edge: {e}"))?;
+        if !existing_edges.iter().any(|prior| same_edge(prior, edge)) {
+            dep_store
+                .add_edge(edge.clone())
+                .map_err(|e| anyhow::anyhow!("failed to add dep edge: {e}"))?;
+        }
     }
 
+    Ok(())
+}
+
+fn same_edge(left: &DepEdge, right: &DepEdge) -> bool {
+    left.from == right.from && left.to == right.to && left.edge_type == right.edge_type
+}
+
+/// Pin the accepted plan before materialization. A torn file blocks recovery
+/// rather than silently treating a different plan as the original generation.
+fn persist_plan_identity(
+    result: &DecomposeResult,
+    store: &OrbStore,
+    parent: &OrbId,
+) -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+
+    let base = store
+        .path()
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("orb store has no parent"))?;
+    let directory = base.join("decomposition-plans");
+    std::fs::create_dir_all(&directory)?;
+    std::fs::File::open(base)?.sync_all()?;
+    let path = directory.join(format!(
+        "{:x}.json",
+        Sha256::digest(parent.to_string().as_bytes())
+    ));
+    let plan = serde_json::json!({
+        "children": result.children.iter().map(|child| serde_json::json!({
+            "id": child.id, "parent_id": child.parent_id, "root_id": child.root_id,
+            "title": child.title, "description": child.description,
+            "preferred_model": child.preferred_model,
+        })).collect::<Vec<_>>(),
+        "edges": result.edges.iter().map(|edge| serde_json::json!({
+            "from": edge.from, "to": edge.to, "type": edge.edge_type,
+        })).collect::<Vec<_>>(),
+    });
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            serde_json::to_writer(&mut file, &plan)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            std::fs::File::open(&directory)?.sync_all()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let prior: serde_json::Value = serde_json::from_reader(std::fs::File::open(&path)?)?;
+            anyhow::ensure!(prior == plan,
+                "decomposition plan changed for {parent}; explicit generation reconciliation required");
+        }
+        Err(error) => return Err(error.into()),
+    }
     Ok(())
 }
 
@@ -409,6 +513,34 @@ mod tests {
     }
 
     // ── phase transitions ────────────────────────────────────
+
+    #[test]
+    fn replay_preserves_child_progress_and_rejects_surplus_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OrbStore::new(dir.path().join("orbs.jsonl"));
+        let deps = DepStore::new(dir.path().join("deps.jsonl"));
+        let mut parent = Orb::new("Parent", "first task\nsecond task").with_type(OrbType::Feature);
+        parent.phase = Some(OrbPhase::Decomposing);
+        store.append(&parent).unwrap();
+        let result = decompose_orb(&parent, &store, &deps).unwrap();
+        apply_decomposition(&result, &store, &deps).unwrap();
+        let mut child = result.children.first().unwrap().clone();
+        child.status = Some(orbs::orb::OrbStatus::Done);
+        child.description = "operator-edited description".into();
+        child.result = Some("completed evidence".into());
+        store.update(&child).unwrap();
+        apply_decomposition(&result, &store, &deps).unwrap();
+        let replayed = store.load_by_id(&child.id).unwrap().unwrap();
+        assert_eq!(replayed.status, child.status);
+        assert_eq!(replayed.result, child.result);
+        assert_eq!(replayed.description, child.description);
+        let reduced = DecomposeResult {
+            children: vec![result.children.first().unwrap().clone()],
+            edges: vec![],
+        };
+        assert!(apply_decomposition(&reduced, &store, &deps).is_err());
+        assert_eq!(store.load_children(&parent.id).unwrap().len(), 2);
+    }
 
     #[test]
     fn begin_decomposing_from_speccing() {

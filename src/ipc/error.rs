@@ -2,6 +2,8 @@ use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IpcError {
+    #[error("owned worker cleanup failed: {0}")]
+    Cleanup(String),
     #[error("failed to parse message: {0}")]
     Parse(#[from] serde_json::Error),
 
@@ -51,7 +53,8 @@ impl IpcError {
     pub const fn is_fatal_init_failure(&self) -> bool {
         matches!(
             self,
-            Self::InitRejected { .. }
+            Self::Cleanup(_)
+                | Self::InitRejected { .. }
                 | Self::ProtocolVersionMismatch { .. }
                 | Self::UnexpectedResponse { .. }
         )

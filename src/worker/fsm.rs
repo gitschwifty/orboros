@@ -31,6 +31,9 @@ pub enum FailureClass {
 impl From<&IpcError> for FailureClass {
     fn from(err: &IpcError) -> Self {
         match err {
+            IpcError::Cleanup(detail) => FailureClass::Protocol {
+                message: detail.clone(),
+            },
             IpcError::Parse(e) => FailureClass::Protocol {
                 message: e.to_string(),
             },

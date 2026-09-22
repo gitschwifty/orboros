@@ -173,6 +173,7 @@ pub(crate) fn prepare_reset(
     }
     orb.closed_at = None;
     orb.execution = None;
+    crate::phases::review::clear_checkpoint(&mut orb);
     orb.result = None;
     orb.confidence = None;
     orb.review_report = None;
@@ -1049,11 +1050,12 @@ pub fn cmd_orb_review(
         .load_children(&orb.id)
         .context("failed to load orb children")?;
     let post_completion_review = orb.orb_type.uses_phase()
-        && (orb
-            .execution
-            .as_ref()
-            .and_then(|execution| execution.prompt_category.as_deref())
-            == Some("worker.execute")
+        && (crate::phases::review::is_completion_checkpoint(&orb)
+            || orb
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.prompt_category.as_deref())
+                == Some("worker.execute")
             || (!children.is_empty()
                 && children
                     .iter()
@@ -1107,12 +1109,14 @@ pub fn cmd_orb_review(
                 orb.set_phase(target)
                     .context("revise: phase transition rejected")?;
             }
+            orb.execution = None;
             println!("Sent orb {id} back for revision");
             HookEvent::OnReviewRevise
         }
         other => bail!("unknown review decision: {other}. Use: approve, reject, revise"),
     };
 
+    crate::phases::review::clear_checkpoint(&mut orb);
     store
         .update(&orb)
         .context("failed to persist review decision")?;

@@ -362,7 +362,7 @@ pub(crate) async fn dispatch_orb_with_retry_limit(
                     let session_id = Some(worker.session_id().to_string());
                     let runtime = worker.runtime().cloned();
                     let routing = worker.routing().cloned();
-                    let _ = worker.shutdown().await;
+                    worker.shutdown().await.map_err(anyhow::Error::new)?;
                     (
                         build_outcome(
                             &attempt_config,
@@ -394,7 +394,7 @@ pub(crate) async fn dispatch_orb_with_retry_limit(
                     let session_id = Some(worker.session_id().to_string());
                     let runtime = worker.runtime().cloned();
                     let routing = worker.routing().cloned();
-                    let _ = worker.shutdown().await;
+                    worker.shutdown().await.map_err(anyhow::Error::new)?;
                     (
                         build_failure(
                             &attempt_config,
@@ -796,12 +796,37 @@ pub fn apply_dispatch_outcome_with_review(
             orb.result.clone_from(&outcome.response);
             orb.confidence = outcome.confidence;
             if orb.orb_type.uses_phase() {
+                if orb.phase == Some(OrbPhase::Reevaluating) {
+                    if let Some(plan) = outcome
+                        .response
+                        .as_deref()
+                        .and_then(crate::phases::re_evaluation::parse_response)
+                    {
+                        crate::phases::re_evaluation::apply_plan(orb, &plan)?;
+                        if orb.phase != Some(OrbPhase::Failed) {
+                            orb.execution = None;
+                        }
+                    } else {
+                        orb.result = Some("[worker_error] invalid re-evaluation verdict".into());
+                        orb.set_phase(OrbPhase::Failed)?;
+                    }
+                    return Ok(());
+                }
                 let next = if review_on_completion && orb.phase == Some(OrbPhase::Executing) {
                     OrbPhase::Review
                 } else {
                     next_phase_on_dispatch_success(orb.phase)
                 };
-                orb.set_phase(next)?;
+                if next == OrbPhase::Review {
+                    let checkpoint = if orb.phase == Some(OrbPhase::Executing) {
+                        crate::phases::review::CheckpointType::PostCompletion
+                    } else {
+                        crate::phases::review::CheckpointType::PostRefinement
+                    };
+                    crate::phases::review::enter_review(orb, checkpoint)?;
+                } else {
+                    orb.set_phase(next)?;
+                }
                 if !next.is_terminal() {
                     // A completed phase must not keep looking like an active
                     // dispatch. `dispatch_target_for` deliberately excludes
@@ -1040,6 +1065,47 @@ mod tests {
     }
 
     #[test]
+    fn completion_review_survives_storage_and_approval_without_execution() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = orbs::orb_store::OrbStore::new(dir.path().join("orbs.jsonl"));
+        let mut orb = Orb::new("Completed feature", "implementation").with_type(OrbType::Feature);
+        orb.phase = Some(OrbPhase::Executing);
+        apply_dispatch_outcome_with_review(&mut orb, &done_outcome(), true).unwrap();
+        assert!(orb.execution.is_none());
+        store.append(&orb).unwrap();
+        crate::orb_cmd::cmd_orb_review(&store, &orb.id.to_string(), "approve", None).unwrap();
+        let approved = store.load_by_id(&orb.id).unwrap().unwrap();
+        assert_eq!(approved.phase, Some(OrbPhase::Done));
+        assert!(!crate::phases::review::is_completion_checkpoint(&approved));
+    }
+
+    #[test]
+    fn completion_review_revision_reenters_execution_without_stale_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = orbs::orb_store::OrbStore::new(dir.path().join("orbs.jsonl"));
+        let mut orb = Orb::new("Revision", "implementation").with_type(OrbType::Feature);
+        orb.phase = Some(OrbPhase::Executing);
+        apply_dispatch_outcome_with_review(&mut orb, &done_outcome(), true).unwrap();
+        store.append(&orb).unwrap();
+        crate::orb_cmd::cmd_orb_review(&store, &orb.id.to_string(), "revise", None).unwrap();
+        let revised = store.load_by_id(&orb.id).unwrap().unwrap();
+        assert_eq!(revised.phase, Some(OrbPhase::Executing));
+        assert!(revised.execution.is_none());
+    }
+
+    #[test]
+    fn reevaluation_pivot_is_applied_before_generic_advancement() {
+        let mut orb = Orb::new("Pivot", "change approach").with_type(OrbType::Feature);
+        orb.phase = Some(OrbPhase::Reevaluating);
+        let mut outcome = done_outcome();
+        outcome.response = Some(r#"{"verdict":"pivot","reasoning":"different approach"}"#.into());
+        apply_dispatch_outcome(&mut orb, &outcome).unwrap();
+        assert_eq!(orb.phase, Some(OrbPhase::Refining));
+        assert_eq!(orb.review_critique.as_deref(), Some("different approach"));
+        assert!(orb.execution.is_none());
+    }
+
+    #[test]
     fn usage_from_send_falls_back_to_last_streamed_usage_event() {
         let send = crate::worker::process::SendOutcome {
             id: "send-1".into(),
@@ -1206,7 +1272,12 @@ mod tests {
                 // every worker-driven lifecycle edge without unrelated setup.
                 orb.phase = Some(current);
 
-                apply_dispatch_outcome(&mut orb, &done_outcome()).unwrap();
+                let mut outcome = done_outcome();
+                if current == OrbPhase::Reevaluating {
+                    outcome.response =
+                        Some(r#"{"verdict":"continue","reasoning":"resume execution"}"#.into());
+                }
+                apply_dispatch_outcome(&mut orb, &outcome).unwrap();
 
                 assert_eq!(
                     orb.phase,
