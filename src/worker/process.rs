@@ -456,9 +456,8 @@ impl Worker {
         }
 
         let mut events = Vec::new();
-        let mut live = super::live::LiveDispatch::new(
-            &self.worker_id.to_string(), &self.session_id, id,
-        );
+        let mut live =
+            super::live::LiveDispatch::new(&self.worker_id.to_string(), &self.session_id, id);
         live.report("started");
         let period = Duration::from_secs(30);
         let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + period, period);

@@ -16,7 +16,8 @@ mod tests {
             let event = serde_json::from_value(serde_json::json!({
                 "event": "usage", "prompt_tokens": 10,
                 "completion_tokens": tokens - 10, "total_tokens": tokens
-            })).unwrap();
+            }))
+            .unwrap();
             live.observe(&event);
         }
         assert_eq!(live.total_tokens, Some(20));
@@ -27,7 +28,8 @@ mod tests {
     fn tool_end_counts_completion_without_retaining_output() {
         let mut live = LiveDispatch::new("worker", "session", "send");
         live.observe(&WorkerEvent::ToolEnd {
-            name: "read_file".into(), result_preview: "private contents".into(),
+            name: "read_file".into(),
+            result_preview: "private contents".into(),
         });
         assert_eq!(live.tool_calls, 1);
         assert_eq!(live.last_tool.as_deref(), Some("read_file"));
@@ -56,11 +58,21 @@ impl LiveDispatch {
     pub(super) fn new(worker_id: &str, session_id: &str, send_id: &str) -> Self {
         let now = Instant::now();
         Self {
-            worker_id: worker_id.into(), session_id: session_id.into(), send_id: send_id.into(),
-            started: now, last_activity: now, last_tool: None, tool_calls: 0,
-            prompt_tokens: None, completion_tokens: None, total_tokens: None,
-            cache_read_tokens: None, cache_write_tokens: None, reasoning_tokens: None,
-            cost_micros: None, retryable_errors: 0,
+            worker_id: worker_id.into(),
+            session_id: session_id.into(),
+            send_id: send_id.into(),
+            started: now,
+            last_activity: now,
+            last_tool: None,
+            tool_calls: 0,
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            cost_micros: None,
+            retryable_errors: 0,
         }
     }
 
@@ -74,8 +86,14 @@ impl LiveDispatch {
                 }
             }
             WorkerEvent::Usage {
-                prompt_tokens, completion_tokens, total_tokens, cached_tokens,
-                cache_write_tokens, reasoning_tokens, cost_micros, ..
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                cached_tokens,
+                cache_write_tokens,
+                reasoning_tokens,
+                cost_micros,
+                ..
             } => {
                 self.prompt_tokens = Some(*prompt_tokens);
                 self.completion_tokens = Some(*completion_tokens);
@@ -85,7 +103,9 @@ impl LiveDispatch {
                 self.reasoning_tokens = *reasoning_tokens;
                 self.cost_micros = *cost_micros;
             }
-            WorkerEvent::Error { retryable: true, .. } => {
+            WorkerEvent::Error {
+                retryable: true, ..
+            } => {
                 self.retryable_errors = self.retryable_errors.saturating_add(1);
             }
             _ => {}

@@ -21,7 +21,9 @@ mod tests {
             self.0.lock().unwrap().extend_from_slice(bytes);
             Ok(bytes.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -46,7 +48,10 @@ mod tests {
         assert_eq!(event["fields"]["attempt"], 2);
         assert_eq!(event["fields"]["message"], "first\nsecond");
         assert_eq!(event["spans"][0]["name"], "dispatch");
-        assert!(event["spans"][0]["fields"].as_str().unwrap().contains("orb-test"));
+        assert!(event["spans"][0]["fields"]
+            .as_str()
+            .unwrap()
+            .contains("orb-test"));
     }
 }
 
@@ -54,10 +59,12 @@ struct EventFields(Map<String, Value>);
 
 impl Visit for EventFields {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        self.0.insert(field.name().into(), Value::String(format!("{value:?}")));
+        self.0
+            .insert(field.name().into(), Value::String(format!("{value:?}")));
     }
     fn record_str(&mut self, field: &Field, value: &str) {
-        self.0.insert(field.name().into(), Value::String(value.into()));
+        self.0
+            .insert(field.name().into(), Value::String(value.into()));
     }
     fn record_u64(&mut self, field: &Field, value: u64) {
         self.0.insert(field.name().into(), value.into());
@@ -89,7 +96,8 @@ where
         if let Some(scope) = ctx.event_scope() {
             for span in scope.from_root() {
                 let extensions = span.extensions();
-                let fields = extensions.get::<FormattedFields<N>>()
+                let fields = extensions
+                    .get::<FormattedFields<N>>()
                     .map_or_else(String::new, ToString::to_string);
                 spans.push(serde_json::json!({ "name": span.name(), "fields": fields }));
             }

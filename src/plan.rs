@@ -201,8 +201,13 @@ pub fn print_plan_status(store: &OrbStore, dep_store: &DepStore, id: &str) -> an
         }
     );
     let next = plan_next_action(
-        phase, epic.execution.is_some(), epic.id.as_str(), children.len(),
-        child_done, child_failed, child_ready,
+        phase,
+        epic.execution.is_some(),
+        epic.id.as_str(),
+        children.len(),
+        child_done,
+        child_failed,
+        child_ready,
     );
     println!("Next action: {next}");
     Ok(())

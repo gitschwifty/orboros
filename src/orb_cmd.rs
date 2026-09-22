@@ -686,7 +686,8 @@ pub fn cmd_orb_list(
 }
 
 fn is_low_confidence(orb: &Orb, threshold: f32) -> bool {
-    orb.confidence.is_some_and(|score| score.is_finite() && score <= threshold)
+    orb.confidence
+        .is_some_and(|score| score.is_finite() && score <= threshold)
 }
 
 /// Lists explicitly scored low-confidence orbs for human inspection.
@@ -702,7 +703,10 @@ pub fn cmd_low_confidence_queue(store: &OrbStore, threshold: f32) -> anyhow::Res
     for orb in &orbs {
         println!(
             "{} [{:?}] confidence={:.2} — {}",
-            orb.id, orb.effective_status(), orb.confidence.unwrap_or_default(), orb.title
+            orb.id,
+            orb.effective_status(),
+            orb.confidence.unwrap_or_default(),
+            orb.title
         );
         println!("  Inspect: orboros orb show {}", orb.id);
     }
