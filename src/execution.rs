@@ -355,6 +355,7 @@ mod attempt_tests {
             terminal_retry: None,
             attempts: vec![
                 DispatchAttempt {
+                    failure_cause: None,
                     worker_id: Some("first-worker".into()),
                     session_id: Some("first-session".into()),
                     dispatched_at: now,
@@ -368,6 +369,7 @@ mod attempt_tests {
                     cost_micros: None,
                 },
                 DispatchAttempt {
+                    failure_cause: None,
                     worker_id: Some("retry-worker".into()),
                     session_id: Some("retry-session".into()),
                     dispatched_at: now,

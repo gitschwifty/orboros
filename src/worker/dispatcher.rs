@@ -106,9 +106,38 @@ pub struct DispatchOutcome {
     pub attempts: Vec<DispatchAttempt>,
 }
 
+/// Classify only structured facts; never infer labels from private error bodies.
+fn failure_cause(outcome: &DispatchOutcome) -> Option<&'static str> {
+    if outcome.status == DispatchStatus::Done {
+        return None;
+    }
+    if outcome.status == DispatchStatus::Cancelled {
+        return Some("cancellation");
+    }
+    if let Some(failure) = &outcome.failure {
+        return Some(if failure.permission.is_some() {
+            "policy"
+        } else if failure.provider.is_some() {
+            "provider"
+        } else if failure.cancellation_source.is_some() {
+            "cancellation"
+        } else if failure.malformed_tool_call.is_some() {
+            "malformed_tool_call"
+        } else if is_terminal_retry_code(&failure.code) {
+            "worker_termination"
+        } else {
+            "unknown"
+        });
+    }
+    Some("unknown")
+}
+
 /// Durable facts about one worker process used by a dispatch.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DispatchAttempt {
+    /// Stable attribution; absent in historical attempts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_cause: Option<String>,
     pub worker_id: Option<String>,
     pub session_id: Option<String>,
     pub dispatched_at: chrono::DateTime<Utc>,
@@ -131,6 +160,7 @@ pub struct DispatchAttempt {
 impl DispatchAttempt {
     fn from_outcome(outcome: &DispatchOutcome) -> Self {
         Self {
+            failure_cause: failure_cause(outcome).map(str::to_owned),
             worker_id: outcome.worker_id.clone(),
             session_id: outcome.session_id.clone(),
             dispatched_at: outcome.dispatched_at,
@@ -458,18 +488,21 @@ pub(crate) async fn dispatch_orb_with_retry_limit(
                 diagnostic.retry_worker_id = None;
                 terminal_retry = Some(diagnostic);
             }
-            attempt = 1;
+            attempt += 1;
             tracing::error!(
                 orb = %orb.id,
-                retry_attempt = 2,
+                retry_attempt = attempt + 1,
                 retry_kind = retry_kind_label,
                 failure_code,
+                failure_cause = failure_cause(&outcome).unwrap_or("unknown"),
+                termination_reason = outcome.failure.as_ref().map_or("-", |failure| failure.termination_reason.as_str()),
+                retry_limit,
                 error,
                 "worker dispatch attempt failed; retrying"
             );
             warn!(
                 orb = %orb.id,
-                retry_attempt = 2,
+                retry_attempt = attempt + 1,
                 retry_kind = retry_kind_label,
                 terminal = terminal_retry.is_some(),
                 "retrying whole worker dispatch from a fresh worker"
@@ -612,7 +645,11 @@ fn build_outcome(
         ResultStatus::Cancelled => DispatchStatus::Cancelled,
         ResultStatus::Error => DispatchStatus::Error,
     };
-    let error = send.error.as_ref().map(|e| e.message.clone());
+    let error = send.error.as_ref().map(|e| e.message.clone()).or_else(|| {
+        send.failure.as_ref().map(|failure| {
+            format!("worker failure: {} ({})", failure.code, failure.termination_reason)
+        })
+    });
     let usage = send.effective_usage();
     DispatchOutcome {
         status,

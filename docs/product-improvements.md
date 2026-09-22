@@ -23,3 +23,20 @@ Remaining: replace scaffold phase shortcuts with durable scaffold provenance,
 show project-root selection and actual supervisor ownership/admission in status,
 and exercise queued/running/blocked/review/completed CLI fixtures. Existing
 normal/shallow CLI assertions were extended but not run by instruction.
+
+## Task 135: retry diagnostics
+
+Attempt records now carry an optional stable `failure_cause`; historical
+records without the field still deserialize. Structured policy, provider,
+cancellation, malformed-tool-call and terminal-worker causes are distinguished;
+unclassified failures explicitly remain `unknown`. Retry cause lines include
+termination reason and configured retry limit. Structured failures supply a
+human-readable error even when the worker omits its error string.
+
+The retry counter now advances on every retry rather than resetting to one,
+which otherwise permits an unbounded loop with a configured limit above one.
+
+Remaining: typed transport attribution through spawn/send error paths, phase
+recovery labels, telemetry-level indexing and exhaustive fixtures. Existing
+human-readable error storage is unchanged; complete redaction of arbitrary
+upstream error bodies needs a separate boundary audit. No checks were run.
