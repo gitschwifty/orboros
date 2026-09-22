@@ -359,6 +359,9 @@ failed snapshot, timestamp, operator intent, reason, and target state in
 `events.jsonl`. Tasks return to pending; phase orbs return to their evidenced
 failed worker phase. Ambiguous phase history is rejected, with no force override.
 Existing pipeline copies are synchronized. See
+[the phase lifecycle notes](../README.md) for the execution marker rule:
+successful nonterminal phase transitions clear the in-flight marker, while
+interrupted work keeps it until an explicit reset.
 [retrying failed orbs](getting-started.md#retry-a-failed-orb) for limitations.
 `rollback-list` shows append-only checkpoints, and `rollback` restores a prior
 snapshot while retaining the history that made recovery possible.
