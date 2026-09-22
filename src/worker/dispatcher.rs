@@ -1272,7 +1272,12 @@ mod tests {
                 // every worker-driven lifecycle edge without unrelated setup.
                 orb.phase = Some(current);
 
-                apply_dispatch_outcome(&mut orb, &done_outcome()).unwrap();
+                let mut outcome = done_outcome();
+                if current == OrbPhase::Reevaluating {
+                    outcome.response =
+                        Some(r#"{"verdict":"continue","reasoning":"resume execution"}"#.into());
+                }
+                apply_dispatch_outcome(&mut orb, &outcome).unwrap();
 
                 assert_eq!(
                     orb.phase,

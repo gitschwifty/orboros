@@ -1093,9 +1093,6 @@ impl ProjectStateAuthority {
         for receipt in self.journal.receipts_after(applied_revision) {
             StateProjection::apply(&self.state_dir, &receipt)?;
         }
-        if self.journal.revision() == 0 {
-            StateProjection::write_watermark(&self.state_dir, 0)?;
-        }
         Ok(())
     }
 

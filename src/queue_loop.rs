@@ -3191,7 +3191,11 @@ mod tests {
             let mut outcome = DispatchOutcome::aborted("mock/phase".into(), "unused".into());
             outcome.status = DispatchStatus::Done;
             outcome.error = None;
-            outcome.response = Some("phase result".into());
+            outcome.response = Some(if phase == OrbPhase::Reevaluating {
+                r#"{"verdict":"continue","reasoning":"resume execution"}"#.into()
+            } else {
+                "phase result".into()
+            });
             outcome.confidence = Some(0.9);
             let ledger = ExecutionStore::new(base.join("executions.jsonl"));
             let record = ExecutionRecord::from_outcome(
@@ -3213,7 +3217,12 @@ mod tests {
             let mut restored = reopened.load_by_id(&orb.id).unwrap().unwrap();
             assert_eq!(restored.phase, Some(next));
             assert!(restored.execution.is_none());
-            assert_eq!(restored.result.as_deref(), Some("phase result"));
+            let expected_result = if phase == OrbPhase::Reevaluating {
+                r#"{"verdict":"continue","reasoning":"resume execution"}"#
+            } else {
+                "phase result"
+            };
+            assert_eq!(restored.result.as_deref(), Some(expected_result));
             assert_eq!(restored.confidence, Some(0.9));
             assert_eq!(dispatch_target_for(&restored), target);
             if next == OrbPhase::Review {
