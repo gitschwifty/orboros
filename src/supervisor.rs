@@ -152,6 +152,8 @@ impl StateOperation {
 /// Failures while opening or appending the replayable operation journal.
 #[derive(Debug, Error)]
 pub enum OperationJournalError {
+    #[error("operation journal {path} requires reopening after an uncertain append")]
+    RecoveryRequired { path: PathBuf },
     #[error("failed to open operation journal {path}: {source}")]
     Open {
         path: PathBuf,
@@ -247,10 +249,15 @@ pub struct OperationJournal {
     path: PathBuf,
     receipts: HashMap<uuid::Uuid, StateReceipt>,
     revision: u64,
+    recovery_required: bool,
 }
 
 impl OperationJournal {
     /// Opens the journal and rebuilds its idempotency index from durable rows.
+    ///
+    /// The caller must hold the project writer lease throughout this journal's
+    /// lifetime. Only an unterminated, incomplete terminal JSON record is
+    /// discarded; malformed complete records remain errors.
     pub fn open(state_dir: &Path) -> Result<Self, OperationJournalError> {
         let path = state_dir.join("operations.jsonl");
         let file = OpenOptions::new()
@@ -264,26 +271,61 @@ impl OperationJournal {
             })?;
         let mut receipts = HashMap::new();
         let mut revision = 0;
-        for line in BufReader::new(file).lines() {
-            let line = line.map_err(|source| OperationJournalError::Read {
+        let mut reader = BufReader::new(file);
+        let mut offset = 0_u64;
+        let mut row = Vec::new();
+        loop {
+            row.clear();
+            let count = reader.read_until(b'\n', &mut row).map_err(|source| OperationJournalError::Read {
                 path: path.clone(),
                 source,
             })?;
-            if line.trim().is_empty() {
+            if count == 0 {
+                break;
+            }
+            let terminated = row.last() == Some(&b'\n');
+            if row.iter().all(u8::is_ascii_whitespace) {
+                offset += count as u64;
                 continue;
             }
-            let receipt: StateReceipt =
-                serde_json::from_str(&line).map_err(|source| OperationJournalError::Parse {
+            let receipt: StateReceipt = match serde_json::from_slice(&row) {
+                Ok(receipt) => receipt,
+                Err(source) if !terminated && source.is_eof() => {
+                    tracing::warn!(path = %path.display(), offset, %source, "discarding incomplete journal tail");
+                    reader.get_ref().set_len(offset).map_err(|source| OperationJournalError::Append {
+                        path: path.clone(),
+                        source,
+                    })?;
+                    break;
+                }
+                Err(source) => return Err(OperationJournalError::Parse {
+                    path: path.clone(),
+                    source,
+                }),
+            };
+            if !terminated {
+                tracing::warn!(path = %path.display(), "repairing missing journal delimiter");
+                reader.get_mut().write_all(b"\n").map_err(|source| OperationJournalError::Append {
                     path: path.clone(),
                     source,
                 })?;
+            }
             revision = revision.max(receipt.revision);
             receipts.insert(receipt.operation.operation_id, receipt);
+            offset += count as u64;
         }
+        // Persist recovery and the directory entry before exposing receipts.
+        reader.get_ref().sync_all()
+            .and_then(|()| File::open(state_dir)?.sync_all())
+            .map_err(|source| OperationJournalError::Append {
+                path: path.clone(),
+                source,
+            })?;
         Ok(Self {
             path,
             receipts,
             revision,
+            recovery_required: false,
         })
     }
 
@@ -315,13 +357,17 @@ impl OperationJournal {
         &mut self,
         operation: StateOperation,
     ) -> Result<StateReceipt, OperationJournalError> {
+        if self.recovery_required {
+            return Err(OperationJournalError::RecoveryRequired {
+                path: self.path.clone(),
+            });
+        }
         if let Some(receipt) = self.receipts.get(&operation.operation_id) {
             return Ok(receipt.clone());
         }
-        self.revision += 1;
         let receipt = StateReceipt {
             operation,
-            revision: self.revision,
+            revision: self.revision + 1,
         };
         let row =
             serde_json::to_vec(&receipt).map_err(|source| OperationJournalError::Serialize {
@@ -335,6 +381,9 @@ impl OperationJournal {
                 path: self.path.clone(),
                 source,
             })?;
+        // Once writing starts, an error cannot tell us whether the row reached
+        // durable storage. Require leased recovery before another append.
+        self.recovery_required = true;
         file.write_all(&row)
             .and_then(|()| file.write_all(b"\n"))
             .and_then(|()| file.sync_data())
@@ -342,6 +391,8 @@ impl OperationJournal {
                 path: self.path.clone(),
                 source,
             })?;
+        self.recovery_required = false;
+        self.revision = receipt.revision;
         self.receipts
             .insert(receipt.operation.operation_id, receipt.clone());
         Ok(receipt)
@@ -976,9 +1027,16 @@ impl ProjectStateAuthority {
     }
 
     fn project_pending_operations(&mut self) -> Result<(), StateProjectionError> {
-        let applied_revision = StateProjection::applied_revision(&self.state_dir)?;
+        let mut applied_revision = StateProjection::applied_revision(&self.state_dir)?;
+        if applied_revision > self.journal.revision() {
+            tracing::warn!(applied_revision, journal_revision = self.journal.revision(), "projection watermark exceeds journal; replaying from the beginning");
+            applied_revision = 0;
+        }
         for receipt in self.journal.receipts_after(applied_revision) {
             StateProjection::apply(&self.state_dir, &receipt)?;
+        }
+        if self.journal.revision() == 0 {
+            StateProjection::write_watermark(&self.state_dir, 0)?;
         }
         Ok(())
     }
@@ -1041,30 +1099,55 @@ impl StateProjection {
     fn applied_revision(state_dir: &Path) -> Result<u64, StateProjectionError> {
         let path = Self::watermark_path(state_dir);
         match std::fs::read_to_string(&path) {
-            Ok(value) => value
-                .trim()
-                .parse()
-                .map_err(|source| StateProjectionError::ParseWatermark { path, source }),
+            Ok(value) => match value.trim().parse() {
+                Ok(revision) => Ok(revision),
+                Err(source) => {
+                    tracing::warn!(path = %path.display(), %source, "invalid projection watermark; replaying journal from the beginning");
+                    Ok(0)
+                }
+            },
             Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(0),
+            Err(source) if source.kind() == io::ErrorKind::InvalidData => {
+                tracing::warn!(path = %path.display(), %source, "unreadable projection watermark; replaying journal from the beginning");
+                Ok(0)
+            }
             Err(source) => Err(StateProjectionError::ReadWatermark { path, source }),
         }
     }
 
     fn apply(state_dir: &Path, receipt: &StateReceipt) -> Result<(), StateProjectionError> {
         Self::apply_mutation(state_dir, receipt.operation.shared_mutation()?)?;
+        // Newly created projection files must be discoverable durably before
+        // publishing a watermark that says their records have been applied.
+        File::open(state_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| StateProjectionError::Write {
+                path: state_dir.to_path_buf(),
+                source,
+            })?;
+        Self::write_watermark(state_dir, receipt.revision)
+    }
+
+    fn write_watermark(state_dir: &Path, revision: u64) -> Result<(), StateProjectionError> {
         let path = Self::watermark_path(state_dir);
+        // A fixed staging path is safe under the exclusive writer lease. A
+        // crashed replacement leaves only a disposable staging file, which the
+        // next replacement overwrites without damaging the current watermark.
+        let staging_path = state_dir.join("projection-revision.pending");
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(&path)
+            .open(&staging_path)
             .map_err(|source| StateProjectionError::Write {
                 path: path.clone(),
                 source,
             })?;
-        file.write_all(receipt.revision.to_string().as_bytes())
+        file.write_all(revision.to_string().as_bytes())
             .and_then(|()| file.write_all(b"\n"))
-            .and_then(|()| file.sync_data())
+            .and_then(|()| file.sync_all())
+            .and_then(|()| std::fs::rename(&staging_path, &path))
+            .and_then(|()| File::open(state_dir)?.sync_all())
             .map_err(|source| StateProjectionError::Write { path, source })
     }
 
