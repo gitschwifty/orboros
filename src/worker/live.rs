@@ -4,7 +4,26 @@ use std::time::Instant;
 
 use crate::ipc::types::WorkerEvent;
 
+pub(super) struct LiveDispatch {
+    worker_id: String,
+    session_id: String,
+    send_id: String,
+    started: Instant,
+    last_activity: Instant,
+    last_tool: Option<String>,
+    tool_calls: u64,
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
+    total_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cache_write_tokens: Option<u64>,
+    reasoning_tokens: Option<u64>,
+    cost_micros: Option<u64>,
+    retryable_errors: u64,
+}
+
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -34,24 +53,6 @@ mod tests {
         assert_eq!(live.tool_calls, 1);
         assert_eq!(live.last_tool.as_deref(), Some("read_file"));
     }
-}
-
-pub(super) struct LiveDispatch {
-    worker_id: String,
-    session_id: String,
-    send_id: String,
-    started: Instant,
-    last_activity: Instant,
-    last_tool: Option<String>,
-    tool_calls: u64,
-    prompt_tokens: Option<u64>,
-    completion_tokens: Option<u64>,
-    total_tokens: Option<u64>,
-    cache_read_tokens: Option<u64>,
-    cache_write_tokens: Option<u64>,
-    reasoning_tokens: Option<u64>,
-    cost_micros: Option<u64>,
-    retryable_errors: u64,
 }
 
 impl LiveDispatch {

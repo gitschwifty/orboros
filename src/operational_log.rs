@@ -7,7 +7,30 @@ use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
 use tracing_subscriber::fmt::{FmtContext, FormattedFields};
 use tracing_subscriber::registry::LookupSpan;
 
+struct EventFields(Map<String, Value>);
+
+impl Visit for EventFields {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.0
+            .insert(field.name().into(), Value::String(format!("{value:?}")));
+    }
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.0
+            .insert(field.name().into(), Value::String(value.into()));
+    }
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.0.insert(field.name().into(), value.into());
+    }
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.0.insert(field.name().into(), value.into());
+    }
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.0.insert(field.name().into(), value.into());
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use std::io::Write;
@@ -32,7 +55,6 @@ mod tests {
         let output = capture.clone();
         let subscriber = tracing_subscriber::fmt()
             .event_format(JsonOperationalFormat)
-            .with_ansi(false)
             .with_writer(move || output.clone())
             .finish();
         tracing::subscriber::with_default(subscriber, || {
@@ -52,28 +74,6 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("orb-test"));
-    }
-}
-
-struct EventFields(Map<String, Value>);
-
-impl Visit for EventFields {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        self.0
-            .insert(field.name().into(), Value::String(format!("{value:?}")));
-    }
-    fn record_str(&mut self, field: &Field, value: &str) {
-        self.0
-            .insert(field.name().into(), Value::String(value.into()));
-    }
-    fn record_u64(&mut self, field: &Field, value: u64) {
-        self.0.insert(field.name().into(), value.into());
-    }
-    fn record_i64(&mut self, field: &Field, value: i64) {
-        self.0.insert(field.name().into(), value.into());
-    }
-    fn record_bool(&mut self, field: &Field, value: bool) {
-        self.0.insert(field.name().into(), value.into());
     }
 }
 
