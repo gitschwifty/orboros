@@ -983,6 +983,28 @@ impl QueueLoop {
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         let mut targets: Vec<(Orb, DispatchTarget)> = Vec::new();
         for orb in &all_orbs {
+            if orb.phase == Some(OrbPhase::Executing) && orb.orb_type.uses_phase() {
+                let children: Vec<_> = all_edges
+                    .iter()
+                    .filter(|edge| {
+                        edge.from == orb.id && edge.edge_type == orbs::dep::EdgeType::Parent
+                    })
+                    .map(|edge| &edge.to)
+                    .collect();
+                let children_done = children.iter().all(|id| {
+                    all_orbs.iter().any(|child| {
+                        &child.id == *id && child.effective_status() == TaskStatus::Done
+                    })
+                }) && all_orbs
+                    .iter()
+                    .filter(|child| child.parent_id.as_ref() == Some(&orb.id))
+                    .all(|child| child.effective_status() == TaskStatus::Done);
+                if !children.is_empty() && (!orb.has_parent_final_work || !children_done) {
+                    tracing::info!(orb = %orb.id, reason = "parent_final_children_not_accepted", "worker admission blocked");
+                    continue;
+                }
+                tracing::info!(orb = %orb.id, children = ?children, "parent execution admission checkpoint");
+            }
             if !blocked_by_parent_review(orb, &all_orbs) {
                 if let Some(t) = dispatch_target_for(orb) {
                     targets.push((orb.clone(), t));
@@ -1020,6 +1042,9 @@ impl QueueLoop {
         let prompt_resolver =
             crate::prompt::PromptResolver::from_config(prompt_config, Some(&self.base_dir));
 
+        tracing::info!(local_cap = max_concurrency.max(1), queued = targets.len(),
+            global_available_permits = ?global_semaphore.as_ref().map(|semaphore| semaphore.available_permits()),
+            "worker admission limits (queued orbs are not in-flight workers)");
         let semaphore = Arc::new(Semaphore::new(max_concurrency.max(1)));
         // `stop()` is a graceful admission barrier: workers that have already
         // started are allowed to finish and persist their outcome, while work
@@ -1423,7 +1448,8 @@ fn validate_structured_phase_response(
         DispatchTarget::Decomposing => {
             let plan = crate::phases::decompose::parse_response(response)
                 .ok_or_else(|| "decomposition response was not a valid plan".to_string())?;
-            crate::phases::decompose::validate_subtasks(&plan)
+            crate::phases::decompose::validate_graph(&plan)
+                .and_then(|()| crate::phases::decompose::validate_subtasks(&plan))
                 .map_err(|error| format!("invalid decomposition subtasks: {error}"))?;
             crate::phases::decompose::validate_model_options(&plan, &model_config.models)
                 .map_err(|error| format!("invalid coordinator model choice: {error}"))
@@ -2260,6 +2286,8 @@ async fn dispatch_one_owned(
         .await
         {
             Ok(report) if report.verdict.is_accept() => {
+                orb.review_critique = None;
+                tracing::info!(orb = %orb.id, verdict = "accept", "refinement accepted; revision feedback cleared");
                 orb.review_report = Some(report);
             }
             Ok(report) => {

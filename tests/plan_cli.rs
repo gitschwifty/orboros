@@ -68,7 +68,9 @@ fn plan_file_respects_shallow_and_status_preserves_the_graph() {
                 .args(["plan", "--status", epic.id.as_str()])
                 .assert()
                 .success()
-                .stdout(contains(format!("{phase:?}")));
+                .stdout(contains(format!("{phase:?}")))
+                .stdout(contains("no execution marker"))
+                .stdout(contains("eligible for"));
         }
         assert_eq!(store.load_all().unwrap().len(), 3);
         assert_eq!(

@@ -171,7 +171,7 @@ pub fn print_plan_status(store: &OrbStore, dep_store: &DepStore, id: &str) -> an
     );
     let all_orbs = store.load_all()?;
     let children = store.load_children(&epic.id)?;
-    let ready = dep_store.ready(&all_orbs).unwrap_or_default();
+    let ready = dep_store.ready(&all_orbs)?;
     let phase = epic.phase.unwrap_or(OrbPhase::Pending);
     let child_done = children
         .iter()
@@ -195,12 +195,15 @@ pub fn print_plan_status(store: &OrbStore, dep_store: &DepStore, id: &str) -> an
     println!(
         "Dispatch:   {}",
         if epic.execution.is_some() {
-            "in flight (execution marker present)"
+            "execution marker present; worker liveness is not established"
         } else {
             "no execution marker"
         }
     );
     let next = match phase {
+        _ if epic.execution.is_some() && !matches!(phase, OrbPhase::Done | OrbPhase::Failed) => {
+            "dispatch blocked by execution marker; inspect daemon/attempt status, then recover the interrupted orb if no worker owns it".to_string()
+        }
         OrbPhase::Speccing
         | OrbPhase::Decomposing
         | OrbPhase::Refining
@@ -210,13 +213,17 @@ pub fn print_plan_status(store: &OrbStore, dep_store: &DepStore, id: &str) -> an
             format!("eligible for {} dispatch", phase_name(phase))
         }
         OrbPhase::Review => "awaiting review decision".to_string(),
-        OrbPhase::Waiting if child_failed > 0 => {
+        OrbPhase::Waiting | OrbPhase::ExecutingChildren if child_failed > 0 => {
             "blocked: reset or recover the failed child before continuing".to_string()
         }
-        OrbPhase::Waiting if child_done == children.len() && !children.is_empty() => {
+        OrbPhase::Waiting | OrbPhase::ExecutingChildren
+            if child_done == children.len() && !children.is_empty() => {
             "children complete; queue will advance parent final work or completion".to_string()
         }
-        OrbPhase::Waiting => "children are ready for queue execution".to_string(),
+        OrbPhase::Waiting | OrbPhase::ExecutingChildren => {
+            format!("waiting on children: {child_ready} dependency-ready; inspect child lifecycle and worker admission")
+        }
+        OrbPhase::Executing => "execution phase; queue must admit parent final work before dispatch".to_string(),
         OrbPhase::Done => "complete".to_string(),
         OrbPhase::Failed => "failed; inspect attempts, then reset the relevant orb".to_string(),
         _ => "not currently queue-dispatchable; inspect lifecycle state".to_string(),

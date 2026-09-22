@@ -21,7 +21,7 @@ use crate::config::SecondOpinionConfig;
 use crate::phases::prompt_util::extract_fenced_json;
 use crate::worker::process::{Worker, WorkerConfig};
 
-pub const REFINEMENT_REVIEWER_SYSTEM_PROMPT: &str = "You are an independent specification-quality reviewer. Evaluate the current task specification for completeness, internal consistency, concrete deliverables, and verifiable acceptance criteria. Do not approve a merely parseable or empty refinement. Respond with exactly one JSON object, no prose: {\"verdict\": \"accept\"} or {\"verdict\": {\"revise\": {\"scope\": \"decomposition\"}}, \"critique\": \"...\"} or {\"verdict\": \"reject\", \"critique\": \"...\"}.";
+pub const REFINEMENT_REVIEWER_SYSTEM_PROMPT: &str = "You are an independent specification-quality reviewer. Evaluate the current task specification for completeness, internal consistency, concrete deliverables, and verifiable acceptance criteria. Do not approve a merely parseable or empty refinement. An accept must omit critique and suggested_changes entirely. A revise must include nonempty actionable critique; observations alone are not a revision request. Respond with exactly one JSON object, no prose: {\"verdict\": \"accept\"} or {\"verdict\": {\"revise\": {\"scope\": \"decomposition\"}}, \"critique\": \"...\"} or {\"verdict\": \"reject\", \"critique\": \"...\"}.";
 
 /// Errors from the reviewer worker.
 #[derive(Debug, thiserror::Error)]
@@ -106,6 +106,39 @@ pub fn parse_verdict(text: &str) -> Result<ReviewVerdict, ReviewerError> {
     Err(ReviewerError::ParseFailed(text.chars().take(200).collect()))
 }
 
+/// Validate newly generated refinement decisions without changing historical reports.
+fn parse_refinement_verdict(text: &str) -> Result<ReviewVerdict, ReviewerError> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|_| {
+        ReviewerError::ParseFailed("refinement review must be one JSON object".into())
+    })?;
+    let verdict: ReviewVerdict = serde_json::from_value(
+        value
+            .get("verdict")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )
+    .map_err(|_| ReviewerError::ParseFailed("unsupported refinement verdict".into()))?;
+    if verdict.is_accept() {
+        if value.get("critique").is_some()
+            || value.get("suggested_changes").is_some()
+            || value.get("notes").is_some()
+        {
+            return Err(ReviewerError::ParseFailed(
+                "accept must omit critique, suggested_changes and notes".into(),
+            ));
+        }
+    } else if value
+        .get("critique")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|critique| critique.trim().is_empty())
+    {
+        return Err(ReviewerError::ParseFailed(
+            "revision or rejection requires actionable critique".into(),
+        ));
+    }
+    Ok(verdict)
+}
+
 /// Walks the text for the first `{` whose enclosing object contains
 /// `"verdict"` as a key. Returns the matched substring (including the
 /// braces). Naive bracket-matching — fine for reviewer output, which
@@ -187,7 +220,7 @@ pub async fn run_reviewer(
     wc.system_prompt = system;
     wc.max_iterations = Some(1);
 
-    run_reviewer_with_config(orb, model, wc, user).await
+    run_reviewer_with_config(orb, model, wc, user, false).await
 }
 
 /// Runs the mandatory post-refinement quality reviewer. Unlike the completion
@@ -224,7 +257,7 @@ pub async fn run_refinement_reviewer(
         router = resolved.router.as_deref().unwrap_or("default"),
         "starting refinement quality review"
     );
-    run_reviewer_with_config(orb, resolved.model, worker_config, user).await
+    run_reviewer_with_config(orb, resolved.model, worker_config, user, true).await
 }
 
 async fn run_reviewer_with_config(
@@ -232,6 +265,7 @@ async fn run_reviewer_with_config(
     model: String,
     worker_config: WorkerConfig,
     user: String,
+    refinement: bool,
 ) -> Result<ReviewReport, ReviewerError> {
     let started = Instant::now();
     let mut worker = Worker::spawn(&worker_config)
@@ -248,7 +282,11 @@ async fn run_reviewer_with_config(
     if body.is_empty() {
         return Err(ReviewerError::EmptyResponse);
     }
-    let verdict = parse_verdict(body)?;
+    let verdict = if refinement {
+        parse_refinement_verdict(body)?
+    } else {
+        parse_verdict(body)?
+    };
     let critique = extract_critique(body).unwrap_or_default();
     let suggested_changes = extract_suggested_changes(body);
     let usage = outcome.effective_usage();
@@ -467,5 +505,31 @@ mod tests {
     fn extract_suggested_changes_when_present() {
         let text = r#"{"verdict": "reject", "critique": "x", "suggested_changes": "do Y"}"#;
         assert_eq!(extract_suggested_changes(text).as_deref(), Some("do Y"));
+    }
+}
+
+#[cfg(test)]
+mod refinement_verdict_tests {
+    use super::*;
+
+    #[test]
+    fn acceptance_cannot_carry_revision_feedback() {
+        assert!(parse_refinement_verdict(r#"{"verdict":"accept"}"#).is_ok());
+        assert!(parse_refinement_verdict(r#"{"verdict":"accept","critique":"Fix API"}"#).is_err());
+        assert!(
+            parse_refinement_verdict(r#"{"verdict":"accept","suggested_changes":"Fix API"}"#)
+                .is_err()
+        );
+        // The permissive historical/general reader remains compatible.
+        assert!(parse_verdict(r#"{"verdict":"accept","critique":"Looks good"}"#).is_ok());
+    }
+
+    #[test]
+    fn revision_requires_actionable_feedback() {
+        assert!(parse_refinement_verdict(r#"{"verdict":{"revise":{"scope":"decomposition"}},"critique":"Add API acceptance criteria"}"#).is_ok());
+        assert!(parse_refinement_verdict(
+            r#"{"verdict":{"revise":{"scope":"decomposition"}},"critique":" "}"#
+        )
+        .is_err());
     }
 }

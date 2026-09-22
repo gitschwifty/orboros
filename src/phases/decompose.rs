@@ -271,6 +271,10 @@ pub fn finish_decomposing(orb: &mut Orb) -> bool {
 /// A single subtask the worker proposes during decomposition.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct DecomposedSubtask {
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub depends_on: Option<Vec<String>>,
     pub title: String,
     pub description: String,
     /// Execution order group. Subtasks with the same order may run
@@ -312,8 +316,10 @@ no code fences — in this shape:\n\
     {\"title\": \"<short subtask title>\", \"description\": \"<what to do>\", \"order\": 1, \"model_option\": \"<optional approved key>\", \"model_reason\": \"<brief reason>\"},\n\
     ...\n\
   ], \"has_parent_final_work\": false}\n\
-Use the `order` field to express sequencing: subtasks with the same order may \
-run in parallel; lower numbers run first. Aim for 2-6 subtasks. Avoid trivial \
+Every subtask must include a unique nonempty `id` and an explicit `depends_on` \
+array of local IDs, including [] for independent work. These fields override \
+legacy `order`. Describe the concrete artifact consumed from each prerequisite \
+in Inputs and keep titles scoped to the child boundary. Aim for 2-6 subtasks. Avoid trivial \
 one-line subtasks; each should be a meaningful unit of work. Set \
 `has_parent_final_work` to true only when the parent must perform its own \
 synthesis or verification after the children finish.\
@@ -417,6 +423,62 @@ pub(crate) fn validate_subtasks(plan: &DecompositionPlan) -> anyhow::Result<()> 
     Ok(())
 }
 
+/// Historical order-only plans remain readable. Mixed graph/legacy data is invalid.
+pub(crate) fn validate_graph(plan: &DecompositionPlan) -> anyhow::Result<()> {
+    if plan
+        .subtasks
+        .iter()
+        .all(|task| task.id.is_none() && task.depends_on.is_none())
+    {
+        return Ok(());
+    }
+    let mut ids = std::collections::HashSet::new();
+    for task in &plan.subtasks {
+        let id = task.id.as_deref().unwrap_or("");
+        anyhow::ensure!(!id.trim().is_empty(), "graph task requires a nonempty id");
+        anyhow::ensure!(ids.insert(id), "duplicate graph task id: {id}");
+        anyhow::ensure!(
+            task.depends_on.is_some(),
+            "task {id} must declare depends_on"
+        );
+    }
+    for task in &plan.subtasks {
+        for dependency in task.depends_on.iter().flatten() {
+            anyhow::ensure!(
+                ids.contains(dependency.as_str()),
+                "unknown dependency: {dependency}"
+            );
+            anyhow::ensure!(
+                task.id.as_ref() != Some(dependency),
+                "self dependency: {dependency}"
+            );
+        }
+    }
+    let mut completed = std::collections::HashSet::new();
+    loop {
+        let previous = completed.len();
+        for task in &plan.subtasks {
+            if task
+                .depends_on
+                .iter()
+                .flatten()
+                .all(|id| completed.contains(id.as_str()))
+            {
+                if let Some(id) = task.id.as_deref() {
+                    completed.insert(id);
+                }
+            }
+        }
+        if completed.len() == ids.len() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            completed.len() > previous,
+            "dependency graph contains a cycle"
+        );
+    }
+}
+
 /// Converts an accepted worker plan into the durable child graph.  This is
 /// deliberately separate from parsing: a response is not a decomposition
 /// until the caller has persisted this result through its configured stores.
@@ -432,6 +494,7 @@ pub fn materialize_plan(parent: &Orb, plan: &DecompositionPlan) -> anyhow::Resul
         parent.phase
     );
     validate_subtasks(plan)?;
+    validate_graph(plan)?;
 
     let root_id = parent.root_id.clone().unwrap_or_else(|| parent.id.clone());
     let mut children = Vec::with_capacity(plan.subtasks.len());
@@ -464,6 +527,27 @@ pub fn materialize_plan(parent: &Orb, plan: &DecompositionPlan) -> anyhow::Resul
             .or_default()
             .push(child_id);
         children.push(child);
+    }
+    if plan.subtasks.iter().any(|task| task.id.is_some()) {
+        let ids: std::collections::HashMap<_, _> = plan
+            .subtasks
+            .iter()
+            .zip(&children)
+            .filter_map(|(task, child)| task.id.as_deref().map(|id| (id, &child.id)))
+            .collect();
+        for (task, child) in plan.subtasks.iter().zip(&children) {
+            for dependency in task.depends_on.iter().flatten() {
+                if let Some(prerequisite) = ids.get(dependency.as_str()) {
+                    edges.push(DepEdge::new(
+                        child.id.clone(),
+                        (*prerequisite).clone(),
+                        EdgeType::DependsOn,
+                    ));
+                }
+            }
+            tracing::info!(child = %child.id, local_id = ?task.id, depends_on = ?task.depends_on, "accepted decomposition graph node");
+        }
+        return Ok(DecomposeResult { children, edges });
     }
     // Build complete order groups before adding edges: input order must not
     // determine which prerequisites exist, and every parallel predecessor
@@ -760,6 +844,8 @@ mod tests {
         let plan = DecompositionPlan {
             subtasks: vec![
                 DecomposedSubtask {
+                    id: None,
+                    depends_on: None,
                     title: "schema".into(),
                     description: "Add the schema".into(),
                     order: 1,
@@ -767,6 +853,8 @@ mod tests {
                     model_reason: None,
                 },
                 DecomposedSubtask {
+                    id: None,
+                    depends_on: None,
                     title: "api".into(),
                     description: "Add the API".into(),
                     order: 1,
@@ -774,6 +862,8 @@ mod tests {
                     model_reason: None,
                 },
                 DecomposedSubtask {
+                    id: None,
+                    depends_on: None,
                     title: "tests".into(),
                     description: "Add tests".into(),
                     order: 2,
@@ -1005,5 +1095,28 @@ mod tests {
         assert_eq!(plan.subtasks.len(), 1);
         assert_eq!(plan.subtasks[0].title, "Add todo model");
         assert!(plan.has_parent_final_work);
+    }
+}
+
+#[cfg(test)]
+mod explicit_graph_tests {
+    use super::*;
+
+    #[test]
+    fn validates_graph_and_rejects_cycles_and_unknown_references() {
+        let mut plan = parse_response(
+            r#"{"subtasks":[
+            {"id":"core","title":"Core","description":"Produce API","depends_on":[]},
+            {"id":"app","title":"App","description":"Consume API","depends_on":["core"]}
+        ]}"#,
+        )
+        .unwrap();
+        assert!(validate_graph(&plan).is_ok());
+        plan.subtasks[0].depends_on = Some(vec!["app".into()]);
+        assert!(validate_graph(&plan).is_err());
+        plan.subtasks[0].depends_on = Some(vec!["missing".into()]);
+        assert!(validate_graph(&plan).is_err());
+        plan.subtasks[0].depends_on = None;
+        assert!(validate_graph(&plan).is_err());
     }
 }
