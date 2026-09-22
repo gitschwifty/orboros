@@ -1317,6 +1317,8 @@ fn validate_structured_phase_response(
         DispatchTarget::Decomposing => {
             let plan = crate::phases::decompose::parse_response(response)
                 .ok_or_else(|| "decomposition response was not a valid plan".to_string())?;
+            crate::phases::decompose::validate_subtasks(&plan)
+                .map_err(|error| format!("invalid decomposition subtasks: {error}"))?;
             crate::phases::decompose::validate_model_options(&plan, &model_config.models)
                 .map_err(|error| format!("invalid coordinator model choice: {error}"))
         }
@@ -2630,6 +2632,22 @@ mod tests {
     }
 
     #[test]
+    fn structured_decomposition_validation_rejects_unmaterializable_subtasks() {
+        let config = crate::config::OrbConfig::default();
+        for response in [
+            r#"{"subtasks":[]}"#,
+            r#"{"subtasks":[{"title":" ","description":"work"}]}"#,
+            r#"{"subtasks":[{"title":"task","description":"\t"}]}"#,
+        ] {
+            assert!(
+                validate_structured_phase_response(DispatchTarget::Decomposing, response, &config,)
+                    .is_err(),
+                "accepted unmaterializable response: {response}"
+            );
+        }
+    }
+
+    #[test]
     fn structured_phase_validation_rejects_malformed_output_for_every_structured_phase() {
         let config = crate::config::OrbConfig::default();
         for target in [
@@ -3575,6 +3593,67 @@ done"#,
             .unwrap()
             .iter()
             .any(|edge| edge.edge_type == EdgeType::DependsOn));
+    }
+
+    #[tokio::test]
+    async fn empty_decomposition_exhausts_recovery_and_stays_failed_after_restart() {
+        let (_tmp, orb_store, dep_store, base) = setup();
+        let script = r#"
+import json, pathlib, sys
+counter = pathlib.Path('dispatch-count')
+for line in sys.stdin:
+    request = json.loads(line)
+    if request['type'] == 'init':
+        print(json.dumps(dict(type='init_ok', id=request['id'], session_id='probe')), flush=True)
+    elif request['type'] == 'send':
+        count = int(counter.read_text()) if counter.exists() else 0
+        counter.write_text(str(count + 1))
+        print(json.dumps(dict(type='result', id=request['id'], status='ok', response='{"subtasks":[]}', tool_calls_made=[], iterations=1)), flush=True)
+    elif request['type'] == 'shutdown':
+        print(json.dumps(dict(type='shutdown_ok', id=request['id'])), flush=True)
+        break
+"#;
+        let mut feature = Orb::new("Feature", "decompose me").with_type(OrbType::Feature);
+        feature.set_phase(OrbPhase::Speccing).unwrap();
+        feature.set_phase(OrbPhase::Decomposing).unwrap();
+        orb_store.append(&feature).unwrap();
+        let worker = crate::worker::process::WorkerConfig {
+            command: "python3".into(),
+            args: vec!["-c".into(), script.into()],
+            cwd: Some(base.clone()),
+            env: vec![],
+            model: "mock/empty-decomposition".into(),
+            system_prompt: String::new(),
+            tools: vec![],
+            max_iterations: Some(1),
+            init_timeout: Some(Duration::from_secs(5)),
+            send_timeout: Some(Duration::from_secs(5)),
+            shutdown_timeout: Some(Duration::from_secs(5)),
+            task_id: None,
+            worker_id: None,
+            runtime: None,
+            routing: None,
+            credential_source: None,
+        };
+        let queue = QueueLoop::new(orb_store.clone(), dep_store.clone(), base.clone());
+        assert_eq!(queue.dispatch_ready_orbs(&worker, 1).await.unwrap(), 0);
+        let parent = orb_store.load_by_id(&feature.id).unwrap().unwrap();
+        assert_eq!(parent.phase, Some(OrbPhase::Failed));
+        assert!(parent
+            .result
+            .as_deref()
+            .unwrap()
+            .contains("recovery exhausted"));
+        assert!(orb_store.load_children(&feature.id).unwrap().is_empty());
+        drop(queue);
+        let reopened = QueueLoop::new(orb_store, dep_store, base.clone());
+        assert_eq!(reopened.dispatch_ready_orbs(&worker, 1).await.unwrap(), 0);
+        assert_eq!(
+            tokio::fs::read_to_string(base.join("dispatch-count"))
+                .await
+                .unwrap(),
+            "3"
+        );
     }
 
     #[tokio::test]

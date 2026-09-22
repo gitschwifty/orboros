@@ -297,6 +297,22 @@ pub fn apply_model_option(child: &mut Orb, subtask: &DecomposedSubtask) {
     child.preferred_model.clone_from(&subtask.model_option);
 }
 
+/// Checks materialization requirements before accepting structured output.
+pub(crate) fn validate_subtasks(plan: &DecompositionPlan) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !plan.subtasks.is_empty(),
+        "decomposition plan has no subtasks"
+    );
+    for (index, subtask) in plan.subtasks.iter().enumerate() {
+        anyhow::ensure!(
+            !subtask.title.trim().is_empty() && !subtask.description.trim().is_empty(),
+            "decomposition subtask {} has an empty title or description",
+            index + 1
+        );
+    }
+    Ok(())
+}
+
 /// Converts an accepted worker plan into the durable child graph.  This is
 /// deliberately separate from parsing: a response is not a decomposition
 /// until the caller has persisted this result through its configured stores.
@@ -311,10 +327,7 @@ pub fn materialize_plan(parent: &Orb, plan: &DecompositionPlan) -> anyhow::Resul
         "parent orb must be in Decomposing phase, got {:?}",
         parent.phase
     );
-    anyhow::ensure!(
-        !plan.subtasks.is_empty(),
-        "decomposition plan has no subtasks"
-    );
+    validate_subtasks(plan)?;
 
     let root_id = parent.root_id.clone().unwrap_or_else(|| parent.id.clone());
     let mut children = Vec::with_capacity(plan.subtasks.len());
@@ -323,11 +336,6 @@ pub fn materialize_plan(parent: &Orb, plan: &DecompositionPlan) -> anyhow::Resul
         std::collections::BTreeMap::new();
 
     for (index, subtask) in plan.subtasks.iter().enumerate() {
-        anyhow::ensure!(
-            !subtask.title.trim().is_empty() && !subtask.description.trim().is_empty(),
-            "decomposition subtask {} has an empty title or description",
-            index + 1
-        );
         let child_id = parent
             .id
             .child(u32::try_from(index + 1).unwrap_or(u32::MAX));
