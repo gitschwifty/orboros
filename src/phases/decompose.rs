@@ -319,7 +319,7 @@ pub fn materialize_plan(parent: &Orb, plan: &DecompositionPlan) -> anyhow::Resul
     let root_id = parent.root_id.clone().unwrap_or_else(|| parent.id.clone());
     let mut children = Vec::with_capacity(plan.subtasks.len());
     let mut edges = Vec::new();
-    let mut previous_by_order: std::collections::BTreeMap<u32, OrbId> =
+    let mut children_by_order: std::collections::BTreeMap<u32, Vec<OrbId>> =
         std::collections::BTreeMap::new();
 
     for (index, subtask) in plan.subtasks.iter().enumerate() {
@@ -347,15 +347,29 @@ pub fn materialize_plan(parent: &Orb, plan: &DecompositionPlan) -> anyhow::Resul
             parent.id.clone(),
             EdgeType::Child,
         ));
-        if let Some((_, previous)) = previous_by_order.range(..subtask.order).next_back() {
-            edges.push(DepEdge::new(
-                child_id.clone(),
-                previous.clone(),
-                EdgeType::DependsOn,
-            ));
-        }
-        previous_by_order.insert(subtask.order, child_id);
+        children_by_order
+            .entry(subtask.order)
+            .or_default()
+            .push(child_id);
         children.push(child);
+    }
+    // Build complete order groups before adding edges: input order must not
+    // determine which prerequisites exist, and every parallel predecessor
+    // must finish before the next group is eligible.
+    let mut groups = children_by_order.values();
+    if let Some(mut previous) = groups.next() {
+        for current in groups {
+            for child in current {
+                for prerequisite in previous {
+                    edges.push(DepEdge::new(
+                        child.clone(),
+                        prerequisite.clone(),
+                        EdgeType::DependsOn,
+                    ));
+                }
+            }
+            previous = current;
+        }
     }
     Ok(DecomposeResult { children, edges })
 }
@@ -639,13 +653,54 @@ mod tests {
                 .iter()
                 .filter(|edge| edge.edge_type == EdgeType::DependsOn)
                 .count(),
-            1
+            2
         );
         apply_decomposition(&result, &store, &dep_store).unwrap();
         assert_eq!(store.load_children(&parent.id).unwrap().len(), 3);
     }
 
     // ── snapshot_decomposition ───────────────────────────────
+
+    #[test]
+    fn materialized_order_groups_include_every_predecessor_independent_of_input_order() {
+        let mut parent = feature_orb("Feature", "Grouped work");
+        parent.phase = Some(OrbPhase::Decomposing);
+        let plan = parse_response(
+            r#"{"subtasks":[
+            {"title":"finish","description":"finish","order":7},
+            {"title":"api","description":"api","order":1},
+            {"title":"tests","description":"tests","order":3},
+            {"title":"schema","description":"schema","order":1},
+            {"title":"docs","description":"docs","order":3}
+        ]}"#,
+        )
+        .unwrap();
+        let expected = std::collections::BTreeSet::from([
+            ("tests", "api"),
+            ("tests", "schema"),
+            ("docs", "api"),
+            ("docs", "schema"),
+            ("finish", "tests"),
+            ("finish", "docs"),
+        ]);
+        let mut reversed = plan.clone();
+        reversed.subtasks.reverse();
+        for candidate in [plan, reversed] {
+            let result = materialize_plan(&parent, &candidate).unwrap();
+            let titles: std::collections::HashMap<_, _> = result
+                .children
+                .iter()
+                .map(|child| (&child.id, child.title.as_str()))
+                .collect();
+            let actual: std::collections::BTreeSet<_> = result
+                .edges
+                .iter()
+                .filter(|edge| edge.edge_type == EdgeType::DependsOn)
+                .map(|edge| (titles[&edge.from], titles[&edge.to]))
+                .collect();
+            assert_eq!(actual, expected);
+        }
+    }
 
     #[test]
     fn snapshot_decomposition_creates_snapshot_dir() {
