@@ -986,8 +986,9 @@ impl ProjectStateAuthority {
     /// Imports an existing isolated `.orbs` projection exactly once.
     ///
     /// Migration is deliberately allowed only before this authority has
-    /// accepted any operation. Each imported latest-value record enters the
-    /// journal normally, giving the shared state an auditable recovery trail.
+    /// accepted any operation. All imported latest-value records enter the
+    /// journal as one batch, so replay can finish an interrupted projection
+    /// without mistaking a partially imported graph for a completed import.
     pub fn import_legacy_projection(
         &mut self,
         legacy_dir: &Path,
@@ -1001,22 +1002,22 @@ impl ProjectStateAuthority {
         let edges = orbs::dep_store::DepStore::new(legacy_dir.join("deps.jsonl"))
             .all_edges()
             .map_err(|error| StateProjectionError::ReadLegacy(error.to_string()))?;
-        let mut imported = 0;
-        for orb in orbs {
+        let mutations: Vec<_> = orbs
+            .into_iter()
+            .map(|orb| SharedStateMutation::UpsertOrb { orb })
+            .chain(
+                edges
+                    .into_iter()
+                    .map(|edge| SharedStateMutation::UpsertDependency { edge }),
+            )
+            .collect();
+        let imported = mutations.len();
+        if imported != 0 {
             self.accept(StateOperation::mutation(
                 uuid::Uuid::new_v4(),
                 self.revision(),
-                SharedStateMutation::UpsertOrb { orb },
+                SharedStateMutation::Batch { mutations },
             ))?;
-            imported += 1;
-        }
-        for edge in edges {
-            self.accept(StateOperation::mutation(
-                uuid::Uuid::new_v4(),
-                self.revision(),
-                SharedStateMutation::UpsertDependency { edge },
-            ))?;
-            imported += 1;
         }
         Ok(imported)
     }
@@ -1463,6 +1464,60 @@ mod tests {
         assert!(matches!(error, ProjectAuthorityError::Projection(_)));
         assert_eq!(authority.revision(), 0);
         assert!(!authority.state_dir().join("projection-revision").exists());
+    }
+
+    #[test]
+    fn authority_imports_complete_legacy_graph_in_one_durable_operation() {
+        let home = tempfile::tempdir().unwrap();
+        let legacy = tempfile::tempdir().unwrap();
+        let first = Orb::new("first", "prerequisite");
+        let second = Orb::new("second", "dependent");
+        let source = OrbStore::new(legacy.path().join("orbs.jsonl"));
+        source.append(&first).unwrap();
+        source.append(&second).unwrap();
+        let edge = DepEdge::new(
+            second.id.clone(),
+            first.id.clone(),
+            orbs::dep::EdgeType::DependsOn,
+        );
+        DepStore::new(legacy.path().join("deps.jsonl"))
+            .add_edge(edge)
+            .unwrap();
+        let mut authority =
+            ProjectStateAuthority::attach(home.path(), project("alpha"), 1).unwrap();
+        assert_eq!(
+            authority.import_legacy_projection(legacy.path()).unwrap(),
+            3
+        );
+        assert_eq!(authority.revision(), 1);
+        let receipts = authority.journal.receipts_after(0);
+        assert_eq!(receipts.len(), 1);
+        assert!(matches!(
+            receipts[0].operation.shared_mutation().unwrap(),
+            SharedStateMutation::Batch { mutations } if mutations.len() == 3
+        ));
+        // Model interruption after the durable import but before projection.
+        std::fs::write(authority.state_dir().join("orbs.jsonl"), b"").unwrap();
+        std::fs::write(authority.state_dir().join("deps.jsonl"), b"").unwrap();
+        std::fs::write(authority.state_dir().join("projection-revision"), b"0\n").unwrap();
+        drop(authority);
+        let mut reopened = ProjectStateAuthority::attach(home.path(), project("alpha"), 2).unwrap();
+        assert_eq!(reopened.import_legacy_projection(legacy.path()).unwrap(), 0);
+        assert_eq!(
+            OrbStore::new(reopened.state_dir().join("orbs.jsonl"))
+                .load_all()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            DepStore::new(reopened.state_dir().join("deps.jsonl"))
+                .all_edges()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(reopened.revision(), 1);
     }
 
     #[test]
