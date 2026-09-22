@@ -2252,13 +2252,17 @@ fn print_telemetry_summary(project: &str, summary: &orboros::telemetry::Telemetr
 }
 
 fn cmd_daemon_stop(daemon_config: &DaemonConfig) -> anyhow::Result<()> {
+    use anyhow::Context;
+
     match orboros::daemon::read_pid_file(daemon_config)? {
         Some(pid) => {
             if orboros::daemon::is_running(daemon_config) {
                 println!("Sending SIGTERM to daemon (PID {pid})...");
-                // Safety: sending SIGTERM to a known PID
-                unsafe {
-                    libc::kill(pid.cast_signed(), libc::SIGTERM);
+                // PID parsing rejects zero and values with process-group semantics.
+                let result = unsafe { libc::kill(pid.cast_signed(), libc::SIGTERM) };
+                if result != 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .with_context(|| format!("sending SIGTERM to daemon PID {pid}"));
                 }
                 println!("Stop signal sent.");
             } else {

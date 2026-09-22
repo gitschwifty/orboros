@@ -75,6 +75,10 @@ pub fn read_pid_file(config: &DaemonConfig) -> Result<Option<u32>> {
         .trim()
         .parse()
         .with_context(|| format!("parsing pid from file: {:?}", content.trim()))?;
+    anyhow::ensure!(
+        pid > 0 && libc::pid_t::try_from(pid).is_ok(),
+        "PID must be a positive representable process ID: {pid}"
+    );
     Ok(Some(pid))
 }
 
@@ -733,6 +737,20 @@ mod tests {
 
         let pid = read_pid_file(&config).unwrap();
         assert_eq!(pid, Some(std::process::id()));
+    }
+
+    #[test]
+    fn read_pid_file_rejects_nonpositive_and_unrepresentable_process_ids() {
+        let tmp = tempdir().unwrap();
+        let config = config_in(tmp.path());
+        for value in ["0", "-1", "2147483648", "4294967295"] {
+            std::fs::write(&config.pid_file, value).unwrap();
+            assert!(read_pid_file(&config).is_err(), "accepted PID {value}");
+        }
+        for value in [1, i32::MAX as u32] {
+            std::fs::write(&config.pid_file, value.to_string()).unwrap();
+            assert_eq!(read_pid_file(&config).unwrap(), Some(value));
+        }
     }
 
     #[test]
