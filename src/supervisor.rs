@@ -971,7 +971,7 @@ impl LocalSupervisor {
 
     pub fn restore_attached_queues(
         &mut self,
-        queues: HashMap<String, crate::queue_loop::QueueLoop>,
+        queues: &HashMap<String, crate::queue_loop::QueueLoop>,
         _dispatch: HashMap<String, Option<crate::daemon::DispatchSettings>>,
     ) {
         // The registry retained the actual lifecycle handles throughout.

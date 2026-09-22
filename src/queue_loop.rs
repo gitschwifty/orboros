@@ -664,7 +664,6 @@ impl QueueLoop {
             if orb.effective_status() == TaskStatus::Done
                 || orb.effective_status() == TaskStatus::Failed
                 || orb.effective_status() == TaskStatus::Cancelled
-                || orb.effective_status() == TaskStatus::Tombstone
             {
                 continue;
             }
@@ -823,7 +822,6 @@ impl QueueLoop {
             if orb.effective_status() == TaskStatus::Done
                 || orb.effective_status() == TaskStatus::Failed
                 || orb.effective_status() == TaskStatus::Cancelled
-                || orb.effective_status() == TaskStatus::Tombstone
             {
                 continue;
             }
@@ -1275,7 +1273,7 @@ fn blocked_by_parent_review(orb: &Orb, orbs: &[Orb]) -> bool {
         };
         if matches!(
             parent.effective_status(),
-            TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Tombstone
+            TaskStatus::Failed | TaskStatus::Cancelled
         ) {
             return true;
         }
@@ -2650,10 +2648,10 @@ async fn dispatch_one_owned(
                 }
                 DispatchTarget::Refining
                 | DispatchTarget::Decomposing
-                | DispatchTarget::Execute => {}
+                | DispatchTarget::Execute
                 // The dispatcher applies the verdict directly from
                 // Reevaluating, before any generic phase advancement.
-                DispatchTarget::Reevaluating => {}
+                | DispatchTarget::Reevaluating => {}
             }
         }
     }

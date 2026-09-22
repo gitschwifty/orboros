@@ -312,7 +312,7 @@ impl Worker {
         let init_result = if let Some(dur) = config.init_timeout {
             tokio::time::timeout(dur, worker.init(config))
                 .await
-                .unwrap_or_else(|_| Err(IpcError::InitTimeout(dur)))
+                .unwrap_or(Err(IpcError::InitTimeout(dur)))
         } else {
             worker.init(config).await
         };
@@ -597,9 +597,19 @@ impl Worker {
     }
 
     async fn terminate_owned(&mut self) -> Result<(), IpcError> {
-        self.group
-            .terminate()
-            .map_err(|error| IpcError::Cleanup(error.to_string()))?;
+        if let Err(error) = self.group.terminate() {
+            // Some platforms report EPERM when the process group has already
+            // disappeared during graceful shutdown. Kill the leader directly
+            // and still reap it; the group handle is cleared only after the
+            // signal attempt above, so no stale group id is retained.
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                self.child
+                    .start_kill()
+                    .map_err(|error| IpcError::Cleanup(error.to_string()))?;
+            } else {
+                return Err(IpcError::Cleanup(error.to_string()));
+            }
+        }
         #[cfg(not(unix))]
         self.child
             .start_kill()

@@ -531,10 +531,10 @@ pub async fn run_supervisor_with_control_socket(
                     if let Err(error) = tick_supervised_projects_with_global(&attached, global_semaphore.clone()).await {
                         tracing::error!(%error, "fatal headless IPC failure in attached project; stopping supervisor");
                         for project in &projects { project.queue.stop(); }
-                        supervisor.lock().await.restore_attached_queues(queues, dispatch);
+                        supervisor.lock().await.restore_attached_queues(&queues, dispatch);
                         break 'supervisor;
                     }
-                    supervisor.lock().await.restore_attached_queues(queues, dispatch);
+                    supervisor.lock().await.restore_attached_queues(&queues, dispatch);
                 }
             }
         }
