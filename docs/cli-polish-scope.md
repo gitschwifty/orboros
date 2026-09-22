@@ -27,3 +27,21 @@ within [0, 1]; selection and error-path unit cases were added but not run.
 Remaining: daemon notification policy and deduplication are deliberately
 undecided. A confidence score does not automatically block, reset, or approve
 work, and a missing score is not treated as low confidence.
+
+## Live in-flight observations (task 151, bounded first slice)
+
+Worker sends now emit a start, a snapshot every 30 seconds, and a snapshot on
+result or transport-read failure through operational tracing. Snapshots contain
+worker/session/send IDs, elapsed and last-event age, last tool name, completed
+tool count, observed retryable-error count, and latest provisional usage. Usage
+snapshots replace prior values; they never enter settled telemetry accounting.
+Timer ticks retain the pending IPC read to avoid losing partial JSON lines.
+No tool arguments, results, content, or provider error bodies are added.
+
+Remaining: an admission-scoped registry, daemon/orb cross-process views,
+model/route attribution, reliable assistant-turn signals, provider retry versus
+fresh-worker lineage, cancellation/draining terminal records, durable bounded
+restart snapshots, and final reconciliation tests. Event silence is observable
+as age, not a claim that the worker has stalled. Heartbeats from Heddle count
+as activity. Tests added for snapshot replacement and tool completion were not
+executed. This slice does not claim the full task 151 acceptance contract.

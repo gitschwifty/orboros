@@ -456,14 +456,42 @@ impl Worker {
         }
 
         let mut events = Vec::new();
+        let mut live = super::live::LiveDispatch::new(
+            &self.worker_id.to_string(), &self.session_id, id,
+        );
+        live.report("started");
+        let period = Duration::from_secs(30);
+        let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            let response = read_response(&mut self.reader)
-                .await?
-                .ok_or(IpcError::StdoutClosed)?;
+            // Keep the same read future across timer ticks: read_line is not
+            // cancellation-safe when a response arrives in partial chunks.
+            let response = {
+                let read = read_response(&mut self.reader);
+                tokio::pin!(read);
+                loop {
+                    tokio::select! {
+                        response = &mut read => break response,
+                        _ = heartbeat.tick() => live.report("active"),
+                    }
+                }
+            };
+            let response = match response {
+                Ok(Some(response)) => response,
+                Ok(None) => {
+                    live.report("stdout_closed");
+                    return Err(IpcError::StdoutClosed);
+                }
+                Err(error) => {
+                    live.report("read_failed");
+                    return Err(error);
+                }
+            };
 
             match response {
                 IpcResponse::Event { event, .. } => {
+                    live.observe(&event);
                     if let Some(tx) = event_tx.as_ref() {
                         // Drop the forwarder if the receiver hangs up, but
                         // keep collecting into `events` so the outcome stays
@@ -491,6 +519,7 @@ impl Worker {
                     failure,
                     ..
                 } => {
+                    live.report("result_received");
                     let confidence = resolve_confidence(confidence, &mut response);
                     return Ok(SendOutcome {
                         id: result_id,
