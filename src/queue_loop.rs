@@ -904,13 +904,20 @@ impl QueueLoop {
         let mut targets: Vec<(Orb, DispatchTarget)> = Vec::new();
         for orb in &all_orbs {
             if orb.phase == Some(OrbPhase::Executing) && orb.orb_type.uses_phase() {
-                let children: Vec<_> = all_edges.iter()
-                    .filter(|edge| edge.from == orb.id && edge.edge_type == orbs::dep::EdgeType::Parent)
+                let children: Vec<_> = all_edges
+                    .iter()
+                    .filter(|edge| {
+                        edge.from == orb.id && edge.edge_type == orbs::dep::EdgeType::Parent
+                    })
                     .map(|edge| &edge.to)
                     .collect();
-                let children_done = children.iter().all(|id| all_orbs.iter().any(|child| {
-                    &child.id == *id && child.effective_status() == TaskStatus::Done
-                })) && all_orbs.iter().filter(|child| child.parent_id.as_ref() == Some(&orb.id))
+                let children_done = children.iter().all(|id| {
+                    all_orbs.iter().any(|child| {
+                        &child.id == *id && child.effective_status() == TaskStatus::Done
+                    })
+                }) && all_orbs
+                    .iter()
+                    .filter(|child| child.parent_id.as_ref() == Some(&orb.id))
                     .all(|child| child.effective_status() == TaskStatus::Done);
                 if !children.is_empty() && (!orb.has_parent_final_work || !children_done) {
                     tracing::info!(orb = %orb.id, reason = "parent_final_children_not_accepted", "worker admission blocked");

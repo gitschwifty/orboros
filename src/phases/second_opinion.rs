@@ -112,17 +112,24 @@ fn parse_refinement_verdict(text: &str) -> Result<ReviewVerdict, ReviewerError> 
         ReviewerError::ParseFailed("refinement review must be one JSON object".into())
     })?;
     let verdict: ReviewVerdict = serde_json::from_value(
-        value.get("verdict").cloned().unwrap_or(serde_json::Value::Null),
-    ).map_err(|_| ReviewerError::ParseFailed("unsupported refinement verdict".into()))?;
+        value
+            .get("verdict")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )
+    .map_err(|_| ReviewerError::ParseFailed("unsupported refinement verdict".into()))?;
     if verdict.is_accept() {
-        if value.get("critique").is_some() || value.get("suggested_changes").is_some()
+        if value.get("critique").is_some()
+            || value.get("suggested_changes").is_some()
             || value.get("notes").is_some()
         {
             return Err(ReviewerError::ParseFailed(
                 "accept must omit critique, suggested_changes and notes".into(),
             ));
         }
-    } else if value.get("critique").and_then(serde_json::Value::as_str)
+    } else if value
+        .get("critique")
+        .and_then(serde_json::Value::as_str)
         .is_none_or(|critique| critique.trim().is_empty())
     {
         return Err(ReviewerError::ParseFailed(
@@ -509,7 +516,10 @@ mod refinement_verdict_tests {
     fn acceptance_cannot_carry_revision_feedback() {
         assert!(parse_refinement_verdict(r#"{"verdict":"accept"}"#).is_ok());
         assert!(parse_refinement_verdict(r#"{"verdict":"accept","critique":"Fix API"}"#).is_err());
-        assert!(parse_refinement_verdict(r#"{"verdict":"accept","suggested_changes":"Fix API"}"#).is_err());
+        assert!(
+            parse_refinement_verdict(r#"{"verdict":"accept","suggested_changes":"Fix API"}"#)
+                .is_err()
+        );
         // The permissive historical/general reader remains compatible.
         assert!(parse_verdict(r#"{"verdict":"accept","critique":"Looks good"}"#).is_ok());
     }
@@ -517,6 +527,9 @@ mod refinement_verdict_tests {
     #[test]
     fn revision_requires_actionable_feedback() {
         assert!(parse_refinement_verdict(r#"{"verdict":{"revise":{"scope":"decomposition"}},"critique":"Add API acceptance criteria"}"#).is_ok());
-        assert!(parse_refinement_verdict(r#"{"verdict":{"revise":{"scope":"decomposition"}},"critique":" "}"#).is_err());
+        assert!(parse_refinement_verdict(
+            r#"{"verdict":{"revise":{"scope":"decomposition"}},"critique":" "}"#
+        )
+        .is_err());
     }
 }

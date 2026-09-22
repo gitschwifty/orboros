@@ -321,7 +321,11 @@ pub(crate) fn validate_subtasks(plan: &DecompositionPlan) -> anyhow::Result<()> 
 
 /// Historical order-only plans remain readable. Mixed graph/legacy data is invalid.
 pub(crate) fn validate_graph(plan: &DecompositionPlan) -> anyhow::Result<()> {
-    if plan.subtasks.iter().all(|task| task.id.is_none() && task.depends_on.is_none()) {
+    if plan
+        .subtasks
+        .iter()
+        .all(|task| task.id.is_none() && task.depends_on.is_none())
+    {
         return Ok(());
     }
     let mut ids = std::collections::HashSet::new();
@@ -329,19 +333,33 @@ pub(crate) fn validate_graph(plan: &DecompositionPlan) -> anyhow::Result<()> {
         let id = task.id.as_deref().unwrap_or("");
         anyhow::ensure!(!id.trim().is_empty(), "graph task requires a nonempty id");
         anyhow::ensure!(ids.insert(id), "duplicate graph task id: {id}");
-        anyhow::ensure!(task.depends_on.is_some(), "task {id} must declare depends_on");
+        anyhow::ensure!(
+            task.depends_on.is_some(),
+            "task {id} must declare depends_on"
+        );
     }
     for task in &plan.subtasks {
         for dependency in task.depends_on.iter().flatten() {
-            anyhow::ensure!(ids.contains(dependency.as_str()), "unknown dependency: {dependency}");
-            anyhow::ensure!(task.id.as_ref() != Some(dependency), "self dependency: {dependency}");
+            anyhow::ensure!(
+                ids.contains(dependency.as_str()),
+                "unknown dependency: {dependency}"
+            );
+            anyhow::ensure!(
+                task.id.as_ref() != Some(dependency),
+                "self dependency: {dependency}"
+            );
         }
     }
     let mut completed = std::collections::HashSet::new();
     loop {
         let previous = completed.len();
         for task in &plan.subtasks {
-            if task.depends_on.iter().flatten().all(|id| completed.contains(id.as_str())) {
+            if task
+                .depends_on
+                .iter()
+                .flatten()
+                .all(|id| completed.contains(id.as_str()))
+            {
                 if let Some(id) = task.id.as_deref() {
                     completed.insert(id);
                 }
@@ -350,7 +368,10 @@ pub(crate) fn validate_graph(plan: &DecompositionPlan) -> anyhow::Result<()> {
         if completed.len() == ids.len() {
             return Ok(());
         }
-        anyhow::ensure!(completed.len() > previous, "dependency graph contains a cycle");
+        anyhow::ensure!(
+            completed.len() > previous,
+            "dependency graph contains a cycle"
+        );
     }
 }
 
@@ -404,14 +425,20 @@ pub fn materialize_plan(parent: &Orb, plan: &DecompositionPlan) -> anyhow::Resul
         children.push(child);
     }
     if plan.subtasks.iter().any(|task| task.id.is_some()) {
-        let ids: std::collections::HashMap<_, _> = plan.subtasks.iter()
+        let ids: std::collections::HashMap<_, _> = plan
+            .subtasks
+            .iter()
             .zip(&children)
             .filter_map(|(task, child)| task.id.as_deref().map(|id| (id, &child.id)))
             .collect();
         for (task, child) in plan.subtasks.iter().zip(&children) {
             for dependency in task.depends_on.iter().flatten() {
                 if let Some(prerequisite) = ids.get(dependency.as_str()) {
-                    edges.push(DepEdge::new(child.id.clone(), (*prerequisite).clone(), EdgeType::DependsOn));
+                    edges.push(DepEdge::new(
+                        child.id.clone(),
+                        (*prerequisite).clone(),
+                        EdgeType::DependsOn,
+                    ));
                 }
             }
             tracing::info!(child = %child.id, local_id = ?task.id, depends_on = ?task.depends_on, "accepted decomposition graph node");
@@ -945,10 +972,13 @@ mod explicit_graph_tests {
 
     #[test]
     fn validates_graph_and_rejects_cycles_and_unknown_references() {
-        let mut plan = parse_response(r#"{"subtasks":[
+        let mut plan = parse_response(
+            r#"{"subtasks":[
             {"id":"core","title":"Core","description":"Produce API","depends_on":[]},
             {"id":"app","title":"App","description":"Consume API","depends_on":["core"]}
-        ]}"#).unwrap();
+        ]}"#,
+        )
+        .unwrap();
         assert!(validate_graph(&plan).is_ok());
         plan.subtasks[0].depends_on = Some(vec!["app".into()]);
         assert!(validate_graph(&plan).is_err());
