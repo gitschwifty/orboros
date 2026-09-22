@@ -29,6 +29,7 @@ pub mod execution;
 pub mod hooks;
 pub mod ipc;
 pub mod notify;
+pub mod operational_log;
 pub mod orb_cmd;
 pub mod phases;
 pub mod plan;

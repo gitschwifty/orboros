@@ -45,3 +45,24 @@ restart snapshots, and final reconciliation tests. Event silence is observable
 as age, not a claim that the worker has stalled. Heartbeats from Heddle count
 as activity. Tests added for snapshot replacement and tool completion were not
 executed. This slice does not claim the full task 151 acceptance contract.
+
+## JSON operational logs (task 136, bounded first slice)
+
+`--log-json` opts the general file sink into schema version 1 JSON lines.
+Terminal and benchmark sinks retain readable output. The selected operational
+path gains `.jsonl` so switching formats does not append JSON to its text file;
+rotation uses the actual sink path plus `.1`. Existing project/supervisor log
+home selection remains in force. No new dependency is required.
+
+Schema 1 fields: `schema_version`, RFC3339 UTC `timestamp`, `level`, `target`,
+`fields` (event key/value map, including message), and `spans` (root-first name
+and readable fields). Additive fields are compatible; changing field types or
+semantics requires a schema bump. Correlation fields survive where instrumented.
+A capture test was added for line boundaries, types, and span context, not run.
+
+Remaining: TOML selection, structured span-field maps, complete attribution
+coverage and project-event routing in multi-project supervisors, redaction
+review of existing tracing call sites, and rotation/concurrency/isolation
+acceptance tests. This formatter adds no prompt/body fields, but is not a
+redaction layer for existing tracing events. Explicitly assigning a text sink
+to a prior JSON file is unsupported; retain the generated format suffix.
