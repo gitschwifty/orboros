@@ -78,3 +78,33 @@ protected worker transcript remains the place for raw response evidence.
 Remaining: profile-specific structured completion fields, nested/mixed provider
 fragments and broader protocol fixtures. Focused graph and terminal-envelope
 tests were added but not executed.
+
+## Task 149: refinement review decisions
+
+New refinement review output uses a strict JSON control decision. `accept`
+omits critique, suggested changes and notes; `revise` requires nonempty
+critique. The prompt and runtime parser enforce the same contract. Successful
+acceptance clears prior revision feedback so it cannot leak into later work.
+The general reviewer parser and historical durable `ReviewReport` schema stay
+unchanged. Focused parser tests were added, not executed.
+
+Existing budget behavior is retained: revise, reject and reviewer errors each
+consume the bounded quality-review attempt budget (`refinement.max_review_attempts`).
+When budget remains, the prior refinement checkpoint is restored and a fresh
+refinement attempt is scheduled; exhaustion holds for human review. Invalid new
+acceptance shapes follow that existing reviewer-error path.
+
+Remaining: `accept_with_notes` requires separate durable notes in the external
+Orbs report schema, plus outcome-aware operator rendering. It is deliberately
+not mapped onto critique or suggested changes here. An explicit operator
+re-review action and its separate budget/candidate-reuse policy also remain.
+Those require a coherent durable schema/control-plane change, not a reinterpretation
+of existing stored reports.
+
+## Delivery constraints
+
+All slices were edited without running tests, builds, checks, formatting,
+linters or verification, as requested. Commit hooks were disabled for these
+signed commits so hooks could not invoke prohibited checks. Compilation and
+runtime behavior therefore remain unverified. The scope above is bounded
+implementation progress, not completion of every acceptance criterion.

@@ -2138,6 +2138,8 @@ async fn dispatch_one_owned(
         .await
         {
             Ok(report) if report.verdict.is_accept() => {
+                orb.review_critique = None;
+                tracing::info!(orb = %orb.id, verdict = "accept", "refinement accepted; revision feedback cleared");
                 orb.review_report = Some(report);
             }
             Ok(report) => {
