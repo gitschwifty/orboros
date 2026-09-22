@@ -685,6 +685,34 @@ pub fn cmd_orb_list(
     Ok(())
 }
 
+fn is_low_confidence(orb: &Orb, threshold: f32) -> bool {
+    orb.confidence.is_some_and(|score| score.is_finite() && score <= threshold)
+}
+
+/// Lists explicitly scored low-confidence orbs for human inspection.
+/// Scores are self-reported signals, not review verdicts or lifecycle gates.
+pub fn cmd_low_confidence_queue(store: &OrbStore, threshold: f32) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        threshold.is_finite() && (0.0..=1.0).contains(&threshold),
+        "confidence threshold must be a finite value in [0.0, 1.0]"
+    );
+    let mut orbs = store.load_all().context("failed to load orbs")?;
+    orbs.retain(|orb| is_low_confidence(orb, threshold));
+    orbs.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+    for orb in &orbs {
+        println!(
+            "{} [{:?}] confidence={:.2} — {}",
+            orb.id, orb.effective_status(), orb.confidence.unwrap_or_default(), orb.title
+        );
+        println!("  Inspect: orboros orb show {}", orb.id);
+    }
+    println!(
+        "{} orb(s) with self-reported confidence <= {threshold:.2}; unscored orbs excluded. No review decision applied.",
+        orbs.len()
+    );
+    Ok(())
+}
+
 /// Prints orbs whose second-opinion reviewer verdict is `Revise`,
 /// pending operator action. Includes the verdict scope and critique
 /// preview so the user can prioritize.
@@ -1146,6 +1174,27 @@ mod tests {
     }
 
     // ── review filter ──────────────────────────────────────────
+
+    #[test]
+    fn low_confidence_selection_excludes_unknown_and_invalid_scores() {
+        let mut orb = Orb::new("test", "test");
+        assert!(!is_low_confidence(&orb, 0.5));
+        orb.confidence = Some(0.5);
+        assert!(is_low_confidence(&orb, 0.5));
+        orb.confidence = Some(0.8);
+        assert!(!is_low_confidence(&orb, 0.5));
+        orb.confidence = Some(f32::NAN);
+        assert!(!is_low_confidence(&orb, 0.5));
+    }
+
+    #[test]
+    fn review_queue_rejects_invalid_confidence_thresholds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OrbStore::new(dir.path().join("orbs.jsonl"));
+        for threshold in [-0.1, 1.1, f32::NAN, f32::INFINITY] {
+            assert!(cmd_low_confidence_queue(&store, threshold).is_err());
+        }
+    }
 
     #[test]
     fn review_status_filter_parses_aliases() {

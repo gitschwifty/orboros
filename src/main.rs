@@ -172,7 +172,12 @@ enum Commands {
     },
     /// List orbs whose second-opinion reviewer verdict is `Revise`,
     /// pending operator action.
-    ReviewQueue,
+    ReviewQueue {
+        /// Show scored orbs at or below this threshold instead of revise verdicts.
+        /// Missing confidence is excluded; this does not change lifecycle state.
+        #[arg(long, value_name = "0..1")]
+        max_confidence: Option<f32>,
+    },
     /// Benchmark corpus + harness (task 59).
     Bench {
         /// Root containing t1/, t2/, t3/, prompts/, and results/.
@@ -1189,9 +1194,12 @@ fn main() -> anyhow::Result<()> {
                 orboros::hooks::cmd::cmd_hooks_log(&state_dir, orb.as_deref(), limit)
             }
         },
-        Commands::ReviewQueue => {
+        Commands::ReviewQueue { max_confidence } => {
             let orb_store = OrbStore::new(state_dir.join("orbs.jsonl"));
-            orb_cmd::cmd_review_queue(&orb_store)
+            match max_confidence {
+                Some(threshold) => orb_cmd::cmd_low_confidence_queue(&orb_store, threshold),
+                None => orb_cmd::cmd_review_queue(&orb_store),
+            }
         }
         Commands::Bench {
             bench_root,
